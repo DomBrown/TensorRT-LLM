@@ -14,7 +14,6 @@ build_script_dir = _pl.Path(
 assert build_script_dir.is_dir()
 _sys.path.append(str(build_script_dir))
 
-from build_wheel import main as build_trt_llm
 from defs.conftest import llm_models_root
 from defs.cpp_common import (default_test_parallel, default_test_timeout,
                              find_build_dir, find_root_dir,
@@ -141,11 +140,11 @@ def build_google_tests(request, build_dir):
 
     print(f"Using CUDA arch: {cuda_arch}")
 
-    build_trt_llm(cuda_architectures=cuda_arch,
-                  job_count=12,
-                  use_ccache=True,
-                  clean=True,
-                  trt_root="/usr/local/tensorrt")
+    # build_trt_llm(cuda_architectures=cuda_arch,
+    #               job_count=12,
+    #               use_ccache=True,
+    #               clean=True,
+    #               trt_root="/usr/local/tensorrt")
 
     make_google_tests = [
         "cmake", "--build", ".", "--config", "Release", "-j", "--target",
