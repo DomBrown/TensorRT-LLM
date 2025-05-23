@@ -58,7 +58,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
 
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k,
     std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim,
-    int32_t configIndex) const
+    std::optional<int32_t> configIndex)
 {
     batchedGemm::BatchedGemmData gemmData;
     gemmData.mProblemDimensions.mNumBatches = numBatches;
@@ -76,7 +76,14 @@ size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n,
     auto bmm = batchedGemm::BatchedGemmInterface();
     auto const configs = bmm.getBatchedGemmConfigs();
 
-    auto const& config = configs[configIndex];
+    if (!configIndex.has_value())
+    {
+        mSelectedConfigIndex
+            = getDefaultValidConfigIndex(m, n, k, batchedTokens, numTokens, numBatches, maxNumCtasInBatchDim);
+        configIndex = mSelectedConfigIndex;
+    }
+
+    auto const& config = configs[configIndex.value()];
     return bmm.getWorkspaceSizeInBytes(config, gemmData);
 }
 
@@ -85,14 +92,22 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     void const* sfB, void const* perTokensSfA, void const* perTokensSfB, float const* scaleC, float const* scaleGateC,
     void* c, void* outSfC, int32_t const* routeMap, int32_t const* totalNumPaddedTokens,
     int32_t const* ctaIdxXyToBatchIdx, int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
-    void* workspace, CUstream stream, int device, int32_t configIndex)
+    void* workspace, CUstream stream, int device, std::optional<int32_t> configIndex)
 {
     auto bmm = batchedGemm::BatchedGemmInterface();
 
     batchedGemm::BatchedGemmData gemmData;
 
     auto const configs = bmm.getBatchedGemmConfigs();
-    auto const& config = configs[configIndex];
+
+    if (!configIndex.has_value())
+    {
+        TLLM_CHECK_WITH_INFO(mSelectedConfigIndex.has_value(), "Tried to use default config index but none was set");
+
+        configIndex = mSelectedConfigIndex;
+    }
+
+    auto const& config = configs[configIndex.value()];
 
     TLLM_CHECK_WITH_INFO(numBatches > 0, "Batched GEMM requires numBatches > 0");
     if (!mOptions.staticBatch)
@@ -164,7 +179,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
     void const* a, void const* sfA, void const* b, void const* sfB, void* c, void* outSfC, void* workspace,
-    CUstream stream, int device, int32_t configIndex)
+    CUstream stream, int device, std::optional<int32_t> configIndex)
 {
     // Dispatch with block scaling factors and with static batching.
     run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0, a, sfA, b, sfB,
@@ -177,7 +192,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
     void const* a, void const* b, float const* scaleC, float const* scaleGateC, void* c, void* workspace,
-    CUstream stream, int device, int32_t configIndex)
+    CUstream stream, int device, std::optional<int32_t> configIndex)
 {
     // Dispatch with block scaling factors and with static batching.
     run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0, a,
