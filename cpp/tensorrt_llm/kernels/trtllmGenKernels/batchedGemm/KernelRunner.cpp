@@ -53,11 +53,12 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
         }
     }
 
-    TLLM_CHECK_WITH_INFO(mPassingConfigIndices.size() != 0, "No kernel found for the given output type");
+    TLLM_CHECK_WITH_INFO(!mPassingConfigIndices.empty(), "No kernel found for the given options");
 }
 
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k,
-    std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim)
+    std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim,
+    int32_t configIndex) const
 {
     batchedGemm::BatchedGemmData gemmData;
     gemmData.mProblemDimensions.mNumBatches = numBatches;
@@ -72,13 +73,10 @@ size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n,
     gemmData.mProblemDimensions.mWorldSize = 1;
     gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
 
-    selectGemmConfig(m, n, k, batchedTokens, numTokens, numBatches, maxNumCtasInBatchDim);
-
     auto bmm = batchedGemm::BatchedGemmInterface();
     auto const configs = bmm.getBatchedGemmConfigs();
-    TLLM_CHECK_WITH_INFO(
-        mSelectedConfigIndex.has_value(), "No valid kernel found for given param config and problem size");
-    auto const& config = configs[mSelectedConfigIndex.value()];
+
+    auto const& config = configs[configIndex];
     return bmm.getWorkspaceSizeInBytes(config, gemmData);
 }
 
@@ -87,16 +85,14 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     void const* sfB, void const* perTokensSfA, void const* perTokensSfB, float const* scaleC, float const* scaleGateC,
     void* c, void* outSfC, int32_t const* routeMap, int32_t const* totalNumPaddedTokens,
     int32_t const* ctaIdxXyToBatchIdx, int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
-    void* workspace, CUstream stream, int device)
+    void* workspace, CUstream stream, int device, int32_t configIndex)
 {
     auto bmm = batchedGemm::BatchedGemmInterface();
 
     batchedGemm::BatchedGemmData gemmData;
 
     auto const configs = bmm.getBatchedGemmConfigs();
-    TLLM_CHECK_WITH_INFO(
-        mSelectedConfigIndex.has_value(), "No valid kernel found for given param config and problem size");
-    auto const& config = configs[mSelectedConfigIndex.value()];
+    auto const& config = configs[configIndex];
 
     TLLM_CHECK_WITH_INFO(numBatches > 0, "Batched GEMM requires numBatches > 0");
     if (!mOptions.staticBatch)
@@ -168,7 +164,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
     void const* a, void const* sfA, void const* b, void const* sfB, void* c, void* outSfC, void* workspace,
-    CUstream stream, int device)
+    CUstream stream, int device, int32_t configIndex)
 {
     // Dispatch with block scaling factors and with static batching.
     run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0, a, sfA, b, sfB,
@@ -176,12 +172,12 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
         /* scaleC */ nullptr, /* scaleGateC */ nullptr, c, outSfC,
         /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
         /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
-        /* numNonExitingCtas */ nullptr, workspace, stream, device);
+        /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex);
 }
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
     void const* a, void const* b, float const* scaleC, float const* scaleGateC, void* c, void* workspace,
-    CUstream stream, int device)
+    CUstream stream, int device, int32_t configIndex)
 {
     // Dispatch with block scaling factors and with static batching.
     run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0, a,
@@ -189,11 +185,12 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
         scaleGateC, c, /* outSfC */ nullptr,
         /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
         /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
-        /* numNonExitingCtas */ nullptr, workspace, stream, device);
+        /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex);
 }
 
-void TrtllmGenBatchedGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k,
-    std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim)
+std::vector<int32_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m, int32_t n, int32_t k,
+    std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches,
+    int32_t maxNumCtasInBatchDim) const
 {
     auto const bmm = batchedGemm::BatchedGemmInterface();
     auto const configs = bmm.getBatchedGemmConfigs();
@@ -229,16 +226,30 @@ void TrtllmGenBatchedGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t 
             return optionsA.mUseUnrollLoop2xForMma;
         });
 
+    std::vector<int32_t> validConfigIndices;
     for (auto const& configIndex : sortedIndices)
     {
         auto const& config = configs[configIndex];
         auto isValidConfig = bmm.isValidConfig(config, gemmData);
         if (isValidConfig)
         {
-            mSelectedConfigIndex = configIndex;
-            return;
+            validConfigIndices.push_back(configIndex);
         }
     }
+
+    TLLM_CHECK_WITH_INFO(!validConfigIndices.empty(), "No valid config found for the given problem shape");
+
+    return validConfigIndices;
+}
+
+int32_t TrtllmGenBatchedGemmRunner::getDefaultValidConfigIndex(int32_t m, int32_t n, int32_t k,
+    std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches,
+    int32_t maxNumCtasInBatchDim) const
+{
+    auto const validConfigIndices
+        = getValidConfigIndices(m, n, k, batchedTokens, numTokens, numBatches, maxNumCtasInBatchDim);
+
+    return validConfigIndices[0];
 }
 
 } // namespace kernels

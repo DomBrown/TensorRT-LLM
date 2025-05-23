@@ -54,8 +54,12 @@ void runBatchedGemm(at::Tensor& out, at::Tensor& outSfC, at::Tensor const& mat1,
     // numTokens and maxNumCtasInBatchDim are not used for static batching
     int32_t numTokens = 0;
     int32_t maxNumCtasInBatchDim = 0;
-    int64_t const numBytesWorkspace
-        = runner.getWorkspaceSizeInBytes(m, n, k, batchedTokens, numTokens, batchedTokens.size(), maxNumCtasInBatchDim);
+
+    int32_t configIndex = runner.getDefaultValidConfigIndex(
+        m, n, k, batchedTokens, numTokens, batchedTokens.size(), maxNumCtasInBatchDim);
+
+    int64_t const numBytesWorkspace = runner.getWorkspaceSizeInBytes(
+        m, n, k, batchedTokens, numTokens, batchedTokens.size(), maxNumCtasInBatchDim, configIndex);
     at::Tensor workspace
         = at::detail::empty_cuda({numBytesWorkspace}, at::ScalarType::Char, mat1.device(), std::nullopt);
 
@@ -66,13 +70,13 @@ void runBatchedGemm(at::Tensor& out, at::Tensor& outSfC, at::Tensor const& mat1,
         float* outSfCPtr = outDtype == tg::Dtype::E4m3 ? outSfC.data_ptr<float>() : nullptr;
         runner.run(m, n, k, batchedTokens, mat1.const_data_ptr(), dDqSfsA.value().const_data_ptr(),
             mat2.const_data_ptr(), dDqSfsB.value().const_data_ptr(), out.data_ptr(), outSfCPtr, workspace.data_ptr(),
-            stream.stream(), mat1.get_device());
+            stream.stream(), mat1.get_device(), configIndex);
     }
     else
     {
         runner.run(m, n, k, batchedTokens, mat1.const_data_ptr(), mat2.const_data_ptr(),
             reinterpret_cast<float const*>(scaleC.value().const_data_ptr()), nullptr, out.data_ptr(),
-            workspace.data_ptr(), stream.stream(), mat1.get_device());
+            workspace.data_ptr(), stream.stream(), mat1.get_device(), configIndex);
     }
 }
 
