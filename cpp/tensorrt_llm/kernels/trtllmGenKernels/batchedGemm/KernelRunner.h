@@ -73,13 +73,13 @@ public:
     }
 
     // Get the list of config indices that are valid for the given problem shape
-    [[nodiscard]] std::vector<int32_t> getValidConfigIndices(int32_t m, int32_t n, int32_t k,
+    [[nodiscard]] std::vector<int64_t> getValidConfigIndices(int32_t m, int32_t n, int32_t k,
         std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches,
         int32_t maxNumCtasInBatchDim) const;
 
     // Get a default config index that is valid for the given problem shape
     // This will be used as the fallback config if using auto-tuning
-    [[nodiscard]] int32_t getDefaultValidConfigIndex(int32_t m, int32_t n, int32_t k,
+    [[nodiscard]] int64_t getDefaultValidConfigIndex(int32_t m, int32_t n, int32_t k,
         std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches,
         int32_t maxNumCtasInBatchDim) const;
 

@@ -203,7 +203,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
         /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex);
 }
 
-std::vector<int32_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m, int32_t n, int32_t k,
+std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m, int32_t n, int32_t k,
     std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches,
     int32_t maxNumCtasInBatchDim) const
 {
@@ -241,7 +241,7 @@ std::vector<int32_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
             return optionsA.mUseUnrollLoop2xForMma;
         });
 
-    std::vector<int32_t> validConfigIndices;
+    std::vector<int64_t> validConfigIndices;
     for (auto const& configIndex : sortedIndices)
     {
         auto const& config = configs[configIndex];
@@ -257,7 +257,7 @@ std::vector<int32_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
     return validConfigIndices;
 }
 
-int32_t TrtllmGenBatchedGemmRunner::getDefaultValidConfigIndex(int32_t m, int32_t n, int32_t k,
+int64_t TrtllmGenBatchedGemmRunner::getDefaultValidConfigIndex(int32_t m, int32_t n, int32_t k,
     std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches,
     int32_t maxNumCtasInBatchDim) const
 {

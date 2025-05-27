@@ -341,3 +341,9 @@ def test_fp8_batched_gemm_trtllmgen(test_case: BatchedGemmTestCase) -> None:
                             bi * m_padded:bi * m_padded + m].to(torch.float32),
                 atol=1e-2,
                 rtol=1e-2)
+
+
+def test_fp8_batched_gemm_trtllmgen_autotuned():
+    torch.ops.trtllm.fp8_batched_gemm()
+
+    assert True

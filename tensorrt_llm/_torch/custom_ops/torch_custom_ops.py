@@ -359,6 +359,76 @@ def _(
                              dtype=output_dtype)
 
 
+class FP8BmmRunner(TunableRunner):
+
+    _runner_dict = dict()
+
+    def __init__(self, output_dtype: torch.dtype, use_deepseek_fp8: bool,
+                 low_latency_kernel: bool, tile_size: int,
+                 epilogue_tile_m: int):
+
+        self.output_dtype = output_dtype
+        self.use_deepseek_fp8 = use_deepseek_fp8
+        self.low_latency_kernel = low_latency_kernel
+        self.tile_size = tile_size
+        self.epilogue_tile_m = epilogue_tile_m
+
+        instance_key = (output_dtype, use_deepseek_fp8, low_latency_kernel,
+                        tile_size, epilogue_tile_m)
+
+        if instance_key not in FP8BmmRunner._runner_dict:
+            FP8BmmRunner._runner_dict[
+                instance_key] = torch.classes.trtllm.FP8BmmRunner(
+                    output_dtype, use_deepseek_fp8, low_latency_kernel,
+                    tile_size, epilogue_tile_m)
+
+        self.kernel_runner = FP8BmmRunner._runner_dict[instance_key]
+
+    def forward(self):
+        pass
+
+    def get_valid_tactics(self) -> List[int]:
+        """Get valid tactics for the FP8 batched GEMM operation.
+        """
+
+        # FIXME Placeholder values for the dimensions.
+        tactics = self.kernel_runner.get_valid_configs(8, 256, 512, 4)
+
+        return tactics
+
+    def get_default_valid_tactic(self) -> int:
+        """Get the default valid tactic for the FP8 batched GEMM operation.
+        """
+
+        # FIXME Placeholder values for the dimensions.
+        return self.kernel_runner.get_default_valid_tactic(8, 256, 512, 4)
+
+    def get_cache_key_specifc(self, profile: Tuple) -> Tuple:
+        """Generate a unique cache key for the given profile.
+        """
+        return (self.output_dtype, self.use_deepseek_fp8,
+                self.low_latency_kernel, self.tile_size,
+                self.epilogue_tile_m), profile
+
+
+@torch.library.custom_op("trtllm::fp8_batched_gemm", mutates_args=())
+def fp8_batched_gemm() -> torch.Tensor:
+
+    kernel_runner = FP8BmmRunner(output_dtype=torch.float8_e4m3fn,
+                                 use_deepseek_fp8=True,
+                                 low_latency_kernel=True,
+                                 tile_size=8,
+                                 epilogue_tile_m=64)
+
+    return torch.empty((0, 0), dtype=torch.float8_e4m3fn)
+
+
+@fp8_batched_gemm.register_fake
+def _() -> torch.Tensor:
+    print("FP8BmmRunner: register_fake called")
+    return torch.empty((0, 0), dtype=torch.float8_e4m3fn)
+
+
 @torch.library.custom_op("trtllm::attention", mutates_args=())
 def attention(
     q: torch.Tensor,

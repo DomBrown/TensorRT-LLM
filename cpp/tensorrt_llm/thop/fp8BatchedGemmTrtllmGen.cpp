@@ -26,6 +26,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <memory>
 
 namespace
 {
@@ -201,10 +202,77 @@ extern std::tuple<at::Tensor, at::Tensor> fp8_batched_gemm_trtllmgen(at::Tensor 
     default: TLLM_THROW("Unsupported or unimplemented compute capability for fp8 batched gemm: %i", smVersion);
     }
 }
+
+class FP8BmmRunner : public torch::CustomClassHolder
+{
+
+public:
+    explicit FP8BmmRunner(c10::ScalarType outDtypeArg, bool useDeepSeekFp8, bool lowLatencyKernel, int64_t tileSize,
+        int64_t epilogueTileM)
+    {
+        auto const eltType = tg::Dtype::E4m3;
+
+        tg::Dtype outDtype = tg::Dtype::E4m3;
+
+        switch (outDtypeArg)
+        {
+        case at::ScalarType::Half: outDtype = tg::Dtype::Fp16; break;
+        case at::ScalarType::BFloat16: outDtype = tg::Dtype::Bfloat16; break;
+        case at::ScalarType::Float8_e4m3fn: outDtype = tg::Dtype::E4m3; break;
+        default: C10_THROW_ERROR(NotImplementedError, "outDtype must be one of fp16/bf16/e4m3.");
+        }
+
+        RunnerOptionsType const options = {.eltType = eltType,
+            .outputType = outDtype,
+            .deepSeekFp8 = useDeepSeekFp8,
+            .fusedAct = false,
+            .routeAct = false,
+            .staticBatch = true,
+            .transposeMmaOutput = lowLatencyKernel,
+            .tileSize = static_cast<int32_t>(tileSize),
+            .epilogueTileM = static_cast<int32_t>(epilogueTileM)};
+
+        mRunner = std::make_unique<RunnerType>(options);
+    }
+
+    std::vector<int64_t> getValidConfigs(int64_t m, int64_t n, int64_t k, int64_t numBatches) const
+    {
+        // numTokens and maxNumCtasInBatchDim are not used for static batching
+        int32_t const numTokens = 0;
+        int32_t const maxNumCtasInBatchDim = 0;
+
+        std::vector<int32_t> const batchedTokens(numBatches, m);
+
+        return mRunner->getValidConfigIndices(m, n, k, batchedTokens, numTokens, numBatches, maxNumCtasInBatchDim);
+    }
+
+    int64_t getDefaultValidConfigIndex(int64_t m, int64_t n, int64_t k, int64_t numBatches) const
+    {
+        // numTokens and maxNumCtasInBatchDim are not used for static batching
+        int32_t const numTokens = 0;
+        int32_t const maxNumCtasInBatchDim = 0;
+
+        std::vector<int32_t> const batchedTokens(numBatches, m);
+
+        return mRunner->getDefaultValidConfigIndex(m, n, k, batchedTokens, numTokens, numBatches, maxNumCtasInBatchDim);
+    }
+
+private:
+    using RunnerType = tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner;
+    using RunnerOptionsType = tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions;
+
+    std::unique_ptr<RunnerType> mRunner;
+};
+
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.class_<torch_ext::FP8BmmRunner>("FP8BmmRunner")
+        .def(torch::init<at::ScalarType, bool, bool, int64_t, int64_t>())
+        .def("get_valid_configs", &torch_ext::FP8BmmRunner::getValidConfigs)
+        .def("get_default_valid_config", &torch_ext::FP8BmmRunner::getDefaultValidConfigIndex);
+
     m.def(
         "fp8_batched_gemm_trtllmgen(Tensor a, Tensor b, int tile_size,"
         "bool use_deep_seek_fp8=False, bool low_latency=False, "
