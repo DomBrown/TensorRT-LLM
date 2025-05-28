@@ -344,6 +344,28 @@ def test_fp8_batched_gemm_trtllmgen(test_case: BatchedGemmTestCase) -> None:
 
 
 def test_fp8_batched_gemm_trtllmgen_autotuned():
-    torch.ops.trtllm.fp8_batched_gemm()
+
+    # FIXME placeholder for inputs, should be replaced with actual inputs
+    m = 8
+    n = 256
+    k = 512
+    b = 4
+
+    mat1 = torch.empty((b, m, k), dtype=torch.float8_e4m3fn, device="cuda")
+    mat2 = torch.empty((b, n, k), dtype=torch.float8_e4m3fn, device="cuda")
+    dq_sfs_a = torch.empty((b, m), dtype=torch.float32, device="cuda")
+    dq_sfs_b = torch.empty((b, n), dtype=torch.float32, device="cuda")
+    scale_c = torch.empty((b, 1), dtype=torch.float32, device="cuda")
+    output_dtype = torch.float8_e4m3fn
+    use_deepseek_fp8 = True
+    low_latency_kernel = True
+    tile_size = 8
+    epilogue_tile_m = 64
+
+    print(type(output_dtype))
+
+    torch.ops.trtllm.fp8_batched_gemm(mat1, mat2, tile_size, use_deepseek_fp8,
+                                      low_latency_kernel, epilogue_tile_m,
+                                      dq_sfs_a, dq_sfs_b, scale_c, output_dtype)
 
     assert True

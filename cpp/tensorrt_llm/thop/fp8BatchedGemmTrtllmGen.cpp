@@ -203,12 +203,12 @@ extern std::tuple<at::Tensor, at::Tensor> fp8_batched_gemm_trtllmgen(at::Tensor 
     }
 }
 
-class FP8BmmRunner : public torch::CustomClassHolder
+class FP8BatchedGemmRunner : public torch::CustomClassHolder
 {
 
 public:
-    explicit FP8BmmRunner(c10::ScalarType outDtypeArg, bool useDeepSeekFp8, bool lowLatencyKernel, int64_t tileSize,
-        int64_t epilogueTileM)
+    explicit FP8BatchedGemmRunner(c10::ScalarType outDtypeArg, bool useDeepSeekFp8, bool lowLatencyKernel,
+        int64_t tileSize, int64_t epilogueTileM)
     {
         auto const eltType = tg::Dtype::E4m3;
 
@@ -268,10 +268,10 @@ private:
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.class_<torch_ext::FP8BmmRunner>("FP8BmmRunner")
+    m.class_<torch_ext::FP8BatchedGemmRunner>("FP8BatchedGemmRunner")
         .def(torch::init<at::ScalarType, bool, bool, int64_t, int64_t>())
-        .def("get_valid_configs", &torch_ext::FP8BmmRunner::getValidConfigs)
-        .def("get_default_valid_config", &torch_ext::FP8BmmRunner::getDefaultValidConfigIndex);
+        .def("get_valid_configs", &torch_ext::FP8BatchedGemmRunner::getValidConfigs)
+        .def("get_default_valid_config", &torch_ext::FP8BatchedGemmRunner::getDefaultValidConfigIndex);
 
     m.def(
         "fp8_batched_gemm_trtllmgen(Tensor a, Tensor b, int tile_size,"

@@ -359,7 +359,7 @@ def _(
                              dtype=output_dtype)
 
 
-class FP8BmmRunner(TunableRunner):
+class FP8BatchedGemmRunner(TunableRunner):
 
     _runner_dict = dict()
 
@@ -376,32 +376,56 @@ class FP8BmmRunner(TunableRunner):
         instance_key = (output_dtype, use_deepseek_fp8, low_latency_kernel,
                         tile_size, epilogue_tile_m)
 
-        if instance_key not in FP8BmmRunner._runner_dict:
-            FP8BmmRunner._runner_dict[
-                instance_key] = torch.classes.trtllm.FP8BmmRunner(
+        if instance_key not in FP8BatchedGemmRunner._runner_dict:
+            FP8BatchedGemmRunner._runner_dict[
+                instance_key] = torch.classes.trtllm.FP8BatchedGemmRunner(
                     output_dtype, use_deepseek_fp8, low_latency_kernel,
                     tile_size, epilogue_tile_m)
 
-        self.kernel_runner = FP8BmmRunner._runner_dict[instance_key]
+        self.kernel_runner = FP8BatchedGemmRunner._runner_dict[instance_key]
 
-    def forward(self):
-        pass
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+        do_preparation: bool = False,
+    ) -> torch.Tensor:
 
-    def get_valid_tactics(self) -> List[int]:
-        """Get valid tactics for the FP8 batched GEMM operation.
-        """
+        mat1, mat2, dq_sfs_a, dq_sfs_b, scale_c = inputs
 
-        # FIXME Placeholder values for the dimensions.
-        tactics = self.kernel_runner.get_valid_configs(8, 256, 512, 4)
+        # Code to run the FP8 batched gemm kernel will go here.
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+    ) -> List[int]:
+
+        mat1, mat2, _, _, _ = inputs
+
+        b = mat1.shape[0]
+        m = mat1.shape[1]
+        n = mat2.shape[1]
+        k = mat1.shape[2]
+
+        tactics = self.kernel_runner.get_valid_configs(m, n, k, b)
 
         return tactics
 
-    def get_default_valid_tactic(self) -> int:
-        """Get the default valid tactic for the FP8 batched GEMM operation.
-        """
+    def get_default_valid_tactic(
+        self,
+        inputs: List[torch.Tensor],
+    ) -> int:
 
-        # FIXME Placeholder values for the dimensions.
-        return self.kernel_runner.get_default_valid_tactic(8, 256, 512, 4)
+        mat1, mat2, _, _, _ = inputs
+
+        b = mat1.shape[0]
+        m = mat1.shape[1]
+        n = mat2.shape[1]
+        k = mat1.shape[2]
+
+        default_tactic = self.kernel_runner.get_default_valid_config(m, n, k, b)
+
+        return default_tactic
 
     def get_cache_key_specifc(self, profile: Tuple) -> Tuple:
         """Generate a unique cache key for the given profile.
@@ -412,13 +436,27 @@ class FP8BmmRunner(TunableRunner):
 
 
 @torch.library.custom_op("trtllm::fp8_batched_gemm", mutates_args=())
-def fp8_batched_gemm() -> torch.Tensor:
+def fp8_batched_gemm(mat1: torch.Tensor,
+                     mat2: torch.Tensor,
+                     tile_size: int,
+                     use_deepseek_fp8: bool = False,
+                     low_latency: bool = False,
+                     epilogue_tile_m: int = 0,
+                     dq_sfs_a: torch.Tensor = None,
+                     dq_sfs_b: torch.Tensor = None,
+                     scale_c: torch.Tensor = None,
+                     out_dtype: torch.dtype = None) -> torch.Tensor:
 
-    kernel_runner = FP8BmmRunner(output_dtype=torch.float8_e4m3fn,
-                                 use_deepseek_fp8=True,
-                                 low_latency_kernel=True,
-                                 tile_size=8,
-                                 epilogue_tile_m=64)
+    kernel_runner = FP8BatchedGemmRunner(output_dtype=out_dtype,
+                                         use_deepseek_fp8=use_deepseek_fp8,
+                                         low_latency_kernel=low_latency,
+                                         tile_size=tile_size,
+                                         epilogue_tile_m=epilogue_tile_m)
+
+    result = kernel_runner.get_default_valid_tactic(
+        [mat1, mat2, dq_sfs_a, dq_sfs_b, scale_c])
+
+    print(f"FP8BmmRunner: valid tactics: {result}")
 
     return torch.empty((0, 0), dtype=torch.float8_e4m3fn)
 
