@@ -245,10 +245,8 @@ public:
         std::optional<at::Tensor> const& scaleC, int64_t configIndex)
     {
 
-        auto const result = fp8_batched_gemm_sm100(mat1, mat2, mTileSize, mUseDeepSeekFp8, mLowLatencyKernel,
-            mEpilogueTileM, dDqSfsA, dDqSfsB, scaleC, mOutDtypeArg, configIndex);
-
-        return result;
+        return fp8_batched_gemm_sm100(mat1, mat2, mTileSize, mUseDeepSeekFp8, mLowLatencyKernel, mEpilogueTileM,
+            dDqSfsA, dDqSfsB, scaleC, mOutDtypeArg, configIndex);
     }
 
     std::vector<int64_t> getValidConfigs(int64_t m, int64_t n, int64_t k, int64_t numBatches) const

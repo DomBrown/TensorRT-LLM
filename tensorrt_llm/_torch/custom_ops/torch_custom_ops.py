@@ -398,7 +398,7 @@ class FP8BatchedGemmRunner(TunableRunner):
         chosen_tactic = self.get_default_valid_tactic(
             inputs) if tactic == -1 else tactic
 
-        return self._kernel_runner.run_batched_gemm(
+        out_tensors = self._kernel_runner.run_batched_gemm(
             mat1,
             mat2,
             dq_sfs_a,
@@ -406,6 +406,8 @@ class FP8BatchedGemmRunner(TunableRunner):
             scale_c,
             chosen_tactic,
         )
+
+        return out_tensors
 
     def get_valid_tactics(
         self,
@@ -467,13 +469,15 @@ def fp8_batched_gemm(
                                          tile_size=tile_size,
                                          epilogue_tile_m=epilogue_tile_m)
 
-    result = kernel_runner.get_default_valid_tactic(
+    chosen_tactic = kernel_runner.get_default_valid_tactic(
         [mat1, mat2, dq_sfs_a, dq_sfs_b, scale_c])
 
-    mock1 = torch.empty((0, 0), dtype=out_dtype)
-    mock2 = torch.empty((0, 0), dtype=out_dtype)
+    inputs = [mat1, mat2, dq_sfs_a, dq_sfs_b, scale_c]
 
-    return (mock1, mock2)
+    return kernel_runner(
+        inputs=inputs,
+        tactic=chosen_tactic,
+    )
 
 
 @fp8_batched_gemm.register_fake
