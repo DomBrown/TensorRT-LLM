@@ -382,18 +382,30 @@ class FP8BatchedGemmRunner(TunableRunner):
                     output_dtype, use_deepseek_fp8, low_latency_kernel,
                     tile_size, epilogue_tile_m)
 
-        self.kernel_runner = FP8BatchedGemmRunner._runner_dict[instance_key]
+        self._kernel_runner = FP8BatchedGemmRunner._runner_dict[instance_key]
 
     def forward(
         self,
         inputs: List[torch.Tensor],
         tactic: int = -1,
         do_preparation: bool = False,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run the batched GEMM operation with the given inputs and tactic.
+        """
 
         mat1, mat2, dq_sfs_a, dq_sfs_b, scale_c = inputs
 
-        # Code to run the FP8 batched gemm kernel will go here.
+        chosen_tactic = self.get_default_valid_tactic(
+            inputs) if tactic == -1 else tactic
+
+        return self._kernel_runner.run_batched_gemm(
+            mat1,
+            mat2,
+            dq_sfs_a,
+            dq_sfs_b,
+            scale_c,
+            chosen_tactic,
+        )
 
     def get_valid_tactics(
         self,
@@ -407,7 +419,7 @@ class FP8BatchedGemmRunner(TunableRunner):
         n = mat2.shape[1]
         k = mat1.shape[2]
 
-        tactics = self.kernel_runner.get_valid_configs(m, n, k, b)
+        tactics = self._kernel_runner.get_valid_configs(m, n, k, b)
 
         return tactics
 
@@ -423,7 +435,8 @@ class FP8BatchedGemmRunner(TunableRunner):
         n = mat2.shape[1]
         k = mat1.shape[2]
 
-        default_tactic = self.kernel_runner.get_default_valid_config(m, n, k, b)
+        default_tactic = self._kernel_runner.get_default_valid_config(
+            m, n, k, b)
 
         return default_tactic
 
@@ -436,16 +449,17 @@ class FP8BatchedGemmRunner(TunableRunner):
 
 
 @torch.library.custom_op("trtllm::fp8_batched_gemm", mutates_args=())
-def fp8_batched_gemm(mat1: torch.Tensor,
-                     mat2: torch.Tensor,
-                     tile_size: int,
-                     use_deepseek_fp8: bool = False,
-                     low_latency: bool = False,
-                     epilogue_tile_m: int = 0,
-                     dq_sfs_a: torch.Tensor = None,
-                     dq_sfs_b: torch.Tensor = None,
-                     scale_c: torch.Tensor = None,
-                     out_dtype: torch.dtype = None) -> torch.Tensor:
+def fp8_batched_gemm(
+        mat1: torch.Tensor,
+        mat2: torch.Tensor,
+        tile_size: int,
+        use_deepseek_fp8: bool = False,
+        low_latency: bool = False,
+        epilogue_tile_m: int = 0,
+        dq_sfs_a: torch.Tensor = None,
+        dq_sfs_b: torch.Tensor = None,
+        scale_c: torch.Tensor = None,
+        out_dtype: torch.dtype = None) -> Tuple[torch.Tensor, torch.Tensor]:
 
     kernel_runner = FP8BatchedGemmRunner(output_dtype=out_dtype,
                                          use_deepseek_fp8=use_deepseek_fp8,
@@ -456,15 +470,39 @@ def fp8_batched_gemm(mat1: torch.Tensor,
     result = kernel_runner.get_default_valid_tactic(
         [mat1, mat2, dq_sfs_a, dq_sfs_b, scale_c])
 
-    print(f"FP8BmmRunner: valid tactics: {result}")
+    mock1 = torch.empty((0, 0), dtype=out_dtype)
+    mock2 = torch.empty((0, 0), dtype=out_dtype)
 
-    return torch.empty((0, 0), dtype=torch.float8_e4m3fn)
+    return (mock1, mock2)
 
 
 @fp8_batched_gemm.register_fake
-def _() -> torch.Tensor:
-    print("FP8BmmRunner: register_fake called")
-    return torch.empty((0, 0), dtype=torch.float8_e4m3fn)
+def _(mat1: torch.Tensor,
+      mat2: torch.Tensor,
+      tile_size: int,
+      use_deepseek_fp8: bool = False,
+      low_latency: bool = False,
+      epilogue_tile_m: int = 0,
+      dq_sfs_a: torch.Tensor = None,
+      dq_sfs_b: torch.Tensor = None,
+      scale_c: torch.Tensor = None,
+      out_dtype: torch.dtype = None) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    b = mat1.size(0)
+    m = mat1.size(1)
+    n = mat2.size(1)
+
+    fake_out = mat1.new_empty((b, m, n), dtype=out_dtype)
+
+    if use_deepseek_fp8:
+        ds_fp8_quant_block_size = 128
+        dim0_size = n // ds_fp8_quant_block_size
+        dim1_size = b * m
+        fake_dq_sfs_c = torch.empty((dim0_size, dim1_size), dtype=torch.float32)
+    else:
+        fake_dq_sfs_c = torch.empty((0, 0), dtype=torch.float32)
+
+    return (fake_out, fake_dq_sfs_c)
 
 
 @torch.library.custom_op("trtllm::attention", mutates_args=())

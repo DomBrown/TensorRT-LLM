@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <tuple>
 
 namespace
 {
@@ -36,7 +37,8 @@ template <tg::Dtype outDtype>
 void runBatchedGemm(at::Tensor& out, at::Tensor& outSfC, at::Tensor const& mat1, at::Tensor const& mat2,
     std::optional<at::Tensor> const& dDqSfsA, std::optional<at::Tensor> const& dDqSfsB,
     std::optional<at::Tensor> const& scaleC, int64_t m, int64_t n, int64_t k, int32_t tileSize, int32_t epilogueTileM,
-    std::vector<int32_t> const& batchedTokens, bool useDeepSeekFp8, bool lowLatencyKernel)
+    std::vector<int32_t> const& batchedTokens, bool useDeepSeekFp8, bool lowLatencyKernel,
+    std::optional<int32_t> configIndex = std::nullopt)
 {
     auto eltType = tg::Dtype::E4m3;
 
@@ -56,11 +58,11 @@ void runBatchedGemm(at::Tensor& out, at::Tensor& outSfC, at::Tensor const& mat1,
     int32_t numTokens = 0;
     int32_t maxNumCtasInBatchDim = 0;
 
-    int32_t configIndex = runner.getDefaultValidConfigIndex(
-        m, n, k, batchedTokens, numTokens, batchedTokens.size(), maxNumCtasInBatchDim);
+    int32_t selectedConfig = configIndex.value_or(runner.getDefaultValidConfigIndex(
+        m, n, k, batchedTokens, numTokens, batchedTokens.size(), maxNumCtasInBatchDim));
 
     int64_t const numBytesWorkspace = runner.getWorkspaceSizeInBytes(
-        m, n, k, batchedTokens, numTokens, batchedTokens.size(), maxNumCtasInBatchDim, configIndex);
+        m, n, k, batchedTokens, numTokens, batchedTokens.size(), maxNumCtasInBatchDim, selectedConfig);
     at::Tensor workspace
         = at::detail::empty_cuda({numBytesWorkspace}, at::ScalarType::Char, mat1.device(), std::nullopt);
 
@@ -71,20 +73,21 @@ void runBatchedGemm(at::Tensor& out, at::Tensor& outSfC, at::Tensor const& mat1,
         float* outSfCPtr = outDtype == tg::Dtype::E4m3 ? outSfC.data_ptr<float>() : nullptr;
         runner.run(m, n, k, batchedTokens, mat1.const_data_ptr(), dDqSfsA.value().const_data_ptr(),
             mat2.const_data_ptr(), dDqSfsB.value().const_data_ptr(), out.data_ptr(), outSfCPtr, workspace.data_ptr(),
-            stream.stream(), mat1.get_device(), configIndex);
+            stream.stream(), mat1.get_device(), selectedConfig);
     }
     else
     {
         runner.run(m, n, k, batchedTokens, mat1.const_data_ptr(), mat2.const_data_ptr(),
             reinterpret_cast<float const*>(scaleC.value().const_data_ptr()), nullptr, out.data_ptr(),
-            workspace.data_ptr(), stream.stream(), mat1.get_device(), configIndex);
+            workspace.data_ptr(), stream.stream(), mat1.get_device(), selectedConfig);
     }
 }
 
 std::tuple<at::Tensor, at::Tensor> fp8_batched_gemm_sm100(at::Tensor const& mat1, at::Tensor const& mat2,
     int32_t tileSize, bool useDeepSeekFp8, bool lowLatencyKernel, int64_t epilogueTileM,
     std::optional<at::Tensor> const& dDqSfsA, std::optional<at::Tensor> const& dDqSfsB,
-    std::optional<at::Tensor> const& scaleC, std::optional<c10::ScalarType> outDtype)
+    std::optional<at::Tensor> const& scaleC, std::optional<c10::ScalarType> outDtype,
+    std::optional<int32_t> configIndex = std::nullopt)
 {
     TORCH_CHECK(mat1.dim() == 3, "Matrix A must be of size [B, M, K]");
     TORCH_CHECK(mat2.dim() == 3, "Matrix B must be of size [B, N, K]");
@@ -166,15 +169,15 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_gemm_sm100(at::Tensor const& mat1
     {
     case at::ScalarType::Half:
         runBatchedGemm<tg::Dtype::Fp16>(out, outSfC, mat1, mat2, dDqSfsA, dDqSfsB, scaleC, m, n, k, tileSize,
-            epilogueTileM, batchedTokens, useDeepSeekFp8, lowLatencyKernel);
+            epilogueTileM, batchedTokens, useDeepSeekFp8, lowLatencyKernel, configIndex);
         break;
     case at::ScalarType::BFloat16:
         runBatchedGemm<tg::Dtype::Bfloat16>(out, outSfC, mat1, mat2, dDqSfsA, dDqSfsB, scaleC, m, n, k, tileSize,
-            epilogueTileM, batchedTokens, useDeepSeekFp8, lowLatencyKernel);
+            epilogueTileM, batchedTokens, useDeepSeekFp8, lowLatencyKernel, configIndex);
         break;
     case at::ScalarType::Float8_e4m3fn:
         runBatchedGemm<tg::Dtype::E4m3>(out, outSfC, mat1, mat2, dDqSfsA, dDqSfsB, scaleC, m, n, k, tileSize,
-            epilogueTileM, batchedTokens, useDeepSeekFp8, lowLatencyKernel);
+            epilogueTileM, batchedTokens, useDeepSeekFp8, lowLatencyKernel, configIndex);
         break;
     default: C10_THROW_ERROR(NotImplementedError, "outDtype must be one of fp16/bf16/e4m3.");
     }
@@ -209,30 +212,43 @@ class FP8BatchedGemmRunner : public torch::CustomClassHolder
 public:
     explicit FP8BatchedGemmRunner(c10::ScalarType outDtypeArg, bool useDeepSeekFp8, bool lowLatencyKernel,
         int64_t tileSize, int64_t epilogueTileM)
+        : mOutDtypeArg(outDtypeArg)
+        , mUseDeepSeekFp8(useDeepSeekFp8)
+        , mLowLatencyKernel(lowLatencyKernel)
+        , mTileSize(tileSize)
+        , mEpilogueTileM(epilogueTileM)
     {
-        auto const eltType = tg::Dtype::E4m3;
-
-        tg::Dtype outDtype = tg::Dtype::E4m3;
 
         switch (outDtypeArg)
         {
-        case at::ScalarType::Half: outDtype = tg::Dtype::Fp16; break;
-        case at::ScalarType::BFloat16: outDtype = tg::Dtype::Bfloat16; break;
-        case at::ScalarType::Float8_e4m3fn: outDtype = tg::Dtype::E4m3; break;
+        case at::ScalarType::Half: mOutDtype = tg::Dtype::Fp16; break;
+        case at::ScalarType::BFloat16: mOutDtype = tg::Dtype::Bfloat16; break;
+        case at::ScalarType::Float8_e4m3fn: mOutDtype = tg::Dtype::E4m3; break;
         default: C10_THROW_ERROR(NotImplementedError, "outDtype must be one of fp16/bf16/e4m3.");
         }
 
-        RunnerOptionsType const options = {.eltType = eltType,
-            .outputType = outDtype,
-            .deepSeekFp8 = useDeepSeekFp8,
+        RunnerOptionsType const options = {.eltType = mEltType,
+            .outputType = mOutDtype,
+            .deepSeekFp8 = mUseDeepSeekFp8,
             .fusedAct = false,
             .routeAct = false,
             .staticBatch = true,
-            .transposeMmaOutput = lowLatencyKernel,
-            .tileSize = static_cast<int32_t>(tileSize),
-            .epilogueTileM = static_cast<int32_t>(epilogueTileM)};
+            .transposeMmaOutput = mLowLatencyKernel,
+            .tileSize = static_cast<int32_t>(mTileSize),
+            .epilogueTileM = static_cast<int32_t>(mEpilogueTileM)};
 
         mRunner = std::make_unique<RunnerType>(options);
+    }
+
+    std::tuple<at::Tensor, at::Tensor> runBatchedGemm(at::Tensor const& mat1, at::Tensor const& mat2,
+        std::optional<at::Tensor> const& dDqSfsA, std::optional<at::Tensor> const& dDqSfsB,
+        std::optional<at::Tensor> const& scaleC, int64_t configIndex)
+    {
+
+        auto const result = fp8_batched_gemm_sm100(mat1, mat2, mTileSize, mUseDeepSeekFp8, mLowLatencyKernel,
+            mEpilogueTileM, dDqSfsA, dDqSfsB, scaleC, mOutDtypeArg, configIndex);
+
+        return result;
     }
 
     std::vector<int64_t> getValidConfigs(int64_t m, int64_t n, int64_t k, int64_t numBatches) const
@@ -262,6 +278,13 @@ private:
     using RunnerOptionsType = tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions;
 
     std::unique_ptr<RunnerType> mRunner;
+    tg::Dtype mEltType{tg::Dtype::E4m3};
+    c10::ScalarType mOutDtypeArg;
+    tg::Dtype mOutDtype{tg::Dtype::E4m3};
+    bool mUseDeepSeekFp8;
+    bool mLowLatencyKernel;
+    int64_t mTileSize;
+    int64_t mEpilogueTileM;
 };
 
 } // namespace torch_ext
@@ -271,7 +294,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.class_<torch_ext::FP8BatchedGemmRunner>("FP8BatchedGemmRunner")
         .def(torch::init<at::ScalarType, bool, bool, int64_t, int64_t>())
         .def("get_valid_configs", &torch_ext::FP8BatchedGemmRunner::getValidConfigs)
-        .def("get_default_valid_config", &torch_ext::FP8BatchedGemmRunner::getDefaultValidConfigIndex);
+        .def("get_default_valid_config", &torch_ext::FP8BatchedGemmRunner::getDefaultValidConfigIndex)
+        .def("run_batched_gemm", &torch_ext::FP8BatchedGemmRunner::runBatchedGemm);
 
     m.def(
         "fp8_batched_gemm_trtllmgen(Tensor a, Tensor b, int tile_size,"
