@@ -425,6 +425,20 @@ class FP8BatchedGemmRunner(TunableRunner):
 
         return tactics
 
+    def find_nearest_profile(
+            self, shapes: Tuple[torch.Size],
+            dynamic_tensors: Tuple[Tuple[int, int, Tuple[Union[Tuple[int],
+                                                               Callable],
+                                                         Callable]]],
+            constraints: Tuple[Tuple[int, int, Callable]]) -> Tuple:
+        """Generate a unique profile to reduce host overhead during inference.
+        """
+        _, _, (_, shape_round_rule) = dynamic_tensors[0]
+        b, m, n, k = shapes[0][0], shape_round_rule(
+            shapes[0][1]), shapes[1][1], shapes[1][2]
+
+        return (b, m, n, k)
+
     def get_default_valid_tactic(
         self,
         inputs: List[torch.Tensor],
@@ -452,16 +466,17 @@ class FP8BatchedGemmRunner(TunableRunner):
 
 @torch.library.custom_op("trtllm::fp8_batched_gemm", mutates_args=())
 def fp8_batched_gemm(
-        mat1: torch.Tensor,
-        mat2: torch.Tensor,
-        tile_size: int,
-        use_deepseek_fp8: bool = False,
-        low_latency: bool = False,
-        epilogue_tile_m: int = 0,
-        dq_sfs_a: torch.Tensor = None,
-        dq_sfs_b: torch.Tensor = None,
-        scale_c: torch.Tensor = None,
-        out_dtype: torch.dtype = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    tile_size: int,
+    use_deepseek_fp8: bool = False,
+    low_latency: bool = False,
+    epilogue_tile_m: int = 0,
+    dq_sfs_a: Optional[torch.Tensor] = None,
+    dq_sfs_b: Optional[torch.Tensor] = None,
+    scale_c: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
 
     kernel_runner = FP8BatchedGemmRunner(output_dtype=out_dtype,
                                          use_deepseek_fp8=use_deepseek_fp8,
@@ -469,28 +484,46 @@ def fp8_batched_gemm(
                                          tile_size=tile_size,
                                          epilogue_tile_m=epilogue_tile_m)
 
-    chosen_tactic = kernel_runner.get_default_valid_tactic(
-        [mat1, mat2, dq_sfs_a, dq_sfs_b, scale_c])
+    tuner = AutoTuner.get()
+
+    dynamic_tensors = ((0, 1, ((8, 16, 32, 64, 128, 256, 512, 1024, 2048),
+                               lambda x: next_positive_power_of_2(x))), )
+
+    constraints = ()
+
+    tuning_config = TuningConfig(dynamic_tensors=dynamic_tensors,
+                                 constraints=constraints)
 
     inputs = [mat1, mat2, dq_sfs_a, dq_sfs_b, scale_c]
 
+    _, best_tactic = tuner.choose_one(
+        "trtllm::fp8_batched_gemm::batched_gemm",
+        [kernel_runner],
+        tuning_config,
+        inputs,
+    )
+
+    print(f"Using tactic {best_tactic} for fp8_batched_gemm")
+
     return kernel_runner(
         inputs=inputs,
-        tactic=chosen_tactic,
+        tactic=best_tactic,
     )
 
 
 @fp8_batched_gemm.register_fake
-def _(mat1: torch.Tensor,
-      mat2: torch.Tensor,
-      tile_size: int,
-      use_deepseek_fp8: bool = False,
-      low_latency: bool = False,
-      epilogue_tile_m: int = 0,
-      dq_sfs_a: torch.Tensor = None,
-      dq_sfs_b: torch.Tensor = None,
-      scale_c: torch.Tensor = None,
-      out_dtype: torch.dtype = None) -> Tuple[torch.Tensor, torch.Tensor]:
+def _(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    tile_size: int,
+    use_deepseek_fp8: bool = False,
+    low_latency: bool = False,
+    epilogue_tile_m: int = 0,
+    dq_sfs_a: Optional[torch.Tensor] = None,
+    dq_sfs_b: Optional[torch.Tensor] = None,
+    scale_c: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
 
     b = mat1.size(0)
     m = mat1.size(1)

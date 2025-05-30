@@ -156,7 +156,7 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_gemm_sm100(at::Tensor const& mat1
 
     // Create output tensor.
     at::Tensor out = at::detail::empty_cuda({b, m, outputN}, outDtype.value(), mat1.device(), std::nullopt);
-    at::Tensor outSfC;
+    at::Tensor outSfC = at::detail::empty_cuda({0, 0}, at::ScalarType::Float, mat1.device(), std::nullopt);
     if (useDeepSeekFp8 && outDtype.value() == at::ScalarType::Float8_e4m3fn)
     {
         outSfC = at::detail::empty_cuda(

@@ -402,7 +402,10 @@ class AutoTuner:
             Although runners[0] with tactic=-1 is always treated as the fallback runner.
             Runner authors are suggested to provide a fallback implementation for each runner to avoid potential issues.
         """
-        input_shapes = tuple(t.shape for t in inputs)
+
+        # Empty tensors such as unused scale factors are None
+        # Give these shape tuple(0)
+        input_shapes = tuple((0, ) if t is None else t.shape for t in inputs)
 
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:

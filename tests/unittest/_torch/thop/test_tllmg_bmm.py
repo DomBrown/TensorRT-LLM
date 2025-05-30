@@ -20,6 +20,7 @@ import pytest
 import torch
 from utils.util import getSMVersion
 
+from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm.quantization.utils.fp4_utils import shuffle_matrix_a
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
@@ -477,17 +478,18 @@ def test_fp8_batched_gemm_trtllmgen_tunable(
         out_global_scaling_factor = out_global_scaling_factor.contiguous().to(
             torch.float32)
 
-    c_actual, c_dq_sf = torch.ops.trtllm.fp8_batched_gemm(
-        a_fp8.contiguous(),
-        b_fp8.contiguous(),
-        tile_size=tile_size,
-        epilogue_tile_m=epilogue_tile_m,
-        use_deepseek_fp8=use_deep_seek_fp8,
-        low_latency=low_latency,
-        out_dtype=dtype_c,
-        dq_sfs_a=dq_sf_a,
-        dq_sfs_b=dq_sf_b,
-        scale_c=out_global_scaling_factor)
+    with autotune():
+        c_actual, c_dq_sf = torch.ops.trtllm.fp8_batched_gemm(
+            a_fp8.contiguous(),
+            b_fp8.contiguous(),
+            tile_size=tile_size,
+            epilogue_tile_m=epilogue_tile_m,
+            use_deepseek_fp8=use_deep_seek_fp8,
+            low_latency=low_latency,
+            out_dtype=dtype_c,
+            dq_sfs_a=dq_sf_a,
+            dq_sfs_b=dq_sf_b,
+            scale_c=out_global_scaling_factor)
 
     c_actual = c_actual.detach().cpu()
     c_ref = c_ref.detach().cpu()
