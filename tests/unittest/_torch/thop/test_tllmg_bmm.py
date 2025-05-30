@@ -247,265 +247,205 @@ def quant_fp8(x_fp32: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         ),
     ],
 )
-def test_fp8_batched_gemm_trtllmgen(test_case: BatchedGemmTestCase) -> None:
-    torch.random.manual_seed(42)
+class TestFP8BatchedGemmTRTLLMGen:
 
-    b = test_case.b
-    m = test_case.m
-    n = test_case.n
-    k = test_case.k
-    use_deep_seek_fp8 = test_case.use_deep_seek_fp8
-    dtype_c = test_case.dtype_c
-    low_latency = test_case.low_latency
-    tile_size = test_case.tile_size
+    def test_thop(self, test_case: BatchedGemmTestCase) -> None:
 
-    a_fp32 = torch.randn((b, m, k), device="cuda", dtype=torch.float32)
-    b_fp32 = torch.randn((b, n, k), device="cuda", dtype=torch.float32)
-    # Pad to the tile size. It is needed for the TRT-LLM Gen BMM input requirements.
-    if m % tile_size:
-        tiled_shape = ((m + tile_size - 1) // tile_size) * tile_size
-        a_fp32 = torch.nn.functional.pad(a_fp32, (0, 0, 0, tiled_shape - m),
-                                         "constant", 0)
-    m_padded = ((m + tile_size - 1) // tile_size) * tile_size
+        torch.random.manual_seed(42)
 
-    dq_sf_a = None
-    dq_sf_b = None
-    global_dq_a = None
-    global_dq_b = None
-    out_global_scaling_factor = None
+        b = test_case.b
+        m = test_case.m
+        n = test_case.n
+        k = test_case.k
+        use_deep_seek_fp8 = test_case.use_deep_seek_fp8
+        dtype_c = test_case.dtype_c
+        low_latency = test_case.low_latency
+        tile_size = test_case.tile_size
 
-    if use_deep_seek_fp8:
-        a_fp8, dq_sf_a = quant_ds_fp8(a_fp32, activations=True)
-        dq_sf_a = dq_sf_a.reshape(k // 128, -1).contiguous()
-        b_fp8, dq_sf_b = quant_ds_fp8(b_fp32, activations=False)
-        dq_sf_b = dq_sf_b.contiguous()
-    else:
-        a_fp8, global_dq_a = quant_fp8(a_fp32)
-        b_fp8, global_dq_b = quant_fp8(b_fp32)
-        out_global_scaling_factor = global_dq_a * global_dq_b
+        a_fp32 = torch.randn((b, m, k), device="cuda", dtype=torch.float32)
+        b_fp32 = torch.randn((b, n, k), device="cuda", dtype=torch.float32)
+        # Pad to the tile size. It is needed for the TRT-LLM Gen BMM input requirements.
+        if m % tile_size:
+            tiled_shape = ((m + tile_size - 1) // tile_size) * tile_size
+            a_fp32 = torch.nn.functional.pad(a_fp32, (0, 0, 0, tiled_shape - m),
+                                             "constant", 0)
+        m_padded = ((m + tile_size - 1) // tile_size) * tile_size
 
-    # Compute reference batched matrix multiplication
-    output = fp8_bmm_reference(a_fp8, b_fp8, dq_sf_a, dq_sf_b, global_dq_a,
-                               global_dq_b, dtype_c, use_deep_seek_fp8)
+        dq_sf_a = None
+        dq_sf_b = None
+        global_dq_a = None
+        global_dq_b = None
+        out_global_scaling_factor = None
 
-    c_dq_sf_ref = None
-    if dtype_c == torch.float8_e4m3fn:
         if use_deep_seek_fp8:
-            c_ref, c_dq_sf_ref = output
-            c_dq_sf_ref = c_dq_sf_ref.reshape(n // 128, -1)
+            a_fp8, dq_sf_a = quant_ds_fp8(a_fp32, activations=True)
+            dq_sf_a = dq_sf_a.reshape(k // 128, -1).contiguous()
+            b_fp8, dq_sf_b = quant_ds_fp8(b_fp32, activations=False)
+            dq_sf_b = dq_sf_b.contiguous()
         else:
-            c_ref, c_scale = output
-            out_global_scaling_factor /= c_scale.cuda()
-    else:
-        c_ref = output
+            a_fp8, global_dq_a = quant_fp8(a_fp32)
+            b_fp8, global_dq_b = quant_fp8(b_fp32)
+            out_global_scaling_factor = global_dq_a * global_dq_b
 
-    epilogue_tile_m = 64 if use_deep_seek_fp8 else 128
-    if low_latency:
-        b_fp8_shuffled = []
-        for bi in range(b):
-            b_fp8_shuffled.append(
-                shuffle_matrix_a(b_fp8[bi].view(torch.uint8).clone(),
-                                 epilogue_tile_m))
+        # Compute reference batched matrix multiplication
+        output = fp8_bmm_reference(a_fp8, b_fp8, dq_sf_a, dq_sf_b, global_dq_a,
+                                   global_dq_b, dtype_c, use_deep_seek_fp8)
 
-        # Stack weights for all experts
-        b_fp8 = torch.stack(b_fp8_shuffled).view(torch.float8_e4m3fn)
-
-    if not use_deep_seek_fp8:
-        out_global_scaling_factor = out_global_scaling_factor.contiguous().to(
-            torch.float32)
-
-    c_actual, c_dq_sf = torch.ops.trtllm.fp8_batched_gemm_trtllmgen(
-        a_fp8.contiguous(),
-        b_fp8.contiguous(),
-        tile_size=tile_size,
-        epilogue_tile_m=epilogue_tile_m,
-        use_deep_seek_fp8=use_deep_seek_fp8,
-        low_latency=low_latency,
-        out_dtype=dtype_c,
-        dq_sfs_a=dq_sf_a,
-        dq_sfs_b=dq_sf_b,
-        scale_c=out_global_scaling_factor)
-
-    c_actual = c_actual.detach().cpu()
-    c_ref = c_ref.detach().cpu()
-
-    torch.testing.assert_close(c_actual.to(torch.float32)[:, :m],
-                               c_ref.to(torch.float32)[:, :m],
-                               atol=1e-2,
-                               rtol=1e-2)
-    if use_deep_seek_fp8 and dtype_c == torch.float8_e4m3fn:
-        c_dq_sf = c_dq_sf.detach().cpu()
-        for bi in range(b):
-            torch.testing.assert_close(
-                c_dq_sf[:, bi * m_padded:bi * m_padded + m].to(torch.float32),
-                c_dq_sf_ref[:,
-                            bi * m_padded:bi * m_padded + m].to(torch.float32),
-                atol=1e-2,
-                rtol=1e-2)
-
-
-@pytest.mark.skipif(
-    getSMVersion() not in [100],
-    reason=
-    "The kernel is only supported with compute capability 100. Current compute capability is %d."
-    % getSMVersion(),
-)
-@pytest.mark.parametrize(
-    "test_case",
-    [
-        pytest.param(
-            BatchedGemmTestCase(b=4,
-                                m=8,
-                                n=256,
-                                k=512,
-                                dtype_c=torch.float8_e4m3fn,
-                                use_deep_seek_fp8=False,
-                                low_latency=True,
-                                tile_size=8),
-            id="num_batches_4_8x256x512_ll_e4m3_ts8",
-        ),
-        pytest.param(
-            BatchedGemmTestCase(b=4,
-                                m=128,
-                                n=256,
-                                k=512,
-                                dtype_c=torch.float8_e4m3fn,
-                                use_deep_seek_fp8=True,
-                                low_latency=True,
-                                tile_size=8),
-            id="num_batches_4_128x256x512_ll_e4m3_ds_ts8",
-        ),
-        pytest.param(
-            BatchedGemmTestCase(b=4,
-                                m=128,
-                                n=256,
-                                k=512,
-                                dtype_c=torch.bfloat16,
-                                use_deep_seek_fp8=False,
-                                low_latency=True,
-                                tile_size=8),
-            id="num_batches_4_128x256x512_ll_bf16_ts8",
-        ),
-        pytest.param(
-            BatchedGemmTestCase(b=4,
-                                m=128,
-                                n=256,
-                                k=512,
-                                dtype_c=torch.bfloat16,
-                                use_deep_seek_fp8=True,
-                                low_latency=True,
-                                tile_size=8),
-            id="num_batches_4_128x256x512_ll_bf16_ds_ts8",
-        ),
-        pytest.param(
-            BatchedGemmTestCase(b=4,
-                                m=2,
-                                n=128,
-                                k=512,
-                                dtype_c=torch.float8_e4m3fn,
-                                use_deep_seek_fp8=True,
-                                low_latency=True,
-                                tile_size=8),
-            id="num_batches_4_128x2x512_ll_e4m3_ds_ts8",
-        ),
-    ],
-)
-def test_fp8_batched_gemm_trtllmgen_tunable(
-        test_case: BatchedGemmTestCase) -> None:
-    torch.random.manual_seed(42)
-
-    b = test_case.b
-    m = test_case.m
-    n = test_case.n
-    k = test_case.k
-    use_deep_seek_fp8 = test_case.use_deep_seek_fp8
-    dtype_c = test_case.dtype_c
-    low_latency = test_case.low_latency
-    tile_size = test_case.tile_size
-
-    a_fp32 = torch.randn((b, m, k), device="cuda", dtype=torch.float32)
-    b_fp32 = torch.randn((b, n, k), device="cuda", dtype=torch.float32)
-    # Pad to the tile size. It is needed for the TRT-LLM Gen BMM input requirements.
-    if m % tile_size:
-        tiled_shape = ((m + tile_size - 1) // tile_size) * tile_size
-        a_fp32 = torch.nn.functional.pad(a_fp32, (0, 0, 0, tiled_shape - m),
-                                         "constant", 0)
-    m_padded = ((m + tile_size - 1) // tile_size) * tile_size
-
-    dq_sf_a = torch.empty(0, device="cuda", dtype=torch.float32)
-    dq_sf_b = torch.empty(0, device="cuda", dtype=torch.float32)
-    global_dq_a = torch.empty(0, device="cuda", dtype=torch.float32)
-    global_dq_b = torch.empty(0, device="cuda", dtype=torch.float32)
-    out_global_scaling_factor = torch.empty(0,
-                                            device="cuda",
-                                            dtype=torch.float32)
-
-    if use_deep_seek_fp8:
-        a_fp8, dq_sf_a = quant_ds_fp8(a_fp32, activations=True)
-        dq_sf_a = dq_sf_a.reshape(k // 128, -1).contiguous()
-        b_fp8, dq_sf_b = quant_ds_fp8(b_fp32, activations=False)
-        dq_sf_b = dq_sf_b.contiguous()
-    else:
-        a_fp8, global_dq_a = quant_fp8(a_fp32)
-        b_fp8, global_dq_b = quant_fp8(b_fp32)
-        out_global_scaling_factor = global_dq_a * global_dq_b
-
-    # Compute reference batched matrix multiplication
-    output = fp8_bmm_reference(a_fp8, b_fp8, dq_sf_a, dq_sf_b, global_dq_a,
-                               global_dq_b, dtype_c, use_deep_seek_fp8)
-
-    c_dq_sf_ref = None
-    if dtype_c == torch.float8_e4m3fn:
-        if use_deep_seek_fp8:
-            c_ref, c_dq_sf_ref = output
-            c_dq_sf_ref = c_dq_sf_ref.reshape(n // 128, -1)
+        c_dq_sf_ref = None
+        if dtype_c == torch.float8_e4m3fn:
+            if use_deep_seek_fp8:
+                c_ref, c_dq_sf_ref = output
+                c_dq_sf_ref = c_dq_sf_ref.reshape(n // 128, -1)
+            else:
+                c_ref, c_scale = output
+                out_global_scaling_factor /= c_scale.cuda()
         else:
-            c_ref, c_scale = output
-            out_global_scaling_factor /= c_scale.cuda()
-    else:
-        c_ref = output
+            c_ref = output
 
-    epilogue_tile_m = 64 if use_deep_seek_fp8 else 128
-    if low_latency:
-        b_fp8_shuffled = []
-        for bi in range(b):
-            b_fp8_shuffled.append(
-                shuffle_matrix_a(b_fp8[bi].view(torch.uint8).clone(),
-                                 epilogue_tile_m))
+        epilogue_tile_m = 64 if use_deep_seek_fp8 else 128
+        if low_latency:
+            b_fp8_shuffled = []
+            for bi in range(b):
+                b_fp8_shuffled.append(
+                    shuffle_matrix_a(b_fp8[bi].view(torch.uint8).clone(),
+                                     epilogue_tile_m))
 
-        # Stack weights for all experts
-        b_fp8 = torch.stack(b_fp8_shuffled).view(torch.float8_e4m3fn)
+            # Stack weights for all experts
+            b_fp8 = torch.stack(b_fp8_shuffled).view(torch.float8_e4m3fn)
 
-    if not use_deep_seek_fp8:
-        out_global_scaling_factor = out_global_scaling_factor.contiguous().to(
-            torch.float32)
+        if not use_deep_seek_fp8:
+            out_global_scaling_factor = out_global_scaling_factor.contiguous(
+            ).to(torch.float32)
 
-    with autotune():
-        c_actual, c_dq_sf = torch.ops.trtllm.fp8_batched_gemm(
+        c_actual, c_dq_sf = torch.ops.trtllm.fp8_batched_gemm_trtllmgen(
             a_fp8.contiguous(),
             b_fp8.contiguous(),
             tile_size=tile_size,
             epilogue_tile_m=epilogue_tile_m,
-            use_deepseek_fp8=use_deep_seek_fp8,
+            use_deep_seek_fp8=use_deep_seek_fp8,
             low_latency=low_latency,
             out_dtype=dtype_c,
             dq_sfs_a=dq_sf_a,
             dq_sfs_b=dq_sf_b,
             scale_c=out_global_scaling_factor)
 
-    c_actual = c_actual.detach().cpu()
-    c_ref = c_ref.detach().cpu()
+        c_actual = c_actual.detach().cpu()
+        c_ref = c_ref.detach().cpu()
 
-    torch.testing.assert_close(c_actual.to(torch.float32)[:, :m],
-                               c_ref.to(torch.float32)[:, :m],
-                               atol=1e-2,
-                               rtol=1e-2)
-    if use_deep_seek_fp8 and dtype_c == torch.float8_e4m3fn:
-        c_dq_sf = c_dq_sf.detach().cpu()
-        for bi in range(b):
-            torch.testing.assert_close(
-                c_dq_sf[:, bi * m_padded:bi * m_padded + m].to(torch.float32),
-                c_dq_sf_ref[:,
+        torch.testing.assert_close(c_actual.to(torch.float32)[:, :m],
+                                   c_ref.to(torch.float32)[:, :m],
+                                   atol=1e-2,
+                                   rtol=1e-2)
+        if use_deep_seek_fp8 and dtype_c == torch.float8_e4m3fn:
+            c_dq_sf = c_dq_sf.detach().cpu()
+            for bi in range(b):
+                torch.testing.assert_close(
+                    c_dq_sf[:,
                             bi * m_padded:bi * m_padded + m].to(torch.float32),
-                atol=1e-2,
-                rtol=1e-2)
+                    c_dq_sf_ref[:, bi * m_padded:bi * m_padded + m].to(
+                        torch.float32),
+                    atol=1e-2,
+                    rtol=1e-2)
+
+    def test_autotunable_thop(self, test_case: BatchedGemmTestCase) -> None:
+        torch.random.manual_seed(42)
+
+        b = test_case.b
+        m = test_case.m
+        n = test_case.n
+        k = test_case.k
+        use_deep_seek_fp8 = test_case.use_deep_seek_fp8
+        dtype_c = test_case.dtype_c
+        low_latency = test_case.low_latency
+        tile_size = test_case.tile_size
+
+        a_fp32 = torch.randn((b, m, k), device="cuda", dtype=torch.float32)
+        b_fp32 = torch.randn((b, n, k), device="cuda", dtype=torch.float32)
+        # Pad to the tile size. It is needed for the TRT-LLM Gen BMM input requirements.
+        if m % tile_size:
+            tiled_shape = ((m + tile_size - 1) // tile_size) * tile_size
+            a_fp32 = torch.nn.functional.pad(a_fp32, (0, 0, 0, tiled_shape - m),
+                                             "constant", 0)
+        m_padded = ((m + tile_size - 1) // tile_size) * tile_size
+
+        # We use empty tensors to avoid passing None to the autotuner
+        # which currently does not support it.
+
+        dq_sf_a = torch.empty(0, device="cuda", dtype=torch.float32)
+        dq_sf_b = torch.empty(0, device="cuda", dtype=torch.float32)
+        global_dq_a = torch.empty(0, device="cuda", dtype=torch.float32)
+        global_dq_b = torch.empty(0, device="cuda", dtype=torch.float32)
+        out_global_scaling_factor = torch.empty(0,
+                                                device="cuda",
+                                                dtype=torch.float32)
+
+        if use_deep_seek_fp8:
+            a_fp8, dq_sf_a = quant_ds_fp8(a_fp32, activations=True)
+            dq_sf_a = dq_sf_a.reshape(k // 128, -1).contiguous()
+            b_fp8, dq_sf_b = quant_ds_fp8(b_fp32, activations=False)
+            dq_sf_b = dq_sf_b.contiguous()
+        else:
+            a_fp8, global_dq_a = quant_fp8(a_fp32)
+            b_fp8, global_dq_b = quant_fp8(b_fp32)
+            out_global_scaling_factor = global_dq_a * global_dq_b
+
+        # Compute reference batched matrix multiplication
+        output = fp8_bmm_reference(a_fp8, b_fp8, dq_sf_a, dq_sf_b, global_dq_a,
+                                   global_dq_b, dtype_c, use_deep_seek_fp8)
+
+        c_dq_sf_ref = None
+        if dtype_c == torch.float8_e4m3fn:
+            if use_deep_seek_fp8:
+                c_ref, c_dq_sf_ref = output
+                c_dq_sf_ref = c_dq_sf_ref.reshape(n // 128, -1)
+            else:
+                c_ref, c_scale = output
+                out_global_scaling_factor /= c_scale.cuda()
+        else:
+            c_ref = output
+
+        epilogue_tile_m = 64 if use_deep_seek_fp8 else 128
+        if low_latency:
+            b_fp8_shuffled = []
+            for bi in range(b):
+                b_fp8_shuffled.append(
+                    shuffle_matrix_a(b_fp8[bi].view(torch.uint8).clone(),
+                                     epilogue_tile_m))
+
+            # Stack weights for all experts
+            b_fp8 = torch.stack(b_fp8_shuffled).view(torch.float8_e4m3fn)
+
+        if not use_deep_seek_fp8:
+            out_global_scaling_factor = out_global_scaling_factor.contiguous(
+            ).to(torch.float32)
+
+        with autotune():
+            c_actual, c_dq_sf = torch.ops.trtllm.fp8_batched_gemm(
+                a_fp8.contiguous(),
+                b_fp8.contiguous(),
+                tile_size=tile_size,
+                epilogue_tile_m=epilogue_tile_m,
+                use_deepseek_fp8=use_deep_seek_fp8,
+                low_latency=low_latency,
+                out_dtype=dtype_c,
+                dq_sfs_a=dq_sf_a,
+                dq_sfs_b=dq_sf_b,
+                scale_c=out_global_scaling_factor)
+
+        c_actual = c_actual.detach().cpu()
+        c_ref = c_ref.detach().cpu()
+
+        torch.testing.assert_close(c_actual.to(torch.float32)[:, :m],
+                                   c_ref.to(torch.float32)[:, :m],
+                                   atol=1e-2,
+                                   rtol=1e-2)
+        if use_deep_seek_fp8 and dtype_c == torch.float8_e4m3fn:
+            c_dq_sf = c_dq_sf.detach().cpu()
+            for bi in range(b):
+                torch.testing.assert_close(
+                    c_dq_sf[:,
+                            bi * m_padded:bi * m_padded + m].to(torch.float32),
+                    c_dq_sf_ref[:, bi * m_padded:bi * m_padded + m].to(
+                        torch.float32),
+                    atol=1e-2,
+                    rtol=1e-2)
