@@ -289,7 +289,7 @@ class NVFP4GemmRunner(TunableRunner):
 
         return (m, n, k)
 
-    def get_cache_key_specifc(self, profile: Tuple) -> Tuple:
+    def get_cache_key_specific(self, profile: Tuple) -> Tuple:
         """Generate a unique cache key for the given profile.
         """
         return (self.sf_use_ue8m0, self.output_dtype), profile
@@ -456,7 +456,7 @@ class FP8BatchedGemmRunner(TunableRunner):
 
         return default_tactic
 
-    def get_cache_key_specifc(self, profile: Tuple) -> Tuple:
+    def get_cache_key_specific(self, profile: Tuple) -> Tuple:
         """Generate a unique cache key for the given profile.
         """
         return (self.output_dtype, self.use_deepseek_fp8,

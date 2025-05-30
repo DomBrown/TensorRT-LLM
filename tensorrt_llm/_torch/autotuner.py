@@ -218,7 +218,7 @@ class TunableRunner(ABC):
             dynamic_tensors=tuning_config.dynamic_tensors,
             constraints=tuning_config.constraints)
         return (self.get_cache_key_general(custom_op),
-                self.get_cache_key_specifc(nearest_profile))
+                self.get_cache_key_specific(nearest_profile))
 
     def get_cache_key_general(self, custom_op: str) -> Tuple:
         """Generate the general part of cache key.
@@ -232,7 +232,7 @@ class TunableRunner(ABC):
         """
         return custom_op, self.__class__.__name__
 
-    def get_cache_key_specifc(self, profile: Tuple) -> Tuple:
+    def get_cache_key_specific(self, profile: Tuple) -> Tuple:
         """Generate the specific part of cache key.
         User can define their own cache key assembly method to reduce the host overhead.
         Args:
