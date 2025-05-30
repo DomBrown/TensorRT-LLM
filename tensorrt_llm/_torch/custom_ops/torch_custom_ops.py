@@ -464,6 +464,20 @@ class FP8BatchedGemmRunner(TunableRunner):
                 self.epilogue_tile_m), profile
 
 
+def div_up(a, b):
+    return (a + b - 1) // b
+
+
+def constrain_dq_sfs_a_dim1(shapes, tile_size=8):
+
+    b = shapes[0][0]
+    m = shapes[0][1]
+
+    result = div_up(m, tile_size) * tile_size * b
+
+    return result
+
+
 @torch.library.custom_op("trtllm::fp8_batched_gemm", mutates_args=())
 def fp8_batched_gemm(
     mat1: torch.Tensor,
@@ -489,7 +503,11 @@ def fp8_batched_gemm(
     dynamic_tensors = ((0, 1, ((8, 16, 32, 64, 128, 256, 512, 1024, 2048),
                                lambda x: next_positive_power_of_2(x))), )
 
-    constraints = ()
+    # When using deepseek fp8, the dq_sfs_a and dq_sfs_b tensors are expected to
+    # have specific dimensions. As we are only tuning M, we need only constrain
+    # dimension 1 of dq_sfs_a
+    constraints = () if not use_deepseek_fp8 else ((2, 1,
+                                                    constrain_dq_sfs_a_dim1), )
 
     tuning_config = TuningConfig(dynamic_tensors=dynamic_tensors,
                                  constraints=constraints)
@@ -502,8 +520,6 @@ def fp8_batched_gemm(
         tuning_config,
         inputs,
     )
-
-    print(f"Using tactic {best_tactic} for fp8_batched_gemm")
 
     return kernel_runner(
         inputs=inputs,

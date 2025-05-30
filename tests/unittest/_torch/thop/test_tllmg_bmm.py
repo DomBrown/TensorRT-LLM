@@ -432,11 +432,13 @@ def test_fp8_batched_gemm_trtllmgen_tunable(
                                          "constant", 0)
     m_padded = ((m + tile_size - 1) // tile_size) * tile_size
 
-    dq_sf_a = None
-    dq_sf_b = None
-    global_dq_a = None
-    global_dq_b = None
-    out_global_scaling_factor = None
+    dq_sf_a = torch.empty(0, device="cuda", dtype=torch.float32)
+    dq_sf_b = torch.empty(0, device="cuda", dtype=torch.float32)
+    global_dq_a = torch.empty(0, device="cuda", dtype=torch.float32)
+    global_dq_b = torch.empty(0, device="cuda", dtype=torch.float32)
+    out_global_scaling_factor = torch.empty(0,
+                                            device="cuda",
+                                            dtype=torch.float32)
 
     if use_deep_seek_fp8:
         a_fp8, dq_sf_a = quant_ds_fp8(a_fp32, activations=True)
