@@ -114,7 +114,7 @@ class Attention(nn.Module):
         config: Optional[ModelConfig] = None,
         q_scaling: float = 1.0,
         attention_chunk_size: Optional[int] = None,
-        use_cute_dsl_blockscaling_mm: bool = False,
+        use_cute_dsl_blockscaling_mm: Optional[bool] = False,
     ):
         """
         Initialize the Attention module.
