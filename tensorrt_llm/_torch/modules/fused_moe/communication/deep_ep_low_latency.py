@@ -163,6 +163,11 @@ class DeepEPLowLatency(Communication):
             return False
         if self.weight_dtype != torch.bfloat16:
             return False
+        # Mixed context+decode batches produce imbalanced token counts across ranks.
+        # CUDA graphs capture all_rank_max_num_tokens as a constant kernel parameter;
+        # if ranks see different values (e.g. 1024 vs 2), the NVSHMEM barrier deadlocks.
+        if len(all_rank_num_tokens) > 1 and min(all_rank_num_tokens) != all_rank_max_num_tokens:
+            return False
         return True
 
     def dispatch(
@@ -180,6 +185,14 @@ class DeepEPLowLatency(Communication):
         DeepEP Low Latency dispatch
         """
         all_rank_max_num_tokens = max(all_rank_num_tokens)
+
+        # DeepEP TMA requires (ep_size * num_max_dispatch_tokens_per_rank) % 4 == 0.
+        # Round up to the next valid multiple — safe because this arg is only an
+        # upper-bound for buffer sizing; extra slots are never read back.
+        ep_size = self.mapping.moe_ep_size
+        tma_align = max(1, (4 + ep_size - 1) // ep_size)
+        all_rank_max_num_tokens = (
+            (all_rank_max_num_tokens + tma_align - 1) // tma_align * tma_align)
 
         assert all_rank_max_num_tokens <= self.deep_ep_max_num_tokens
 
@@ -206,6 +219,7 @@ class DeepEPLowLatency(Communication):
                 "deep_ep_topk_idx": deep_ep_topk_idx,
                 "deep_ep_topk_weights": deep_ep_topk_weights,
                 "recv_expert_count": recv_expert_count,
+                "all_rank_max_num_tokens": all_rank_max_num_tokens,
             }
 
         else:
@@ -299,6 +313,7 @@ class DeepEPLowLatency(Communication):
                 "deep_ep_topk_idx": deep_ep_topk_idx,
                 "deep_ep_topk_weights": deep_ep_topk_weights,
                 "recv_expert_count": recv_expert_count,
+                "all_rank_max_num_tokens": all_rank_max_num_tokens,
             }
 
         return hidden_states, hidden_states_sf, token_selected_slots, token_final_scales
@@ -316,10 +331,9 @@ class DeepEPLowLatency(Communication):
         deep_ep_topk_weights = self._dispatch_state["deep_ep_topk_weights"]
         recv_expert_count = self._dispatch_state["recv_expert_count"]
 
-        all_rank_max_num_tokens = kwargs.get("all_rank_max_num_tokens")
-        assert all_rank_max_num_tokens is not None, (
-            "all_rank_max_num_tokens must be provided in kwargs"
-        )
+        # Use the padded value stored at dispatch time so combine's view matches
+        # the expert output buffer size (which was sized with the padded token count).
+        all_rank_max_num_tokens = self._dispatch_state["all_rank_max_num_tokens"]
         num_tokens_per_expert = self.mapping.moe_ep_size * all_rank_max_num_tokens
 
         final_hidden_states = final_hidden_states.view(

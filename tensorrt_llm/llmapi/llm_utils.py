@@ -483,12 +483,47 @@ class ModelLoader:
                         raise ValueError(
                             f"Unsupported weights_quant_strategy: {weights_quant_strategy}. "
                             "Supported strategies: 'channel', 'block'.")
+                elif (weights_quant_config["num_bits"] == 4
+                      and weights_quant_config.get("type") == "float"
+                      and weights_quant_strategy == "tensor_group"):
+                    # llm-compressor NVFP4: weights FP4 with FP8 per-group
+                    # scales (group_size=16), scaled by an FP32 global scale.
+                    if inputs_quant_strategy != "tensor_group":
+                        raise ValueError(
+                            f"Unsupported inputs_quant_strategy for NVFP4: {inputs_quant_strategy}."
+                        )
+                    group_size = weights_quant_config["group_size"]
+                    if group_size != 16:
+                        raise ValueError(
+                            f"Unsupported group_size: {group_size}. Supported: 16 for NVFP4."
+                        )
+                    quant_config.quant_algo = QuantAlgo.NVFP4
+                    quant_config.group_size = group_size
                 else:
                     raise ValueError(
                         f"Unsupported quant_bits: {weights_quant_config['num_bits']}. "
-                        "Supported: 8.")
+                        "Supported: 8 (FP8) or 4 (NVFP4).")
+
+                # kv_cache_scheme (llm-compressor): FP8 per-tensor KV cache.
+                kv_cache_scheme = hf_quant_config.get("kv_cache_scheme")
+                if kv_cache_scheme is not None:
+                    if (kv_cache_scheme.get("num_bits") == 8
+                            and kv_cache_scheme.get("type") == "float"):
+                        if quant_config.kv_cache_quant_algo in (None,
+                                                                QuantAlgo.FP8):
+                            quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+                        else:
+                            raise ValueError(
+                                f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, "
+                                f"conflicting with FP8 KV cache from HF quant config."
+                            )
+                    else:
+                        raise ValueError(
+                            f"Unsupported kv_cache_scheme: {kv_cache_scheme}.")
 
                 quant_config.exclude_modules = hf_quant_config.get("ignore", [])
+            elif hf_quant_config.get("quant_method") is None:
+                pass  # quantization_config present but quant_method is null → no quantization
             else:
                 raise NotImplementedError(
                     f"Unsupported quantization_config: {hf_quant_config}.")
