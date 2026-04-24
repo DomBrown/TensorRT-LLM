@@ -22,7 +22,6 @@ from .quantization import UnquantizedFusedMoEMethod
 
 # isort: off
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
-                           DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
                            FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
                            NVFP4CutlassFusedMoEMethod,
                            INT8WoqPerChannelFusedMoEMethod,
@@ -594,8 +593,8 @@ class CutlassFusedMoE(MoE):
         if self.has_deepseek_fp8_block_scales and get_sm_version() == 120:
             from .fused_moe_triton_fp8_block_scale import \
                 run_triton_fp8_block_scale_moe
-            _use_alltoall = (enable_alltoall if enable_alltoall is not None
-                             else self.enable_alltoall)
+            _use_alltoall = (enable_alltoall if enable_alltoall is not None else
+                             self.enable_alltoall)
             # token_selected_experts contains GLOBAL expert IDs in the non-alltoall
             # path (slot_start .. slot_end-1 for this rank's local experts, plus
             # IDs for other ranks).  The Triton kernel operates on LOCAL IDs

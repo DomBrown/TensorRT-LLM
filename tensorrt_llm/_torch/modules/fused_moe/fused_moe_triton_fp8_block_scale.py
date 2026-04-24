@@ -14,11 +14,12 @@ vLLM reference:
   vllm/model_executor/layers/fused_moe/utils.py      (_fp8_quantize)
 """
 
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from typing import Optional
 
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
@@ -49,8 +50,7 @@ def _per_token_group_quant_fp8_kernel(
     offs = pid_g * GROUP_K + tl.arange(0, GROUP_K)
     mask = offs < K
 
-    x = tl.load(x_ptr + pid_m * K + offs, mask=mask,
-                 other=0.0).to(tl.float32)
+    x = tl.load(x_ptr + pid_m * K + offs, mask=mask, other=0.0).to(tl.float32)
     absmax = tl.max(tl.abs(x))
     scale = tl.where(absmax == 0.0, 1.0, absmax / FP8_MAX)
 
@@ -77,9 +77,7 @@ def per_token_group_quant_fp8(
     num_groups = K // group_k
 
     x_q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    scales = torch.empty((num_tokens, num_groups),
-                         dtype=torch.float32,
-                         device=x.device)
+    scales = torch.empty((num_tokens, num_groups), dtype=torch.float32, device=x.device)
 
     _per_token_group_quant_fp8_kernel[(num_tokens, num_groups)](
         x,
@@ -206,13 +204,13 @@ def _moe_scatter_kernel(
 if IS_CUTLASS_DSL_AVAILABLE:
     import cutlass
     import cutlass.cute as _cute
+    from cutlass._mlir.dialects import arith as _cute_arith
     from cutlass.cute.runtime import from_dlpack as _from_dlpack
     from cutlass.utils.distributed import atomicAdd as _atomicAdd
-    from cutlass._mlir.dialects import arith as _cute_arith
 
 if IS_CUTLASS_DSL_AVAILABLE:
-    _CUTE_HIST_BLOCK_N = 32      # threads per CTA for histogram / scatter
-    _CUTE_PREFIX_THREADS = 256   # must be >= num_experts (Laguna: 256)
+    _CUTE_HIST_BLOCK_N = 32  # threads per CTA for histogram / scatter
+    _CUTE_PREFIX_THREADS = 256  # must be >= num_experts (Laguna: 256)
 
     # ── Phase 1: per-expert histogram ─────────────────────────────────────────
     @_cute.kernel
@@ -255,9 +253,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         padded = cutlass.Int32(0)
         if tidx < num_experts:
             cnt = gCounts[(tidx,)]
-            padded = (
-                (cnt + block_size - cutlass.Int32(1)) // block_size
-            ) * block_size
+            padded = ((cnt + block_size - cutlass.Int32(1)) // block_size) * block_size
 
         # Kogge-Stone warp inclusive prefix scan.
         # mask_and_clamp=0 → source lane clamped at 0 (not at WARP_SIZE-1).
@@ -265,9 +261,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         for _off in [1, 2, 4, 8, 16]:
             other = _cute.arch.shuffle_sync_up(val, _off, 0xFFFFFFFF, 0)
             cond = lane_id >= _off
-            val = cutlass.Int32(_cute_arith.select(
-                cond.ir_value(), (val + other).ir_value(), val.ir_value()
-            ))
+            val = cutlass.Int32(
+                _cute_arith.select(cond.ir_value(), (val + other).ir_value(), val.ir_value())
+            )
 
         # Cross-warp merge via shared memory.
         smem_ptr = _cute.arch.alloc_smem(cutlass.Int32, _NUM_WARPS + 1)
@@ -311,9 +307,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         expert_id = _cute.arch.block_idx()[0]
         cnt = gCounts[(expert_id,)]
         off = gOffsets[(expert_id,)]
-        padded = (
-            (cnt + block_size - cutlass.Int32(1)) // block_size
-        ) * block_size
+        padded = ((cnt + block_size - cutlass.Int32(1)) // block_size) * block_size
         start_blk = off // block_size
         n_blk = padded // block_size
         for i in range(n_blk):
@@ -360,12 +354,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         _cute_moe_prefix_dual_kernel(
             mCounts, mOffsets, mCounters, mNumPostPad, block_size, num_experts
         ).launch(grid=(1, 1, 1), block=(_CUTE_PREFIX_THREADS, 1, 1))
-        _cute_moe_expert_ids_kernel(
-            mCounts, mOffsets, mExpertIds, block_size
-        ).launch(grid=(num_experts, 1, 1), block=(1, 1, 1))
-        _cute_moe_scatter_kernel(
-            mFlatIds, mCounters, mSortedTokIds, N, _BLOCK_N
-        ).launch(grid=(num_blocks_N, 1, 1), block=(_CUTE_HIST_BLOCK_N, 1, 1))
+        _cute_moe_expert_ids_kernel(mCounts, mOffsets, mExpertIds, block_size).launch(
+            grid=(num_experts, 1, 1), block=(1, 1, 1)
+        )
+        _cute_moe_scatter_kernel(mFlatIds, mCounters, mSortedTokIds, N, _BLOCK_N).launch(
+            grid=(num_blocks_N, 1, 1), block=(_CUTE_HIST_BLOCK_N, 1, 1)
+        )
 
     # ── Compiled-kernel cache (keyed by device string) ────────────────────────
     _cute_moe_compiled_cache: dict = {}
@@ -381,9 +375,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         compiled = _cute.compile(
             _cute_moe_fused_host,
-            _fake_i32(), _fake_i32(), _fake_i32(), _fake_i32(),
-            _fake_i32(), _fake_i32(), _fake_i32(),
-            cutlass.Int32(1), cutlass.Int32(16), cutlass.Int32(256),
+            _fake_i32(),
+            _fake_i32(),
+            _fake_i32(),
+            _fake_i32(),
+            _fake_i32(),
+            _fake_i32(),
+            _fake_i32(),
+            cutlass.Int32(1),
+            cutlass.Int32(16),
+            cutlass.Int32(256),
         )
         _cute_moe_compiled_cache[device] = compiled
         return compiled
@@ -430,20 +431,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_m_blocks_static = N // block_size + num_experts
 
         # All buffers have statically known sizes → CUDA-graph safe.
-        counts = torch.zeros(num_experts, dtype=torch.int32,
-                             device=topk_ids.device)
-        offsets = torch.empty(num_experts, dtype=torch.int32,
-                              device=topk_ids.device)
-        counters = torch.empty(num_experts, dtype=torch.int32,
-                               device=topk_ids.device)
+        counts = torch.zeros(num_experts, dtype=torch.int32, device=topk_ids.device)
+        offsets = torch.empty(num_experts, dtype=torch.int32, device=topk_ids.device)
+        counters = torch.empty(num_experts, dtype=torch.int32, device=topk_ids.device)
         sorted_token_ids = torch.full(
             (max_tokens_static,), N, dtype=torch.int32, device=topk_ids.device
         )
         expert_ids_out = torch.zeros(
             (num_m_blocks_static,), dtype=torch.int32, device=topk_ids.device
         )
-        num_post_pad = torch.empty(1, dtype=torch.int32,
-                                   device=topk_ids.device)
+        num_post_pad = torch.empty(1, dtype=torch.int32, device=topk_ids.device)
 
         compiled = _get_cute_moe_compiled(device)
 
@@ -451,9 +448,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return _from_dlpack(t).mark_layout_dynamic()
 
         compiled(
-            _fd(flat_ids), _fd(counts), _fd(offsets), _fd(counters),
-            _fd(num_post_pad), _fd(expert_ids_out), _fd(sorted_token_ids),
-            cutlass.Int32(N), cutlass.Int32(block_size),
+            _fd(flat_ids),
+            _fd(counts),
+            _fd(offsets),
+            _fd(counters),
+            _fd(num_post_pad),
+            _fd(expert_ids_out),
+            _fd(sorted_token_ids),
+            cutlass.Int32(N),
+            cutlass.Int32(block_size),
             cutlass.Int32(num_experts),
         )
 
@@ -504,24 +507,18 @@ def moe_align_block_size(
     # Persistent buffers — all constant-size, CUDA-graph compatible
     counts = torch.zeros(num_experts, dtype=torch.int32, device=device)
     out_offsets = torch.empty(num_experts, dtype=torch.int32, device=device)
-    sorted_token_ids = torch.full((max_tokens_static, ),
-                                  N,
-                                  dtype=torch.int32,
-                                  device=device)
-    expert_ids_out = torch.zeros((num_m_blocks_static, ),
-                                 dtype=torch.int32,
-                                 device=device)
+    sorted_token_ids = torch.full((max_tokens_static,), N, dtype=torch.int32, device=device)
+    expert_ids_out = torch.zeros((num_m_blocks_static,), dtype=torch.int32, device=device)
     num_post_pad = torch.empty(1, dtype=torch.int32, device=device)
 
     _BLOCK_N = 32  # one warp per program; minimises waste for small N (decode)
 
     # Phase 1: histogram
     if N > 0:
-        _moe_histogram_kernel[triton.cdiv(N, _BLOCK_N), ](
-            flat_ids, counts, N, BLOCK_N=_BLOCK_N)
+        _moe_histogram_kernel[triton.cdiv(N, _BLOCK_N),](flat_ids, counts, N, BLOCK_N=_BLOCK_N)
 
     # Phase 2: exclusive prefix sum → out_offsets; sum → num_post_pad
-    _moe_prefix_kernel[1, ](
+    _moe_prefix_kernel[1,](
         counts,
         out_offsets,
         num_post_pad,
@@ -530,7 +527,7 @@ def moe_align_block_size(
     )
 
     # Phase 3: fill expert_ids_out (one CTA per expert, runtime inner loop)
-    _moe_expert_ids_kernel[num_experts, ](
+    _moe_expert_ids_kernel[num_experts,](
         counts,
         out_offsets,
         expert_ids_out,
@@ -541,8 +538,9 @@ def moe_align_block_size(
     # Phase 4: scatter — use a mutable copy of out_offsets as per-expert counters
     if N > 0:
         counters = out_offsets.clone()
-        _moe_scatter_kernel[triton.cdiv(N, _BLOCK_N), ](
-            flat_ids, counters, sorted_token_ids, N, BLOCK_N=_BLOCK_N)
+        _moe_scatter_kernel[triton.cdiv(N, _BLOCK_N),](
+            flat_ids, counters, sorted_token_ids, N, BLOCK_N=_BLOCK_N
+        )
 
     return sorted_token_ids, expert_ids_out, num_post_pad
 
@@ -565,8 +563,7 @@ def _write_zeros_to_output(
 ):
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = (c_ptr + stride_cm * offs_token[:, None] +
-              stride_cn * offs_cn[None, :])
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, acc, mask=c_mask)
 
@@ -651,27 +648,34 @@ def _fused_moe_fp8_block_scale_kernel(
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_experts == -1:
-        _write_zeros_to_output(c_ptr, stride_cm, stride_cn, pid_n, N,
-                               offs_token, token_mask, BLOCK_SIZE_M,
-                               BLOCK_SIZE_N, compute_type)
+        _write_zeros_to_output(
+            c_ptr,
+            stride_cm,
+            stride_cn,
+            pid_n,
+            N,
+            offs_token,
+            token_mask,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            compute_type,
+        )
         return
 
-    offs_bn = (pid_n * BLOCK_SIZE_N +
-               tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     # A pointer: row = original token index (offs_token // top_k)
-    a_ptrs = (a_ptr + offs_token[:, None] // top_k * stride_am +
-              offs_k[None, :] * stride_ak)
+    a_ptrs = a_ptr + offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
     # B pointer: row = K index, col = N index, sliced per expert
-    b_ptrs = (b_ptr + off_experts * stride_be +
-              offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    b_ptrs = (
+        b_ptr + off_experts * stride_be + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    )
 
     # Scale pointers (block-wise)
     a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
     offs_bsn = offs_bn // group_n  # N-block index per output column
-    b_scale_ptrs = (b_scale_ptr + off_experts * stride_bse +
-                    offs_bsn * stride_bsn)
+    b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -680,17 +684,13 @@ def _fused_moe_fp8_block_scale_kernel(
             mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
             other=0.0,
         )
-        b = tl.load(b_ptrs,
-                    mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
-                    other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
         # Per-block dequantization: load one A-scale per token-row,
         # one B-scale per N-column (scalar within the current N-tile).
         k_start = k * BLOCK_SIZE_K
         offs_ks = k_start // group_k
-        a_scale = tl.load(a_scale_ptrs + offs_ks * stride_ask,
-                          mask=token_mask,
-                          other=0.0)
+        a_scale = tl.load(a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0)
         b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
 
         accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
@@ -699,16 +699,13 @@ def _fused_moe_fp8_block_scale_kernel(
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
     if MUL_ROUTED_WEIGHT:
-        moe_weight = tl.load(topk_weights_ptr + offs_token,
-                             mask=token_mask,
-                             other=0.0)
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
         accumulator *= moe_weight[:, None]
 
     accumulator = accumulator.to(compute_type)
 
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = (c_ptr + stride_cm * offs_token[:, None] +
-              stride_cn * offs_cn[None, :])
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
@@ -743,18 +740,30 @@ def _invoke_fp8_block_scale_moe_kernel(
     num_valid = A.shape[0] * top_k
     group_n, group_k = _BLOCK_SHAPE[1], _BLOCK_SHAPE[0]
 
-    grid = lambda META: (
-        triton.cdiv(EM, META["BLOCK_SIZE_M"]) *
-        triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    )
+    def grid(META):
+        return (triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
 
     _fused_moe_fp8_block_scale_kernel[grid](
-        A, B, C, A_scale, B_scale, topk_weights,
-        sorted_token_ids, expert_ids, num_tokens_post_padded,
-        N, K, EM, num_valid,
-        A.stride(0), A.stride(1),
-        B.stride(0), B.stride(2), B.stride(1),
-        C.stride(1), C.stride(2),
+        A,
+        B,
+        C,
+        A_scale,
+        B_scale,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        N,
+        K,
+        EM,
+        num_valid,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(2),
+        B.stride(1),
+        C.stride(1),
+        C.stride(2),
         A_scale.stride(0) if A_scale.ndim == 2 else 0,
         A_scale.stride(1) if A_scale.ndim == 2 else 0,
         B_scale.stride(0) if B_scale.ndim >= 2 else 0,
@@ -780,10 +789,10 @@ def _invoke_fp8_block_scale_moe_kernel(
 @triton.jit
 def _fused_moe_bf16act_fp8w_kernel(
     # Tensor pointers
-    a_ptr,           # (num_tokens, K)              BF16 activations
-    b_ptr,           # (E, N, K)                    FP8 weights
-    c_ptr,           # (num_tokens, top_k, N)        BF16 output
-    b_scale_ptr,     # (E, N//group_n, K//group_k)   F32 weight block scales
+    a_ptr,  # (num_tokens, K)              BF16 activations
+    b_ptr,  # (E, N, K)                    FP8 weights
+    c_ptr,  # (num_tokens, top_k, N)        BF16 output
+    b_scale_ptr,  # (E, N//group_n, K//group_k)   F32 weight block scales
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
@@ -846,23 +855,30 @@ def _fused_moe_bf16act_fp8w_kernel(
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_experts == -1:
-        _write_zeros_to_output(c_ptr, stride_cm, stride_cn, pid_n, N,
-                               offs_token, token_mask, BLOCK_SIZE_M,
-                               BLOCK_SIZE_N, compute_type)
+        _write_zeros_to_output(
+            c_ptr,
+            stride_cm,
+            stride_cn,
+            pid_n,
+            N,
+            offs_token,
+            token_mask,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            compute_type,
+        )
         return
 
-    offs_bn = (pid_n * BLOCK_SIZE_N +
-               tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-    a_ptrs = (a_ptr + offs_token[:, None] // top_k * stride_am +
-              offs_k[None, :] * stride_ak)
-    b_ptrs = (b_ptr + off_experts * stride_be +
-              offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    a_ptrs = a_ptr + offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = (
+        b_ptr + off_experts * stride_be + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    )
 
     offs_bsn = offs_bn // group_n
-    b_scale_ptrs = (b_scale_ptr + off_experts * stride_bse +
-                    offs_bsn * stride_bsn)
+    b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -873,9 +889,7 @@ def _fused_moe_bf16act_fp8w_kernel(
             other=0.0,
         )
         # FP8 weights — dequant to BF16 on-the-fly
-        b_fp8 = tl.load(b_ptrs,
-                        mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
-                        other=0.0)
+        b_fp8 = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
         b = b_fp8.to(tl.bfloat16)
 
         k_start = k * BLOCK_SIZE_K
@@ -889,16 +903,13 @@ def _fused_moe_bf16act_fp8w_kernel(
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
     if MUL_ROUTED_WEIGHT:
-        moe_weight = tl.load(topk_weights_ptr + offs_token,
-                             mask=token_mask,
-                             other=0.0)
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
         accumulator *= moe_weight[:, None]
 
     accumulator = accumulator.to(compute_type)
 
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = (c_ptr + stride_cm * offs_token[:, None] +
-              stride_cn * offs_cn[None, :])
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
@@ -930,18 +941,29 @@ def _invoke_bf16act_fp8w_moe_kernel(
     K = B.shape[2]
     group_n, group_k = _BLOCK_SHAPE[1], _BLOCK_SHAPE[0]
 
-    grid = lambda META: (
-        triton.cdiv(EM, META["BLOCK_SIZE_M"]) *
-        triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    )
+    def grid(META):
+        return (triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
 
     _fused_moe_bf16act_fp8w_kernel[grid](
-        A, B, C, B_scale, topk_weights,
-        sorted_token_ids, expert_ids, num_tokens_post_padded,
-        N, K, EM, A.shape[0] * top_k,
-        A.stride(0), A.stride(1),
-        B.stride(0), B.stride(2), B.stride(1),
-        C.stride(1), C.stride(2),
+        A,
+        B,
+        C,
+        B_scale,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        N,
+        K,
+        EM,
+        A.shape[0] * top_k,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(2),
+        B.stride(1),
+        C.stride(1),
+        C.stride(2),
         B_scale.stride(0) if B_scale.ndim >= 2 else 0,
         B_scale.stride(2) if B_scale.ndim == 3 else 0,
         B_scale.stride(1) if B_scale.ndim >= 2 else 0,
@@ -991,9 +1013,10 @@ def _run_moe_bf16_fallback(
         for e in range(E):
             for nb in range(Nb):
                 for kb in range(Kb):
-                    blk = w_fp8[e, nb*128:(nb+1)*128, kb*128:(kb+1)*128].float()
-                    out[e, nb*128:(nb+1)*128, kb*128:(kb+1)*128] = \
-                        (blk * scales[e, nb, kb]).bfloat16()
+                    blk = w_fp8[e, nb * 128 : (nb + 1) * 128, kb * 128 : (kb + 1) * 128].float()
+                    out[e, nb * 128 : (nb + 1) * 128, kb * 128 : (kb + 1) * 128] = (
+                        blk * scales[e, nb, kb]
+                    ).bfloat16()
         return out
 
     w31_bf16 = dequant_weight(w3_w1, w3_w1_scales)
@@ -1054,27 +1077,41 @@ def run_triton_fp8_block_scale_moe(
     Returns:
         (T, H) BF16 output tensor
     """
-    from tensorrt_llm._torch.modules.fused_moe.interface import ActivationType
     import os
-    _debug = os.environ.get('TRTLLM_MOE_TRITON_DEBUG', '0') == '1'
+
+    from tensorrt_llm._torch.modules.fused_moe.interface import ActivationType
+
+    _debug = os.environ.get("TRTLLM_MOE_TRITON_DEBUG", "0") == "1"
 
     num_tokens, hidden = x.shape
     num_experts, N_gate_up, _ = w3_w1.shape
     if _debug:
         import sys
-        print(f"[TritonMoE] x={x.shape} {x.dtype}, w31={w3_w1.shape} {w3_w1.dtype}, "
-              f"w31sc={w3_w1_scales.shape} {w3_w1_scales.dtype}, "
-              f"w2={w2.shape} {w2.dtype}, w2sc={w2_scales.shape} {w2_scales.dtype}, "
-              f"tok_exp={token_selected_experts.shape} {token_selected_experts.dtype}",
-              file=sys.stderr, flush=True)
-        print(f"[TritonMoE] w31sc[0,:2,:2]={w3_w1_scales[0,:2,:2]}", file=sys.stderr, flush=True)
-        print(f"[TritonMoE] w2sc[0,:2,:2]={w2_scales[0,:2,:2]}", file=sys.stderr, flush=True)
+
+        print(
+            f"[TritonMoE] x={x.shape} {x.dtype}, w31={w3_w1.shape} {w3_w1.dtype}, "
+            f"w31sc={w3_w1_scales.shape} {w3_w1_scales.dtype}, "
+            f"w2={w2.shape} {w2.dtype}, w2sc={w2_scales.shape} {w2_scales.dtype}, "
+            f"tok_exp={token_selected_experts.shape} {token_selected_experts.dtype}",
+            file=sys.stderr,
+            flush=True,
+        )
+        print(f"[TritonMoE] w31sc[0,:2,:2]={w3_w1_scales[0, :2, :2]}", file=sys.stderr, flush=True)
+        print(f"[TritonMoE] w2sc[0,:2,:2]={w2_scales[0, :2, :2]}", file=sys.stderr, flush=True)
     # Slow Python-loop fallback for debugging (enable with TRTLLM_MOE_TRITON_BF16=1)
-    _bf16_mode = os.environ.get('TRTLLM_MOE_TRITON_BF16', '0') == '1'
+    _bf16_mode = os.environ.get("TRTLLM_MOE_TRITON_BF16", "0") == "1"
     if _bf16_mode:
         return _run_moe_bf16_fallback(
-            x, token_selected_experts, token_final_scales,
-            w3_w1, w3_w1_scales, w2, w2_scales, activation_type, output_dtype)
+            x,
+            token_selected_experts,
+            token_final_scales,
+            w3_w1,
+            w3_w1_scales,
+            w2,
+            w2_scales,
+            activation_type,
+            output_dtype,
+        )
 
     intermediate = N_gate_up // 2
     top_k = token_selected_experts.shape[1]
@@ -1088,17 +1125,20 @@ def run_triton_fp8_block_scale_moe(
 
     # ── Align token-expert pairs by expert ───────────────────────────────────
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        token_selected_experts, _BLOCK_SIZE_M, num_experts)
+        token_selected_experts, _BLOCK_SIZE_M, num_experts
+    )
 
     # ── Phase 1 GEMM: x_bf16 @ w3_w1^T (FP8, dequant on-the-fly) ───────────
-    ic1 = torch.zeros((num_tokens, top_k, N_gate_up),
-                      dtype=torch.bfloat16,
-                      device=device)
+    ic1 = torch.zeros((num_tokens, top_k, N_gate_up), dtype=torch.bfloat16, device=device)
     _invoke_bf16act_fp8w_moe_kernel(
-        x.contiguous(), w3_w1, ic1,
+        x.contiguous(),
+        w3_w1,
+        ic1,
         w3_w1_scales,
         token_final_scales,
-        sorted_token_ids, expert_ids, num_tokens_post_padded,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
         mul_routed_weight=False,
         top_k=top_k,
     )
@@ -1114,22 +1154,22 @@ def run_triton_fp8_block_scale_moe(
     elif act_int in (geglu, gelu):
         ic2 = F.gelu(gate) * up
     else:
-        raise ValueError(
-            f"Unsupported activation_type={act_int} in Triton FP8 block-scale MoE"
-        )
+        raise ValueError(f"Unsupported activation_type={act_int} in Triton FP8 block-scale MoE")
 
     ic2 = ic2.contiguous()  # (T*top_k, I)  BF16
 
     # ── Phase 2 GEMM: ic2_bf16 @ w2^T (FP8, dequant on-the-fly) ────────────
     # top_k=1: each ic2 row is already one (token, expert) pair
-    ic3 = torch.zeros((num_tokens, top_k, hidden),
-                      dtype=torch.bfloat16,
-                      device=device)
+    ic3 = torch.zeros((num_tokens, top_k, hidden), dtype=torch.bfloat16, device=device)
     _invoke_bf16act_fp8w_moe_kernel(
-        ic2, w2, ic3,
+        ic2,
+        w2,
+        ic3,
         w2_scales,
         token_final_scales,
-        sorted_token_ids, expert_ids, num_tokens_post_padded,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
         mul_routed_weight=True,
         top_k=1,
     )

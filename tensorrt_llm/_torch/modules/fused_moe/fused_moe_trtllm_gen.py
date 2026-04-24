@@ -203,7 +203,7 @@ class TRTLLMGenFusedMoE(MoE):
             activation_type=activation_type,
         )
 
-        sm_version = get_sm_version()
+        get_sm_version()
 
         assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
 
