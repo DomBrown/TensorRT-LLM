@@ -191,8 +191,7 @@ class DeepEPLowLatency(Communication):
         # upper-bound for buffer sizing; extra slots are never read back.
         ep_size = self.mapping.moe_ep_size
         tma_align = max(1, (4 + ep_size - 1) // ep_size)
-        all_rank_max_num_tokens = (
-            (all_rank_max_num_tokens + tma_align - 1) // tma_align * tma_align)
+        all_rank_max_num_tokens = (all_rank_max_num_tokens + tma_align - 1) // tma_align * tma_align
 
         assert all_rank_max_num_tokens <= self.deep_ep_max_num_tokens
 

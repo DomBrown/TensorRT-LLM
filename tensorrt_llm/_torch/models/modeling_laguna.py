@@ -14,8 +14,6 @@
 # limitations under the License.
 """Laguna / Laguna-XS model for TensorRT-LLM PyTorch backend."""
 
-import copy
-import math
 import os
 from typing import Dict, List, Optional, Type
 
@@ -28,25 +26,15 @@ from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (
-    PredefinedAttentionMask,
     PositionalEmbeddingParams,
+    PredefinedAttentionMask,
     RopeParams,
 )
 from ..distributed import AllReduce, AllReduceParams
-from ..model_config import ModelConfig
-from ..modules.attention import (
-    Attention,
-    _helix_cp_allgather_input,
-    _helix_cp_output_projection,
-)
+from ..modules.attention import _helix_cp_allgather_input, _helix_cp_output_projection
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (
-    MiniMaxM2MoeRoutingMethod,
-    RoutingMethodType,
-    create_moe,
-    get_moe_cls,
-)
+from ..modules.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe, get_moe_cls
 from ..modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from ..modules.fused_moe.interface import MoE as MoEInterface
 from ..modules.gated_mlp import GatedMLP
@@ -57,12 +45,7 @@ from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
 from .checkpoints.hf.weight_mapper import HfWeightMapper
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import (
-    DecoderModel,
-    DecoderModelForCausalLM,
-    register_auto_model,
-    register_mapper,
-)
+from .modeling_utils import DecoderModel, register_auto_model, register_mapper
 
 
 def _diag_enabled():
@@ -133,8 +116,7 @@ def _diag_compact(label: str, t: torch.Tensor, rank: int = 0):
                 absmax = float("nan")
             tag = "NaN" if has_nan else "Inf"
             print(
-                f"[DIAG-ALL rank={rank}] {label}: {tag}! "
-                f"finite_absmax={absmax:.4e}",
+                f"[DIAG-ALL rank={rank}] {label}: {tag}! finite_absmax={absmax:.4e}",
                 flush=True,
             )
         else:
@@ -147,6 +129,7 @@ def _diag_compact(label: str, t: torch.Tensor, rank: int = 0):
 # ---------------------------------------------------------------------------
 #  Gate (MoE router)
 # ---------------------------------------------------------------------------
+
 
 class LagunaGate(nn.Module):
     """Sigmoid router with e_score_correction_bias (MiniMaxM2 routing)."""
@@ -201,8 +184,8 @@ class LagunaGate(nn.Module):
 #  MoE
 # ---------------------------------------------------------------------------
 
-class LagunaMoE(nn.Module):
 
+class LagunaMoE(nn.Module):
     def __init__(self, model_config, layer_idx, aux_stream_dict):
         super().__init__()
         config = model_config.pretrained_config
@@ -246,9 +229,7 @@ class LagunaMoE(nn.Module):
             # be combined with AllReduce (ranks hold different tokens).  Use
             # overridden_tp_size=1 so every rank holds full weights and computes
             # the shared expert independently.
-            shared_expert_tp_size = (
-                1 if self.mapping.enable_attention_dp else None
-            )
+            shared_expert_tp_size = 1 if self.mapping.enable_attention_dp else None
             self.shared_expert = GatedMLP(
                 hidden_size=self.hidden_dim,
                 intermediate_size=shared_size,
@@ -262,9 +243,7 @@ class LagunaMoE(nn.Module):
         else:
             self.shared_expert = None
 
-        self.routed_scaling_factor = float(
-            getattr(config, "moe_routed_scaling_factor", 1.0)
-        )
+        self.routed_scaling_factor = float(getattr(config, "moe_routed_scaling_factor", 1.0))
 
     def forward(
         self,
@@ -276,8 +255,12 @@ class LagunaMoE(nn.Module):
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        rank = self.mapping.rank if hasattr(self.mapping, 'rank') else 0
-        do_diag = _diag_enabled() and hasattr(self, '_layer_idx_for_diag') and self._layer_idx_for_diag < 3
+        rank = self.mapping.rank if hasattr(self.mapping, "rank") else 0
+        do_diag = (
+            _diag_enabled()
+            and hasattr(self, "_layer_idx_for_diag")
+            and self._layer_idx_for_diag < 3
+        )
 
         router_logits = self.gate(hidden_states)
 
@@ -311,11 +294,12 @@ class LagunaMoE(nn.Module):
         # produced complete per-rank outputs via ReduceScatter; an AllReduce
         # here would be semantically wrong (ranks hold different tokens) and
         # causes a NCCL deadlock.  Skip it in DEP mode.
-        if (self.mapping.tp_size > 1 and self.allreduce is not None
-                and not self.mapping.enable_attention_dp):
-            final_output = self.allreduce(
-                final_output, all_reduce_params=all_reduce_params
-            )
+        if (
+            self.mapping.tp_size > 1
+            and self.allreduce is not None
+            and not self.mapping.enable_attention_dp
+        ):
+            final_output = self.allreduce(final_output, all_reduce_params=all_reduce_params)
 
         if do_diag:
             _diag_tensor(f"MoE_L{self._layer_idx_for_diag} post_allreduce", final_output, rank)
@@ -326,6 +310,7 @@ class LagunaMoE(nn.Module):
 # ---------------------------------------------------------------------------
 #  Attention
 # ---------------------------------------------------------------------------
+
 
 class LagunaAttention(QKNormRoPEAttention):
     """Laguna attention with per-head softplus gating, per-layer heads,
@@ -347,16 +332,11 @@ class LagunaAttention(QKNormRoPEAttention):
         )
 
         layer_types = getattr(config, "layer_types", None)
-        is_sliding = (
-            layer_types is not None
-            and layer_types[layer_idx] == "sliding_attention"
-        )
+        is_sliding = layer_types is not None and layer_types[layer_idx] == "sliding_attention"
 
         rope_params = self._build_rope_params(config, is_sliding)
 
-        self.attention_window_size = (
-            config.sliding_window if is_sliding else None
-        )
+        self.attention_window_size = config.sliding_window if is_sliding else None
 
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gpt_neox,
@@ -377,8 +357,7 @@ class LagunaAttention(QKNormRoPEAttention):
             num_attention_heads=num_heads,
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
-            bias=getattr(config, "qkv_bias", False)
-            or getattr(config, "attention_bias", False),
+            bias=getattr(config, "qkv_bias", False) or getattr(config, "attention_bias", False),
             pos_embd_params=pos_embd_params,
             fuse_qk_norm_rope=False,
             layer_idx=layer_idx,
@@ -395,8 +374,9 @@ class LagunaAttention(QKNormRoPEAttention):
             # In DEP mode (enable_attention_dp=True) the attention base class uses
             # a local mapping with tp_size=1, so self.num_heads == num_heads (full).
             # g_proj must match: no COLUMN sharding, each GPU holds the full weight.
-            g_tp_mode = (None if model_config.mapping.enable_attention_dp
-                         else TensorParallelMode.COLUMN)
+            g_tp_mode = (
+                None if model_config.mapping.enable_attention_dp else TensorParallelMode.COLUMN
+            )
             self.g_proj = Linear(
                 config.hidden_size,
                 g_out,
@@ -413,10 +393,7 @@ class LagunaAttention(QKNormRoPEAttention):
             if swa_rp is not None:
                 rp = RopeParams()
                 rp.theta = float(swa_rp.get("rope_theta", 10000.0))
-                rp.dim = int(
-                    config.head_dim
-                    * float(swa_rp.get("partial_rotary_factor", 1.0))
-                )
+                rp.dim = int(config.head_dim * float(swa_rp.get("partial_rotary_factor", 1.0)))
                 rp.max_positions = config.max_position_embeddings
                 rt = swa_rp.get("rope_type", "linear")
                 if rt == "linear":
@@ -463,8 +440,14 @@ class LagunaAttention(QKNormRoPEAttention):
 
         window = attention_window_size or self.attention_window_size
         attn_output = self.forward_impl(
-            q, k, v, attn_metadata, attention_mask, window,
-            attention_mask_data, mrope_config=None,
+            q,
+            k,
+            v,
+            attn_metadata,
+            attention_mask,
+            window,
+            attention_mask_data,
+            mrope_config=None,
             has_lora=bool(lora_params),
         )
 
@@ -475,17 +458,21 @@ class LagunaAttention(QKNormRoPEAttention):
             if self._gate_per_head:
                 shape = attn_output.shape
                 attn_output = (
-                    attn_output.view(
-                        *shape[:-1], self._num_heads_local, self.head_dim
-                    )
+                    attn_output.view(*shape[:-1], self._num_heads_local, self.head_dim)
                     * gate.unsqueeze(-1)
                 ).view(shape)
             else:
                 attn_output = attn_output * gate
 
         attn_output = _helix_cp_output_projection(
-            self.o_proj, attn_output, attn_metadata, all_reduce_params,
-            self.mapping, self.mapping_o, self.layer_idx, lora_params,
+            self.o_proj,
+            attn_output,
+            attn_metadata,
+            all_reduce_params,
+            self.mapping,
+            self.mapping_o,
+            self.layer_idx,
+            lora_params,
         )
         return attn_output
 
@@ -494,8 +481,8 @@ class LagunaAttention(QKNormRoPEAttention):
 #  Decoder layer
 # ---------------------------------------------------------------------------
 
-class LagunaDecoderLayer(DecoderLayer):
 
+class LagunaDecoderLayer(DecoderLayer):
     def __init__(self, model_config, layer_idx: int, aux_stream_dict):
         super().__init__()
         config = model_config.pretrained_config
@@ -510,8 +497,7 @@ class LagunaDecoderLayer(DecoderLayer):
 
         mlp_only_layers = getattr(config, "mlp_only_layers", []) or []
         if (layer_idx not in mlp_only_layers) and (
-            config.num_experts > 0
-            and (layer_idx + 1) % config.decoder_sparse_step == 0
+            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             self.mlp = LagunaMoE(model_config, layer_idx, aux_stream_dict)
             self.mlp._layer_idx_for_diag = layer_idx
@@ -520,9 +506,7 @@ class LagunaDecoderLayer(DecoderLayer):
             # dense MLP would require an AllReduce that deadlocks across ranks
             # (ranks are at different positions in their token streams).
             # Use overridden_tp_size=1 so every rank computes full MLP locally.
-            dense_mlp_tp_size = (
-                1 if model_config.mapping.enable_attention_dp else None
-            )
+            dense_mlp_tp_size = 1 if model_config.mapping.enable_attention_dp else None
             self.mlp = GatedMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -552,16 +536,14 @@ class LagunaDecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ):
-        rank = self.mapping.rank if hasattr(self.mapping, 'rank') else 0
+        rank = self.mapping.rank if hasattr(self.mapping, "rank") else 0
         do_diag = _diag_enabled() and self.layer_idx < 3
 
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual
-            )
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         if do_diag:
             _diag_tensor(f"L{self.layer_idx} post_ln_input", hidden_states, rank)
@@ -580,9 +562,7 @@ class LagunaDecoderLayer(DecoderLayer):
         _diag_check_nan(f"L{self.layer_idx} post_attn", hidden_states, rank)
         _diag_compact(f"L{self.layer_idx} post_attn", hidden_states, rank)
 
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual
-        )
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         if do_diag:
             _diag_tensor(f"L{self.layer_idx} post_ln_mlp", hidden_states, rank)
@@ -603,8 +583,7 @@ class LagunaDecoderLayer(DecoderLayer):
         _diag_compact(f"L{self.layer_idx} residual", residual, rank)
 
         if spec_metadata is not None:
-            spec_metadata.maybe_capture_hidden_states(
-                self.layer_idx, hidden_states, residual)
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
 
         return hidden_states, residual
 
@@ -613,8 +592,8 @@ class LagunaDecoderLayer(DecoderLayer):
 #  Model + CausalLM
 # ---------------------------------------------------------------------------
 
-class LagunaModel(DecoderModel):
 
+class LagunaModel(DecoderModel):
     def __init__(self, model_config):
         super().__init__(model_config)
         config = model_config.pretrained_config
@@ -634,10 +613,12 @@ class LagunaModel(DecoderModel):
             gather_output=True,
         )
 
-        self.layers = nn.ModuleList([
-            LagunaDecoderLayer(model_config, layer_idx, self.aux_stream_dict)
-            for layer_idx in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                LagunaDecoderLayer(model_config, layer_idx, self.aux_stream_dict)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
 
         self.norm = RMSNorm(
             hidden_size=config.hidden_size,
@@ -655,9 +636,7 @@ class LagunaModel(DecoderModel):
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You must specify exactly one of input_ids or inputs_embeds"
-            )
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
@@ -685,9 +664,7 @@ class LagunaModel(DecoderModel):
 
 
 @register_auto_model("LagunaForCausalLM")
-class LagunaForCausalLM(
-        SpecDecOneEngineForCausalLM[LagunaModel, PretrainedConfig]):
-
+class LagunaForCausalLM(SpecDecOneEngineForCausalLM[LagunaModel, PretrainedConfig]):
     def __init__(self, model_config):
         super().__init__(LagunaModel(model_config), model_config)
 
@@ -713,14 +690,13 @@ class LagunaForCausalLM(
 #  Weight mapper (HF checkpoint -> TRT-LLM module names)
 # ---------------------------------------------------------------------------
 
+
 @register_mapper("HF", "LagunaForCausalLM")
 class LagunaHfWeightMapper(HfWeightMapper):
-
     def preprocess_weights(self, weights: dict) -> dict:
         weights = self.rename_by_params_map(
             {
-                r"(.*)mlp\.experts\.e_score_correction_bias(.*)":
-                    r"\1mlp.gate.e_score_correction_bias\2",
+                r"(.*)mlp\.experts\.e_score_correction_bias(.*)": r"\1mlp.gate.e_score_correction_bias\2",
             },
             weights,
         )
@@ -737,8 +713,7 @@ class LagunaHfWeightMapper(HfWeightMapper):
         #   weight_scale_2       (FP32 scalar = amax_weight/(FP8_MAX*FP4_MAX))
         #   input_scale          (FP32 scalar = amax_input/(FP8_MAX*FP4_MAX))
         # which is the reciprocal of the *_global_scale values.
-        if self._config is not None and self._config.quant_config.quant_mode.has_nvfp4(
-        ):
+        if self._config is not None and self._config.quant_config.quant_mode.has_nvfp4():
 
             def _invert_global_scale(t: torch.Tensor) -> torch.Tensor:
                 """Convert compressed-tensors multiplier form to TRT-LLM
@@ -761,27 +736,20 @@ class LagunaHfWeightMapper(HfWeightMapper):
                     torch.zeros_like(t),
                 )
                 # Belt-and-braces: any residual Inf/NaN becomes 0.
-                return torch.nan_to_num(out,
-                                        nan=0.0,
-                                        posinf=0.0,
-                                        neginf=0.0).contiguous()
+                return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).contiguous()
 
             renamed: dict = {}
             for name, value in weights.items():
                 if name.endswith(".weight_packed"):
-                    new_name = name[:-len(".weight_packed")] + ".weight"
+                    new_name = name[: -len(".weight_packed")] + ".weight"
                     renamed[new_name] = value
                 elif name.endswith(".weight_global_scale"):
-                    new_name = name[:-len(".weight_global_scale")
-                                    ] + ".weight_scale_2"
-                    t = value[...] if not isinstance(value, torch.Tensor
-                                                     ) else value
+                    new_name = name[: -len(".weight_global_scale")] + ".weight_scale_2"
+                    t = value[...] if not isinstance(value, torch.Tensor) else value
                     renamed[new_name] = _invert_global_scale(t)
                 elif name.endswith(".input_global_scale"):
-                    new_name = name[:-len(".input_global_scale")
-                                    ] + ".input_scale"
-                    t = value[...] if not isinstance(value, torch.Tensor
-                                                     ) else value
+                    new_name = name[: -len(".input_global_scale")] + ".input_scale"
+                    t = value[...] if not isinstance(value, torch.Tensor) else value
                     renamed[new_name] = _invert_global_scale(t)
                 else:
                     renamed[name] = value
@@ -804,13 +772,15 @@ class LagunaHfWeightMapper(HfWeightMapper):
             # MoE expects the original "weight_scale" (plus "weight_scale_2").
             use_fp8_block_rename = (
                 self._config is not None
-                and self._config.quant_config.quant_mode.has_fp8_block_scales(
-                ))
+                and self._config.quant_config.quant_mode.has_fp8_block_scales()
+            )
             updated = {}
             for wn, wv in module_weights.items():
-                new_wn = (wn.replace("gate_proj", "w1")
-                           .replace("up_proj", "w3")
-                           .replace("down_proj", "w2"))
+                new_wn = (
+                    wn.replace("gate_proj", "w1")
+                    .replace("up_proj", "w3")
+                    .replace("down_proj", "w2")
+                )
                 if use_fp8_block_rename:
                     # ModelOpt uses "weight_scale"; TRT-LLM DeepSeekFP8
                     # quantization expects "weight_scale_inv" (same values).
@@ -818,12 +788,13 @@ class LagunaHfWeightMapper(HfWeightMapper):
                 # filter_weights strips module prefix leaving "experts.X.w1.weight";
                 # VANILLA mode expects "X.w1.weight" (integer prefix only).
                 if new_wn.startswith("experts."):
-                    new_wn = new_wn[len("experts."):]
+                    new_wn = new_wn[len("experts.") :]
                 updated[new_wn] = wv
             if os.environ.get("LAGUNA_DEBUG_LOAD"):
                 sample = sorted(updated.keys())[:6]
-                print(f"[DEBUG handle_special] module_name={module_name} sample keys: {sample}", flush=True)
+                print(
+                    f"[DEBUG handle_special] module_name={module_name} sample keys: {sample}",
+                    flush=True,
+                )
             del module_weights
-            module.load_weights(
-                weights=[updated], allow_partial_loading=allow_partial_loading
-            )
+            module.load_weights(weights=[updated], allow_partial_loading=allow_partial_loading)

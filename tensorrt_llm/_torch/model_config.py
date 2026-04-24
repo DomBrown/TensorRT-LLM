@@ -671,7 +671,8 @@ class ModelConfig(Generic[TConfig]):
             quant_config, layer_quant_config = cls.load_modelopt_quant_config(
                 quant_config_file, checkpoint_dir, moe_backend)
         # quantized ckpt in other formats
-        elif getattr(pretrained_config, "quantization_config", None) is not None:
+        elif getattr(pretrained_config, "quantization_config",
+                     None) is not None:
             hf_quant_config = pretrained_config.quantization_config
             quant_config, layer_quant_config = cls.load_hf_quant_config(
                 hf_quant_config, moe_backend)

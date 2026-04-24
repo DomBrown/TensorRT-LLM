@@ -1186,8 +1186,8 @@ class DeepSeekFP8BlockScalesDequantFusedMoEMethod(
         def _dequant_fp8_block(weight: torch.Tensor,
                                scale: torch.Tensor) -> torch.Tensor:
             # weight: (E, M, K) fp8; scale: (E, M//128, K//128) float32
-            s_exp = scale.repeat_interleave(128, dim=1).repeat_interleave(
-                128, dim=2)
+            s_exp = scale.repeat_interleave(128, dim=1).repeat_interleave(128,
+                                                                          dim=2)
             s_exp = s_exp[:, :weight.shape[1], :weight.shape[2]]
             return (weight.float() * s_exp).bfloat16()
 
@@ -1203,8 +1203,7 @@ class DeepSeekFP8BlockScalesDequantFusedMoEMethod(
             w2_bf16 = _dequant_fp8_block(module.w2_weight,
                                          module.w2_weight_scaling_factor)
             replace_parameter_and_save_metadata(
-                module, "w2_weight",
-                nn.Parameter(w2_bf16, requires_grad=False),
+                module, "w2_weight", nn.Parameter(w2_bf16, requires_grad=False),
                 module.rebuild_tensor_metadata)
             del w2_bf16
 

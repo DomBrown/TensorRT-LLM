@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 NVIDIA Corporation. All rights reserved.
-"""
-Smoke test for Laguna-XS with TensorRT-LLM PyTorch backend.
+"""Smoke test for Laguna-XS with TensorRT-LLM PyTorch backend.
 
 Usage:
     python run_laguna_smoke_test.py [--model PATH] [--tp N]
 """
+
 import argparse
 import json
 import os
@@ -30,6 +30,7 @@ def make_shadow_dir(model_dir: str) -> str:
 
     # Detect fp8 before stripping quant fields
     import modeling_laguna_trtllm as _m
+
     quant_config = _m._detect_quant_config(model_dir)
 
     for key in ("quantization_config", "compression_config"):
@@ -85,8 +86,9 @@ def main():
     print(f"Shadow config dir: {shadow}")
     print(f"Loading model (TP={args.tp})...")
     t0 = time.time()
-    llm = LLM(model=shadow, tensor_parallel_size=args.tp, trust_remote_code=True,
-              cuda_graph_config=None)
+    llm = LLM(
+        model=shadow, tensor_parallel_size=args.tp, trust_remote_code=True, cuda_graph_config=None
+    )
     print(f"Model loaded in {time.time() - t0:.1f}s\n")
 
     sampling = SamplingParams(max_tokens=args.max_tokens, temperature=0.0)
@@ -109,12 +111,11 @@ def main():
         status = "OK" if ok else "FAIL (empty output)"
         if not ok:
             all_ok = False
-        print(f"\n[{i+1}] {status}")
+        print(f"\n[{i + 1}] {status}")
         print(f"     Prompt: {prompt!r}")
         print(f"     Generated ({n_tok} tok, finish={finish}): {text!r}")
 
-    print(f"\nTotal: {total_tokens} tokens in {elapsed:.2f}s "
-          f"({total_tokens/elapsed:.1f} tok/s)")
+    print(f"\nTotal: {total_tokens} tokens in {elapsed:.2f}s ({total_tokens / elapsed:.1f} tok/s)")
 
     if all_ok:
         print("\nSmoke test PASSED.")
