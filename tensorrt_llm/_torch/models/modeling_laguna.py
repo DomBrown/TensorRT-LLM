@@ -345,7 +345,7 @@ class LagunaAttention(QKNormRoPEAttention):
 
         gating = getattr(config, "gating", False)
         self._use_gating = bool(gating)
-        self._gate_per_head = gating == "per-head"
+        self._gate_per_head = gating == "per-head" or gating is True
         self._num_heads_local = None  # set after super().__init__
 
         # fuse_qk_norm_rope=False is required: the fused kernel reads
@@ -387,21 +387,41 @@ class LagunaAttention(QKNormRoPEAttention):
             )
 
     @staticmethod
+    def _build_rope_from_flat_dict(config, rp_dict: dict) -> RopeParams:
+        rp = RopeParams()
+        rp.theta = float(rp_dict.get("rope_theta", 10000.0))
+        rp.max_positions = config.max_position_embeddings
+        rp.dim = int(config.head_dim * float(rp_dict.get("partial_rotary_factor", 1.0)))
+        rope_type = rp_dict.get("rope_type", "default")
+        if rope_type == "linear":
+            rp.scale_type = RotaryScalingType.linear
+            rp.scale = float(rp_dict.get("factor", 1.0))
+        elif rope_type == "yarn":
+            rp.scale_type = RotaryScalingType.yarn
+            rp.scale = float(rp_dict.get("factor", 1.0))
+            rp.beta_fast = float(rp_dict.get("beta_fast", 32.0))
+            rp.beta_slow = float(rp_dict.get("beta_slow", 1.0))
+            rp.mscale = float(rp_dict.get("attention_factor", 1.0))
+            rp.original_max_positions = int(
+                rp_dict.get("original_max_position_embeddings",
+                            config.max_position_embeddings))
+        else:
+            rp.scale_type = RotaryScalingType.none
+            rp.scale = 1.0
+        return rp
+
+    @staticmethod
     def _build_rope_params(config, is_sliding: bool) -> RopeParams:
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if isinstance(rope_parameters, dict):
+            layer_key = "sliding_attention" if is_sliding else "full_attention"
+            sub = rope_parameters.get(layer_key) or rope_parameters.get("full_attention")
+            if sub is not None:
+                return LagunaAttention._build_rope_from_flat_dict(config, sub)
         if is_sliding:
             swa_rp = getattr(config, "swa_rope_parameters", None)
             if swa_rp is not None:
-                rp = RopeParams()
-                rp.theta = float(swa_rp.get("rope_theta", 10000.0))
-                rp.dim = int(config.head_dim * float(swa_rp.get("partial_rotary_factor", 1.0)))
-                rp.max_positions = config.max_position_embeddings
-                rt = swa_rp.get("rope_type", "linear")
-                if rt == "linear":
-                    rp.scale_type = RotaryScalingType.linear
-                    rp.scale = float(swa_rp.get("factor", 1.0))
-                else:
-                    rp.scale_type = RotaryScalingType.none
-                return rp
+                return LagunaAttention._build_rope_from_flat_dict(config, swa_rp)
             return RopeParams.from_config(config)
         else:
             rp = RopeParams.from_config(config)

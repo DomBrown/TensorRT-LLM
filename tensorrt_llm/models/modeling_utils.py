@@ -261,7 +261,10 @@ class QuantConfig(StrictBaseModel):
         """
         if self.exclude_modules is not None:
             for exclude_module in self.exclude_modules:
-                if fnmatch.fnmatchcase(name, exclude_module):
+                if exclude_module.startswith("re:"):
+                    if re.fullmatch(exclude_module[3:], name):
+                        return True
+                elif fnmatch.fnmatchcase(name, exclude_module):
                     return True
         return False
 
