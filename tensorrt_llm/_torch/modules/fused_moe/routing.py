@@ -328,6 +328,7 @@ class Deepseekv3RoutingImpl:
         self.is_fused = is_fused
 
     @staticmethod
+    @torch.compile(options={"max-autotune": True})
     def get_scores(logits, e_score_correction_bias):
         scores = F.sigmoid(logits)
         scores_with_bias = scores + e_score_correction_bias
@@ -491,6 +492,7 @@ class MiniMaxM2MoeRoutingMethod(BaseMoeRoutingMethod):
         self.output_dtype = output_dtype
 
     @staticmethod
+    @torch.compile(options={"max-autotune": True})
     def get_scores(logits, e_score_correction_bias):
         scores = F.sigmoid(logits)
         scores_with_bias = scores + e_score_correction_bias

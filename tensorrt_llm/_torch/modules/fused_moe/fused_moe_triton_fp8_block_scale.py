@@ -3,15 +3,9 @@
 """
 Triton FP8 block-scale MoE forward pass for SM120 (RTX PRO 6000 Blackwell).
 
-Ports vLLM's fused_moe_kernel (Apache-2.0, Copyright vLLM contributors) to
-TRT-LLM to work around CUTLASS FP8 block-scale TMA descriptor failures on
-SM120 for large token counts.  The Triton GEMM kernel is architecture-agnostic
+Works around CUTLASS FP8 block-scale TMA descriptor failures on SM120 for
+large token counts.  The Triton GEMM kernel is architecture-agnostic
 (no wgmma / TMA intrinsics) and works on any SM >= 8.9.
-
-vLLM reference:
-  vllm/model_executor/layers/fused_moe/fused_moe.py  (fused_moe_kernel)
-  vllm/model_executor/layers/fused_moe/moe_align_block_size.py
-  vllm/model_executor/layers/fused_moe/utils.py      (_fp8_quantize)
 """
 
 from typing import Optional
@@ -545,7 +539,7 @@ def moe_align_block_size(
     return sorted_token_ids, expert_ids_out, num_post_pad
 
 
-# ─── Triton MoE FP8 block-scale GEMM kernel (ported from vLLM) ───────────────
+# ─── Triton MoE FP8 block-scale GEMM kernel ──────────────────────────────────
 
 
 @triton.jit
