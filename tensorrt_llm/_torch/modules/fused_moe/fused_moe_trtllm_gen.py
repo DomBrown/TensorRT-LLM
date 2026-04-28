@@ -203,6 +203,11 @@ class TRTLLMGenFusedMoE(MoE):
             activation_type=activation_type,
         )
 
+        sm_version = get_sm_version()
+        if sm_version >= 120:
+            raise NotImplementedError(
+                "TRTLLMGenFusedMoE does not support SM120 and above.")
+
         assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
 
         self.use_flashinfer = self._check_op_backend_support()
