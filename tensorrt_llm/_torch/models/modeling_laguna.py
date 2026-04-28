@@ -14,7 +14,6 @@
 # limitations under the License.
 """Laguna / Laguna-XS model for TensorRT-LLM PyTorch backend."""
 
-import os
 from typing import Dict, List, Optional, Type
 
 import torch
@@ -46,85 +45,6 @@ from ..utils import AuxStreamType
 from .checkpoints.hf.weight_mapper import HfWeightMapper
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, register_mapper
-
-
-def _diag_enabled():
-    return os.environ.get("LAGUNA_DIAG", "") == "1"
-
-
-def _diag_all_enabled():
-    """Per-layer compact summary (1 line per tensor) for all 40 layers."""
-    return os.environ.get("LAGUNA_DIAG_ALL", "") == "1"
-
-
-def _diag_tensor(label: str, t: torch.Tensor, rank: int = 0):
-    """Print tensor statistics for debugging."""
-    if not _diag_enabled():
-        return
-    with torch.no_grad():
-        ft = t.float()
-        print(
-            f"[DIAG rank={rank}] {label}: "
-            f"shape={tuple(t.shape)} dtype={t.dtype} "
-            f"mean={ft.mean().item():.6e} std={ft.std().item():.6e} "
-            f"min={ft.min().item():.6e} max={ft.max().item():.6e} "
-            f"absmax={ft.abs().max().item():.6e}",
-            flush=True,
-        )
-
-
-def _diag_check_nan(label: str, t: torch.Tensor, rank: int = 0):
-    """Emit a loud marker the first time a NaN/Inf appears in a tensor.
-
-    Runs whenever LAGUNA_DIAG=1 regardless of which layer, so we can find the
-    earliest point a numerical blow-up happens. Cheap: two reductions on the
-    flattened tensor, no device sync beyond the reduction itself.
-    """
-    if not _diag_enabled():
-        return
-    with torch.no_grad():
-        has_nan = bool(torch.isnan(t).any().item())
-        has_inf = bool(torch.isinf(t).any().item())
-        if has_nan or has_inf:
-            ft = t.float()
-            finite_mask = torch.isfinite(ft)
-            finite_absmax = (
-                ft[finite_mask].abs().max().item() if finite_mask.any() else float("nan")
-            )
-            print(
-                f"[DIAG-NAN rank={rank}] {label}: "
-                f"shape={tuple(t.shape)} dtype={t.dtype} "
-                f"has_nan={has_nan} has_inf={has_inf} "
-                f"finite_absmax={finite_absmax:.6e}",
-                flush=True,
-            )
-
-
-def _diag_compact(label: str, t: torch.Tensor, rank: int = 0):
-    """One-line absmax + NaN/Inf flag for per-layer scanning (LAGUNA_DIAG_ALL=1)."""
-    if not (_diag_enabled() and _diag_all_enabled()):
-        return
-    with torch.no_grad():
-        has_nan = bool(torch.isnan(t).any().item())
-        has_inf = bool(torch.isinf(t).any().item())
-        if has_nan or has_inf:
-            ft = t.float()
-            finite_mask = torch.isfinite(ft)
-            if finite_mask.any():
-                absmax = ft[finite_mask].abs().max().item()
-            else:
-                absmax = float("nan")
-            tag = "NaN" if has_nan else "Inf"
-            print(
-                f"[DIAG-ALL rank={rank}] {label}: {tag}! finite_absmax={absmax:.4e}",
-                flush=True,
-            )
-        else:
-            print(
-                f"[DIAG-ALL rank={rank}] {label}: absmax={t.float().abs().max().item():.4e}",
-                flush=True,
-            )
-
 
 # ---------------------------------------------------------------------------
 #  Gate (MoE router)
@@ -255,17 +175,8 @@ class LagunaMoE(nn.Module):
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        rank = self.mapping.rank if hasattr(self.mapping, "rank") else 0
-        do_diag = (
-            _diag_enabled()
-            and hasattr(self, "_layer_idx_for_diag")
-            and self._layer_idx_for_diag < 3
-        )
 
         router_logits = self.gate(hidden_states)
-
-        if do_diag:
-            _diag_tensor(f"MoE_L{self._layer_idx_for_diag} router_logits", router_logits, rank)
 
         routed_output = self.experts(
             hidden_states,
@@ -273,22 +184,14 @@ class LagunaMoE(nn.Module):
             all_rank_num_tokens=all_rank_num_tokens,
         )
 
-        if do_diag:
-            _diag_tensor(f"MoE_L{self._layer_idx_for_diag} routed_pre_scale", routed_output, rank)
-
         if self.routed_scaling_factor != 1.0:
             routed_output = routed_output * self.routed_scaling_factor
 
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
-            if do_diag:
-                _diag_tensor(f"MoE_L{self._layer_idx_for_diag} shared_output", shared_output, rank)
             final_output = routed_output + shared_output
         else:
             final_output = routed_output
-
-        if do_diag:
-            _diag_tensor(f"MoE_L{self._layer_idx_for_diag} pre_allreduce", final_output, rank)
 
         # In DEP mode (enable_attention_dp) AllGatherReduceScatter already
         # produced complete per-rank outputs via ReduceScatter; an AllReduce
@@ -300,9 +203,6 @@ class LagunaMoE(nn.Module):
             and not self.mapping.enable_attention_dp
         ):
             final_output = self.allreduce(final_output, all_reduce_params=all_reduce_params)
-
-        if do_diag:
-            _diag_tensor(f"MoE_L{self._layer_idx_for_diag} post_allreduce", final_output, rank)
 
         return final_output.view(orig_shape)
 
@@ -518,7 +418,6 @@ class LagunaDecoderLayer(DecoderLayer):
         is_moe_layer = config.num_experts > 0 and config.mlp_layer_types[layer_idx] == "sparse"
         if is_moe_layer:
             self.mlp = LagunaMoE(model_config, layer_idx, aux_stream_dict)
-            self.mlp._layer_idx_for_diag = layer_idx
         else:
             # In DEP mode each rank holds different tokens; TP-sharding the
             # dense MLP would require an AllReduce that deadlocks across ranks
@@ -554,19 +453,11 @@ class LagunaDecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ):
-        rank = self.mapping.rank if hasattr(self.mapping, "rank") else 0
-        do_diag = _diag_enabled() and self.layer_idx < 3
-
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
-        if do_diag:
-            _diag_tensor(f"L{self.layer_idx} post_ln_input", hidden_states, rank)
-        _diag_check_nan(f"L{self.layer_idx} post_ln_input", hidden_states, rank)
-        _diag_compact(f"L{self.layer_idx} post_ln_input", hidden_states, rank)
 
         hidden_states = self.self_attn(
             position_ids=position_ids,
@@ -575,30 +466,12 @@ class LagunaDecoderLayer(DecoderLayer):
             **kwargs,
         )
 
-        if do_diag:
-            _diag_tensor(f"L{self.layer_idx} post_attn", hidden_states, rank)
-        _diag_check_nan(f"L{self.layer_idx} post_attn", hidden_states, rank)
-        _diag_compact(f"L{self.layer_idx} post_attn", hidden_states, rank)
-
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-
-        if do_diag:
-            _diag_tensor(f"L{self.layer_idx} post_ln_mlp", hidden_states, rank)
-        _diag_check_nan(f"L{self.layer_idx} post_ln_mlp", hidden_states, rank)
-        _diag_compact(f"L{self.layer_idx} post_ln_mlp", hidden_states, rank)
 
         if isinstance(self.mlp, LagunaMoE):
             hidden_states = self.mlp(hidden_states, attn_metadata)
         else:
             hidden_states = self.mlp(hidden_states)
-
-        if do_diag:
-            _diag_tensor(f"L{self.layer_idx} post_mlp", hidden_states, rank)
-            _diag_tensor(f"L{self.layer_idx} residual", residual, rank)
-        _diag_check_nan(f"L{self.layer_idx} post_mlp", hidden_states, rank)
-        _diag_check_nan(f"L{self.layer_idx} residual", residual, rank)
-        _diag_compact(f"L{self.layer_idx} post_mlp", hidden_states, rank)
-        _diag_compact(f"L{self.layer_idx} residual", residual, rank)
 
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
@@ -658,10 +531,6 @@ class LagunaModel(DecoderModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        rank = self.layers[0].mapping.rank if self.layers else 0
-        if _diag_enabled():
-            _diag_tensor("embed_out", inputs_embeds, rank)
-
         hidden_states = inputs_embeds
         residual = None
         for layer in self.layers:
@@ -674,9 +543,6 @@ class LagunaModel(DecoderModel):
                 **kwargs,
             )
         hidden_states, _ = self.norm(hidden_states, residual)
-
-        if _diag_enabled():
-            _diag_tensor("final_norm_out", hidden_states, rank)
 
         return hidden_states
 
@@ -808,11 +674,5 @@ class LagunaHfWeightMapper(HfWeightMapper):
                 if new_wn.startswith("experts."):
                     new_wn = new_wn[len("experts.") :]
                 updated[new_wn] = wv
-            if os.environ.get("LAGUNA_DEBUG_LOAD"):
-                sample = sorted(updated.keys())[:6]
-                print(
-                    f"[DEBUG handle_special] module_name={module_name} sample keys: {sample}",
-                    flush=True,
-                )
             del module_weights
             module.load_weights(weights=[updated], allow_partial_loading=allow_partial_loading)
