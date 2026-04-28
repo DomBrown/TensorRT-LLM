@@ -515,10 +515,25 @@ class LagunaDecoderLayer(DecoderLayer):
             reduce_output=self.mapping.tp_size > 1,
         )
 
-        mlp_only_layers = getattr(config, "mlp_only_layers", []) or []
-        if (layer_idx not in mlp_only_layers) and (
-            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
-        ):
+        # MoE-vs-dense layer assignment supports two config conventions:
+        # (1) Newer Laguna: per-layer string list `mlp_layer_types`
+        #     ("dense" | "sparse" per layer) — preferred when present.
+        # (2) Legacy Laguna: `mlp_only_layers` (indices that are dense) plus
+        #     `decoder_sparse_step` (every Nth non-dense layer is MoE).
+        mlp_layer_types = getattr(config, "mlp_layer_types", None)
+        if mlp_layer_types is not None:
+            is_moe_layer = (
+                config.num_experts > 0 and mlp_layer_types[layer_idx] == "sparse"
+            )
+        else:
+            mlp_only_layers = getattr(config, "mlp_only_layers", []) or []
+            sparse_step = getattr(config, "decoder_sparse_step", 1)
+            is_moe_layer = (
+                layer_idx not in mlp_only_layers
+                and config.num_experts > 0
+                and (layer_idx + 1) % sparse_step == 0
+            )
+        if is_moe_layer:
             self.mlp = LagunaMoE(model_config, layer_idx, aux_stream_dict)
             self.mlp._layer_idx_for_diag = layer_idx
         else:
