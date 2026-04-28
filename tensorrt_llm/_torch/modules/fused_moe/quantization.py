@@ -1168,50 +1168,6 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
             self.setup_quant_scales(module)
 
 
-class DeepSeekFP8BlockScalesDequantFusedMoEMethod(
-        DeepSeekFP8BlockScalesFusedMoEMethod):
-    """SM120 fallback: dequantize FP8 block-scale weights to BF16 at load time.
-
-    Used when the SM120 CUTLASS FP8 block-scale grouped-GEMM kernel is not
-    viable (e.g. TMA descriptor failures for large batch sizes).  We pay the
-    memory cost once at load time and route through the unquantized BF16 path.
-    """
-
-    def post_load_weights(self, module: torch.nn.Module):
-        # Call parent to apply CUTLASS alignment padding (no-op for Laguna-XS
-        # since shapes are already aligned, but keeps the code general).
-        super().post_load_weights(module)
-
-        # Dequantize FP8 block-scale weights → BF16 in-place.
-        def _dequant_fp8_block(weight: torch.Tensor,
-                               scale: torch.Tensor) -> torch.Tensor:
-            # weight: (E, M, K) fp8; scale: (E, M//128, K//128) float32
-            s_exp = scale.repeat_interleave(128, dim=1).repeat_interleave(128,
-                                                                          dim=2)
-            s_exp = s_exp[:, :weight.shape[1], :weight.shape[2]]
-            return (weight.float() * s_exp).bfloat16()
-
-        with torch.no_grad():
-            w31_bf16 = _dequant_fp8_block(module.w3_w1_weight,
-                                          module.w3_w1_weight_scaling_factor)
-            replace_parameter_and_save_metadata(
-                module, "w3_w1_weight",
-                nn.Parameter(w31_bf16, requires_grad=False),
-                module.rebuild_tensor_metadata)
-            del w31_bf16
-
-            w2_bf16 = _dequant_fp8_block(module.w2_weight,
-                                         module.w2_weight_scaling_factor)
-            replace_parameter_and_save_metadata(
-                module, "w2_weight", nn.Parameter(w2_bf16, requires_grad=False),
-                module.rebuild_tensor_metadata)
-            del w2_bf16
-
-        # Nullify quant scales — run_moe will use the unquantized BF16 path.
-        module.quant_scales = tuple()
-        module._dequant_to_bf16 = True
-
-
 class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
     eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
