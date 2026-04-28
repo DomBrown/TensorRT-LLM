@@ -403,8 +403,8 @@ class LagunaAttention(QKNormRoPEAttention):
             rp.beta_slow = float(rp_dict.get("beta_slow", 1.0))
             rp.mscale = float(rp_dict.get("attention_factor", 1.0))
             rp.original_max_positions = int(
-                rp_dict.get("original_max_position_embeddings",
-                            config.max_position_embeddings))
+                rp_dict.get("original_max_position_embeddings", config.max_position_embeddings)
+            )
         else:
             rp.scale_type = RotaryScalingType.none
             rp.scale = 1.0
@@ -522,9 +522,7 @@ class LagunaDecoderLayer(DecoderLayer):
         #     `decoder_sparse_step` (every Nth non-dense layer is MoE).
         mlp_layer_types = getattr(config, "mlp_layer_types", None)
         if mlp_layer_types is not None:
-            is_moe_layer = (
-                config.num_experts > 0 and mlp_layer_types[layer_idx] == "sparse"
-            )
+            is_moe_layer = config.num_experts > 0 and mlp_layer_types[layer_idx] == "sparse"
         else:
             mlp_only_layers = getattr(config, "mlp_only_layers", []) or []
             sparse_step = getattr(config, "decoder_sparse_step", 1)
