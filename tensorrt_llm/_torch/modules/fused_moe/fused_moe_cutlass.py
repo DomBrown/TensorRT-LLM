@@ -609,6 +609,12 @@ class CutlassFusedMoE(MoE):
                 run_triton_fp8_block_scale_moe
             _use_alltoall = (enable_alltoall if enable_alltoall is not None else
                              self.enable_alltoall)
+            # forward_chunk sets token_final_scales=None when
+            # apply_router_weight_on_input=True (weights already folded into x);
+            # substitute ones so the Triton kernel's per-token scaling is a no-op.
+            if token_final_scales is None:
+                token_final_scales = torch.ones_like(token_selected_experts,
+                                                     dtype=torch.float32)
             # token_selected_experts contains GLOBAL expert IDs in the non-alltoall
             # path (slot_start .. slot_end-1 for this rank's local experts, plus
             # IDs for other ranks).  The Triton kernel operates on LOCAL IDs
