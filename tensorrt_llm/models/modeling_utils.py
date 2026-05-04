@@ -213,13 +213,9 @@ class QuantConfig(StrictBaseModel):
             return False
 
     def _get_quant_cfg(self, module_name=None):
-        if self.exclude_modules is not None:
-            for exclude_module in self.exclude_modules:
-                if exclude_module == module_name or (
-                        exclude_module.endswith('*')
-                        and module_name.startswith(exclude_module[:-1])):
-                    return LayerQuantConfig(quant_algo=None,
-                                            quantized_layers={})
+        if (module_name is not None
+                and self.is_module_excluded_from_quantization(module_name)):
+            return LayerQuantConfig(quant_algo=None, quantized_layers={})
         return self
 
     def _get_modelopt_qformat(self):
