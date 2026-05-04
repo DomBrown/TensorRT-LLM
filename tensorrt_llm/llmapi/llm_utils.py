@@ -545,7 +545,9 @@ class ModelLoader:
                 else:
                     quant_config.exclude_modules = default_exclude
             elif hf_quant_config.get("quant_method") is None:
-                pass  # quantization_config present but quant_method is null → no quantization
+                # quantization_config present but quant_method is null → not
+                # pre-quantized; tell caller so calibration is not skipped.
+                return False
             else:
                 raise NotImplementedError(
                     f"Unsupported quantization_config: {hf_quant_config}.")
