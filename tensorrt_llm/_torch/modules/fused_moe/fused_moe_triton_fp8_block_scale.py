@@ -114,7 +114,6 @@ def _moe_scatter_kernel(
     tl.store(sorted_token_ids_ptr + pos, offs.to(tl.int32), mask=mask)
 
 
-
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -208,6 +207,7 @@ def _write_zeros_to_output(
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, acc, mask=c_mask)
+
 
 # ─── Triton MoE BF16-activation + FP8-weight kernel ─────────────────────────
 # For weight-only FP8 models (post-training quantization): activations stay BF16,
@@ -405,6 +405,7 @@ def _invoke_bf16act_fp8w_moe_kernel(
         compute_type=tl.bfloat16,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
     )
+
 
 # ─── Full MoE forward ────────────────────────────────────────────────────────
 
