@@ -521,7 +521,15 @@ class ModelLoader:
                         raise ValueError(
                             f"Unsupported kv_cache_scheme: {kv_cache_scheme}.")
 
-                quant_config.exclude_modules = hf_quant_config.get("ignore", [])
+                hf_exclude_modules = hf_quant_config.get(
+                    "modules_to_not_convert", None)
+                if hf_exclude_modules is not None:
+                    quant_config.exclude_modules = list(
+                        set(hf_exclude_modules +
+                            hf_quant_config.get("ignore", [])))
+                else:
+                    quant_config.exclude_modules = hf_quant_config.get(
+                        "ignore", [])
             elif hf_quant_config.get("quant_method") == "nvfp4":
                 quant_config.quant_algo = QuantAlgo.NVFP4
                 group_size = hf_quant_config.get("group_size", 16)
