@@ -200,9 +200,12 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         cache_position = torch.arange(past_seen_token, seq_len, device=q_device)
 
         # create attention mask
-        if attention_mask == PredefinedAttentionMask.CAUSAL:
+        if attention_mask in (PredefinedAttentionMask.CAUSAL,
+                              PredefinedAttentionMask.SLIDING_WINDOW_CAUSAL):
             # Create custom sliding window mask as sdpa doesn't natively support it.
-            if attention_window_size is not None:
+            if (attention_mask == PredefinedAttentionMask.SLIDING_WINDOW_CAUSAL
+                    or attention_window_size is not None):
+                assert attention_window_size is not None
                 attn_mask = generate_sliding_window_mask(
                     bsz, seq_len, cache_position, q_device,
                     attention_window_size)
@@ -365,7 +368,9 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             max_seqlen_k,
             dropout_p=0.0,
             softmax_scale=None,
-            causal=attention_mask == PredefinedAttentionMask.CAUSAL,
+            causal=attention_mask
+            in (PredefinedAttentionMask.CAUSAL,
+                PredefinedAttentionMask.SLIDING_WINDOW_CAUSAL),
             # window_size=(-1, -1),  # -1 means infinite context window
             alibi_slopes=None,
             deterministic=False,

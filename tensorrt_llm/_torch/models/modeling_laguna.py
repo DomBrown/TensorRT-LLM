@@ -233,6 +233,7 @@ class LagunaAttention(QKNormRoPEAttention):
 
         layer_types = getattr(config, "layer_types", None)
         is_sliding = layer_types is not None and layer_types[layer_idx] == "sliding_attention"
+        self.is_sliding = is_sliding
 
         rope_params = self._build_rope_params(config, is_sliding)
 
@@ -363,12 +364,17 @@ class LagunaAttention(QKNormRoPEAttention):
         q, k, v = self.convert_qkv(q, k, v)
 
         window = attention_window_size or self.attention_window_size
+        attn_mask = (
+            PredefinedAttentionMask.SLIDING_WINDOW_CAUSAL
+            if self.is_sliding and attention_mask == PredefinedAttentionMask.CAUSAL
+            else attention_mask
+        )
         attn_output = self.forward_impl(
             q,
             k,
             v,
             attn_metadata,
-            attention_mask,
+            attn_mask,
             window,
             attention_mask_data,
             mrope_config=None,

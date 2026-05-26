@@ -1672,6 +1672,9 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         elif forward_args.attention_mask == PredefinedAttentionMask.CAUSAL:
             attention_mask_type = int(AttentionMaskType.causal)
             attention_mask_data = None
+        elif forward_args.attention_mask == PredefinedAttentionMask.SLIDING_WINDOW_CAUSAL:
+            attention_mask_type = int(AttentionMaskType.causal)
+            attention_mask_data = None
         elif forward_args.attention_mask == PredefinedAttentionMask.FULL:
             attention_mask_type = int(AttentionMaskType.padding)
             attention_mask_data = None

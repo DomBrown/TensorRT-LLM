@@ -678,9 +678,11 @@ class PredefinedAttentionMask(str, Enum):
 
     Attributes:
         CAUSAL: Use causal mask.
+        SLIDING_WINDOW_CAUSAL: Use sliding-window causal mask.
         FULL: do not use any mask
     """
     CAUSAL = "causal"
+    SLIDING_WINDOW_CAUSAL = "sliding_window_causal"
     FULL = "full"
 
 

@@ -1182,6 +1182,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> bool:
         if attention_mask == PredefinedAttentionMask.CAUSAL:
             mask_type = AttentionMaskType.causal
+        elif attention_mask == PredefinedAttentionMask.SLIDING_WINDOW_CAUSAL:
+            mask_type = AttentionMaskType.sliding_window_causal
         elif attention_mask == PredefinedAttentionMask.FULL:
             mask_type = AttentionMaskType.padding
         else:
@@ -1239,6 +1241,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                        attention_mask: AttentionMask) -> AttentionMaskType:
         if attention_mask == PredefinedAttentionMask.CAUSAL:
             return AttentionMaskType.causal
+        if attention_mask == PredefinedAttentionMask.SLIDING_WINDOW_CAUSAL:
+            return AttentionMaskType.sliding_window_causal
         if attention_mask == PredefinedAttentionMask.FULL:
             return AttentionMaskType.padding
         raise ValueError("Unexpected attention mask type")
