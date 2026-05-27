@@ -382,10 +382,17 @@ inline __device__ void device_flash_attention_nl(Params const& params)
     float global_max[Softmax::ROWS_PER_THREAD];
     float global_sum[Softmax::ROWS_PER_THREAD];
 
+    // Skip-softmax: per-warp vote slots in shared memory. Declared once outside the
+    // KV loop so it is reused every iteration. Sized to the number of warps in the
+    // CTA so each warp can write its sub-vote.
+    constexpr int SKIP_SOFTMAX_NUM_WARPS = Cta_tile_p::WARPS_M * Cta_tile_p::WARPS_N * Cta_tile_p::WARPS_K;
+    __shared__ uint32_t skip_softmax_vote_smem[SKIP_SOFTMAX_NUM_WARPS > 0 ? SKIP_SOFTMAX_NUM_WARPS : 1];
+
     for (int kv_loop = kv_loop_start; kv_loop < kv_loop_end; kv_loop += Cta_tile_p::N)
     {
 
         bool const first_step = (kv_loop == kv_loop_start);
+        bool tile_negligible = false;
         // It is possible that all tokens are masked out (sliding-window-attention).
         bool const apply_sliding_window_mask
             = (mask_sliding_window && (kv_loop <= sliding_window_mask_left || kv_loop >= sliding_window_mask_right));
@@ -530,27 +537,95 @@ inline __device__ void device_flash_attention_nl(Params const& params)
                 __syncthreads();
             }
 
-            // Update last step's acc_o.
-            acc_o_normalizer.update(acc_o, global_max, tmp, global_sum);
-            // Apply expf of softmax.
-            // It is possible that all elts are -FLT_MAX with sliding_window_causal.
-            softmax.template apply_exp_with_mask<CHECK_NEG_INF>(global_max);
+            // ------------------------------------------------------------
+            // Skip-softmax CTA-wide vote.
+            //
+            // For each KV-tile after the first, check whether this tile's
+            // contribution to the running softmax is negligible:
+            //   skip_i = (tile_max[i] <= prev_max[i])
+            //         && expf(tile_max[i] - prev_max[i]) < threshold
+            // where threshold = skip_softmax_threshold_scale_factor / actual_kv_seqlen.
+            // If ALL rows owned by ALL warps in the CTA agree, we skip the
+            // BMM2 (P @ V) for this tile and restore the running max so the
+            // following iterations remain numerically correct.
+            // ------------------------------------------------------------
+            if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
+            {
+                float const threshold = params.skip_softmax_threshold_scale_factor
+                    / static_cast<float>(binfo.actual_kv_seqlen);
+                bool skip = true;
+#pragma unroll
+                for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
+                {
+                    // If the new tile's max strictly exceeds the running max
+                    // it dominates; we cannot skip.
+                    if (global_max[i] > tmp[i])
+                    {
+                        skip = false;
+                    }
+                    else
+                    {
+                        // tile_max <= prev_max; skip if exp(delta) < threshold.
+                        float const ratio = __expf(global_max[i] - tmp[i]);
+                        if (!(ratio < threshold))
+                        {
+                            skip = false;
+                        }
+                    }
+                }
+                // Warp-level AND.
+                skip = __all_sync(0xffffffffu, skip);
+                // CTA-wide AND via shared memory.
+                int const warp_id = threadIdx.x >> 5;
+                int const lane_id = threadIdx.x & 31;
+                if (lane_id == 0)
+                {
+                    skip_softmax_vote_smem[warp_id] = skip ? 1u : 0u;
+                }
+                __syncthreads();
+                uint32_t all_skip = 1u;
+#pragma unroll
+                for (int w = 0; w < SKIP_SOFTMAX_NUM_WARPS; w++)
+                {
+                    all_skip &= skip_softmax_vote_smem[w];
+                }
+                tile_negligible = (all_skip != 0u);
+                if (tile_negligible)
+                {
+                    // Restore running max so the next iter sees the un-updated
+                    // accumulator state.
+#pragma unroll
+                    for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
+                    {
+                        global_max[i] = tmp[i];
+                    }
+                }
+            }
+
+            if (!tile_negligible)
+            {
+                // Update last step's acc_o.
+                acc_o_normalizer.update(acc_o, global_max, tmp, global_sum);
+                // Apply expf of softmax.
+                // It is possible that all elts are -FLT_MAX with sliding_window_causal.
+                softmax.template apply_exp_with_mask<CHECK_NEG_INF>(global_max);
 
 // Update the global sum.
 #pragma unroll
-            for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
-            {
-                tmp[i] = global_sum[i];
-                global_sum[i] = 0.f;
-            }
+                for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
+                {
+                    tmp[i] = global_sum[i];
+                    global_sum[i] = 0.f;
+                }
 
-            // Compute the sum.
-            softmax.template reduce<fmha::Sum_>(global_sum);
+                // Compute the sum.
+                softmax.template reduce<fmha::Sum_>(global_sum);
 
 #pragma unroll
-            for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
-            {
-                global_sum[i] += tmp[i];
+                for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
+                {
+                    global_sum[i] += tmp[i];
+                }
             }
         }
 
@@ -637,60 +712,67 @@ inline __device__ void device_flash_attention_nl(Params const& params)
             smem_v.load(frag_v[0], 0);
         }
 
-        // Repack for the next BMM.
-        fmha::Fragment_a<Traits_p, fmha::Row> frag_p[Mma_tile_o::MMAS_K][Mma_tile_o::MMAS_M];
-        softmax.pack(frag_p);
-
-        // Do this part of O = P^T * V^T.
-        fmha::Fragment_accumulator<Traits_o>(*acc_o_step)[Mma_tile_o::MMAS_M][Mma_tile_o::VALID_MMAS_N] = nullptr;
-        if constexpr (Kernel_traits::SAGE_ATTENTION)
+        // Skip the BMM2 (P @ V) entirely when the skip-softmax vote agreed
+        // the current KV-tile is negligible: acc_o remains unchanged from the
+        // previous iteration, which is the mathematically-correct outcome of
+        // treating this tile's softmax weight as zero.
+        if (!tile_negligible)
         {
-            fmha::Fragment_accumulator<Traits_o> acc_o_temp[Mma_tile_o::MMAS_M][Mma_tile_o::VALID_MMAS_N];
-            acc_o_step = &acc_o_temp;
-            fmha::Clear_accumulator<Acc_type_o, Cta_tile_o::WARPS_K>::apply(*acc_o_step);
-        }
+            // Repack for the next BMM.
+            fmha::Fragment_a<Traits_p, fmha::Row> frag_p[Mma_tile_o::MMAS_K][Mma_tile_o::MMAS_M];
+            softmax.pack(frag_p);
+
+            // Do this part of O = P^T * V^T.
+            fmha::Fragment_accumulator<Traits_o>(*acc_o_step)[Mma_tile_o::MMAS_M][Mma_tile_o::VALID_MMAS_N] = nullptr;
+            if constexpr (Kernel_traits::SAGE_ATTENTION)
+            {
+                fmha::Fragment_accumulator<Traits_o> acc_o_temp[Mma_tile_o::MMAS_M][Mma_tile_o::VALID_MMAS_N];
+                acc_o_step = &acc_o_temp;
+                fmha::Clear_accumulator<Acc_type_o, Cta_tile_o::WARPS_K>::apply(*acc_o_step);
+            }
 #pragma unroll
-        for (int ki = 1; ki < Mma_tile_o::MMAS_K; ++ki)
-        {
-
-            int p_ki = (ki - 1); // frag index for mma
-            int v_ki = (ki - 1);
-            if (Kernel_traits::LIMIT_V_FRAGMENTS)
+            for (int ki = 1; ki < Mma_tile_o::MMAS_K; ++ki)
             {
-                v_ki = (ki - 1) & 1;
-                smem_v.load(frag_v[(ki & 1)], ki);
+
+                int p_ki = (ki - 1); // frag index for mma
+                int v_ki = (ki - 1);
+                if (Kernel_traits::LIMIT_V_FRAGMENTS)
+                {
+                    v_ki = (ki - 1) & 1;
+                    smem_v.load(frag_v[(ki & 1)], ki);
+                }
+                if constexpr (Kernel_traits::SAGE_ATTENTION)
+                {
+                    fmha::gemm(*acc_o_step, frag_p[p_ki], frag_v[v_ki]);
+                }
+                else
+                {
+                    fmha::gemm(acc_o, frag_p[p_ki], frag_v[v_ki]);
+                }
             }
+            {
+                int ki = Mma_tile_o::MMAS_K;
+                int p_ki = (ki - 1);
+                int v_ki = (ki - 1);
+                if (Kernel_traits::LIMIT_V_FRAGMENTS)
+                {
+                    v_ki = (ki - 1) & 1;
+                }
+                if constexpr (Kernel_traits::SAGE_ATTENTION)
+                {
+                    fmha::gemm(*acc_o_step, frag_p[p_ki], frag_v[v_ki]);
+                }
+                else
+                {
+                    fmha::gemm(acc_o, frag_p[p_ki], frag_v[v_ki]);
+                }
+            }
+
             if constexpr (Kernel_traits::SAGE_ATTENTION)
             {
-                fmha::gemm(*acc_o_step, frag_p[p_ki], frag_v[v_ki]);
+                acc_o_normalizer.apply_scale(*acc_o_step);
+                acc_o_normalizer.merge(acc_o, *acc_o_step);
             }
-            else
-            {
-                fmha::gemm(acc_o, frag_p[p_ki], frag_v[v_ki]);
-            }
-        }
-        {
-            int ki = Mma_tile_o::MMAS_K;
-            int p_ki = (ki - 1);
-            int v_ki = (ki - 1);
-            if (Kernel_traits::LIMIT_V_FRAGMENTS)
-            {
-                v_ki = (ki - 1) & 1;
-            }
-            if constexpr (Kernel_traits::SAGE_ATTENTION)
-            {
-                fmha::gemm(*acc_o_step, frag_p[p_ki], frag_v[v_ki]);
-            }
-            else
-            {
-                fmha::gemm(acc_o, frag_p[p_ki], frag_v[v_ki]);
-            }
-        }
-
-        if constexpr (Kernel_traits::SAGE_ATTENTION)
-        {
-            acc_o_normalizer.apply_scale(*acc_o_step);
-            acc_o_normalizer.merge(acc_o, *acc_o_step);
         }
 
         // Commit V to shared memory

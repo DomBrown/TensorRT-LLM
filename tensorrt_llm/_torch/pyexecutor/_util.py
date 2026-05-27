@@ -88,9 +88,13 @@ def get_kv_cache_manager_cls(
     """
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
-    if sparse_attn_config is not None:
+    # For hybrid linear models (Qwen3.5/Qwen3-Next), the Mamba layers still
+    # need recurrent-state caching even when a sparse-attention config is set
+    # — skip-softmax only acts on the full-attention layers. Route to the
+    # hybrid manager and let the attention backend honor the sparse config.
+    if sparse_attn_config is not None and not is_hybrid_linear(config):
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
-    elif is_hybrid_linear(config):
+    if is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
         # mamba layers. Fall through to the standard non-hybrid manager.
         if model_config.get_num_mamba_layers() == 0:

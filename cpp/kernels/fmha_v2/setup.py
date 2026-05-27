@@ -705,7 +705,8 @@ using Kernel_traits_nl = fmha::{kernel_traits}<
     {output_dtype_},
     {sage_block_size_q},
     {sage_block_size_k},
-    {sage_block_size_v}>;
+    {sage_block_size_v},
+    /*enable_skip_softmax*/ {enable_skip_softmax_flag}>;
 
 using Kernel_traits_nl_causal = fmha::{kernel_traits}<
     fmha::{instruction_traits},
@@ -719,7 +720,9 @@ using Kernel_traits_nl_causal = fmha::{kernel_traits}<
     {kernel_flags} | 0x200 /* no_loop flag */,
     /*causal mask*/ 3,
     /*bmm2_fp16_epilogue*/ true,
-    {output_dtype_}>;
+    {output_dtype_},
+    /*sage_q*/ 0, /*sage_k*/ 0, /*sage_v*/ 0,
+    /*enable_skip_softmax*/ {enable_skip_softmax_flag}>;
 
 using Kernel_traits_nl_sliding_or_chunked_causal = fmha::{kernel_traits}<
     fmha::{instruction_traits},
@@ -733,7 +736,9 @@ using Kernel_traits_nl_sliding_or_chunked_causal = fmha::{kernel_traits}<
     {kernel_flags} | 0x200 /* no_loop flag */,
     /*sliding window causal mask*/ 4,
     /*bmm2_fp16_epilogue*/ true,
-    {output_dtype_}>;
+    {output_dtype_},
+    /*sage_q*/ 0, /*sage_k*/ 0, /*sage_v*/ 0,
+    /*enable_skip_softmax*/ {enable_skip_softmax_flag}>;
 
 using Kernel_traits_nl_bidirectional_sliding_window = fmha::{kernel_traits}<
     fmha::{instruction_traits},
@@ -747,7 +752,9 @@ using Kernel_traits_nl_bidirectional_sliding_window = fmha::{kernel_traits}<
     {kernel_flags} | 0x200 /* no_loop flag */,
     /*bidirectional sliding window mask*/ 5,
     /*bmm2_fp16_epilogue*/ true,
-    {output_dtype_}>;
+    {output_dtype_},
+    /*sage_q*/ 0, /*sage_k*/ 0, /*sage_v*/ 0,
+    /*enable_skip_softmax*/ {enable_skip_softmax_flag}>;
 
 using Kernel_traits_nl_custom_mask = fmha::{kernel_traits}<
     fmha::{instruction_traits},
@@ -761,7 +768,9 @@ using Kernel_traits_nl_custom_mask = fmha::{kernel_traits}<
     {kernel_flags} | 0x200 /* no_loop flag */,
     /*custom mask*/ 6,
     /*bmm2_fp16_epilogue*/ true,
-    {output_dtype_}>;
+    {output_dtype_},
+    /*sage_q*/ 0, /*sage_k*/ 0, /*sage_v*/ 0,
+    /*enable_skip_softmax*/ {enable_skip_softmax_flag}>;
 
 #if {padding_mask} // padding_mask
 
@@ -890,7 +899,8 @@ using Kernel_traits_nl_tiled = fmha::{kernel_traits}<
     {output_dtype_},
     {sage_block_size_q},
     {sage_block_size_k},
-    {sage_block_size_v}>;
+    {sage_block_size_v},
+    /*enable_skip_softmax*/ {enable_skip_softmax_flag}>;
 
 using Kernel_traits_nl_tiled_causal = fmha::{kernel_traits}<
     fmha::{instruction_traits},
@@ -904,7 +914,9 @@ using Kernel_traits_nl_tiled_causal = fmha::{kernel_traits}<
     {kernel_flags} | 0x200 /* no_loop flag */,
     /*causal mask*/ 3,
     /*bmm2_fp16_epilogue*/ true,
-    {output_dtype_}>;
+    {output_dtype_},
+    /*sage_q*/ 0, /*sage_k*/ 0, /*sage_v*/ 0,
+    /*enable_skip_softmax*/ {enable_skip_softmax_flag}>;
 
 using Kernel_traits_nl_tiled_sliding_or_chunked_causal = fmha::{kernel_traits}<
     fmha::{instruction_traits},
@@ -918,7 +930,9 @@ using Kernel_traits_nl_tiled_sliding_or_chunked_causal = fmha::{kernel_traits}<
     {kernel_flags} | 0x200 /* no_loop flag */,
     /*sliding window causal mask*/ 4,
     /*bmm2_fp16_epilogue*/ true,
-    {output_dtype_}>;
+    {output_dtype_},
+    /*sage_q*/ 0, /*sage_k*/ 0, /*sage_v*/ 0,
+    /*enable_skip_softmax*/ {enable_skip_softmax_flag}>;
 
 using Kernel_traits_nl_tiled_bidirectional_sliding_window = fmha::{kernel_traits}<
     fmha::{instruction_traits},
@@ -932,7 +946,9 @@ using Kernel_traits_nl_tiled_bidirectional_sliding_window = fmha::{kernel_traits
     {kernel_flags} | 0x200 /* no_loop flag */,
     /*bidirectional sliding window mask*/ 5,
     /*bmm2_fp16_epilogue*/ true,
-    {output_dtype_}>;
+    {output_dtype_},
+    /*sage_q*/ 0, /*sage_k*/ 0, /*sage_v*/ 0,
+    /*enable_skip_softmax*/ {enable_skip_softmax_flag}>;
 
 using Kernel_traits_nl_tiled_custom_mask = fmha::{kernel_traits}<
     fmha::{instruction_traits},
@@ -946,7 +962,9 @@ using Kernel_traits_nl_tiled_custom_mask = fmha::{kernel_traits}<
     {kernel_flags} | 0x200 /* no_loop flag */,
     /*custom mask*/ 6,
     /*bmm2_fp16_epilogue*/ true,
-    {output_dtype_}>;
+    {output_dtype_},
+    /*sage_q*/ 0, /*sage_k*/ 0, /*sage_v*/ 0,
+    /*enable_skip_softmax*/ {enable_skip_softmax_flag}>;
 
 #if {padding_mask} // padding_mask
 
@@ -5223,7 +5241,11 @@ def enumerate_hmma_paged_kv_flash_kernels(specs, sm=80, dtype='fp16'):
                                           enable_attn_logit_softcapping)
 
 
-def enumerate_hmma_flash_kernels(specs, sm=80, dtype='fp16', head_size_v=0):
+def enumerate_hmma_flash_kernels(specs,
+                                 sm=80,
+                                 dtype='fp16',
+                                 head_size_v=0,
+                                 enable_skip_softmax=False):
     input_layouts = [
         InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV,
         InputLayout.Q_PAGED_KV
@@ -5236,7 +5258,7 @@ def enumerate_hmma_flash_kernels(specs, sm=80, dtype='fp16', head_size_v=0):
                                                    [False, True]):
         enumerate_hmma_flash_kernels_base(specs, sm, dtype, input_layout,
                                           enable_attn_logit_softcapping,
-                                          head_size_v)
+                                          head_size_v, enable_skip_softmax)
 
 
 # Note this will be used in TRT-LLM.
@@ -5245,7 +5267,8 @@ def enumerate_hmma_flash_kernels_base(specs,
                                       dtype='fp16',
                                       input_layout=InputLayout.PACKED_QKV,
                                       enable_attn_logit_softcapping=False,
-                                      head_size_v=0):
+                                      head_size_v=0,
+                                      enable_skip_softmax=False):
     #- FP16 Flash Attention (use nl as default)
     # Any Sequence Length H = 16/32/40/48/64/80/128/160/256/512 flash attention
 
@@ -5315,7 +5338,8 @@ def enumerate_hmma_flash_kernels_base(specs,
                     ctas_per_head=1,
                     input_layout=input_layout,
                     enable_attn_logit_softcapping=enable_attn_logit_softcapping,
-                    is_mtp=(head_size == 576 and head_size_v == 512)))
+                    is_mtp=(head_size == 576 and head_size_v == 512),
+                    enable_skip_softmax=enable_skip_softmax))
 
     for head_size in [
             16, 32, 40, 48, 64, 72, 80, 96, 104, 128, 160, 192, 256, 512
@@ -5388,7 +5412,8 @@ def enumerate_hmma_flash_kernels_base(specs,
                     has_scale_max=False,
                     ctas_per_head=1,
                     input_layout=input_layout,
-                    enable_attn_logit_softcapping=enable_attn_logit_softcapping)
+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping,
+                    enable_skip_softmax=enable_skip_softmax)
             )
         elif head_size <= 128:
             # q_step = 64, kv_step = 32
@@ -5419,7 +5444,8 @@ def enumerate_hmma_flash_kernels_base(specs,
                     has_scale_max=False,
                     ctas_per_head=1,
                     input_layout=input_layout,
-                    enable_attn_logit_softcapping=enable_attn_logit_softcapping)
+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping,
+                    enable_skip_softmax=enable_skip_softmax)
             )
 
 
@@ -5588,7 +5614,8 @@ def enumerate_qmma_flash_kernels(specs,
                                  dtype='e4m3_fp32',
                                  head_sizes=None,
                                  sage_block_sizes=None,
-                                 output_dtype=None):
+                                 output_dtype=None,
+                                 enable_skip_softmax=False):
     # ((head_size, head_size_v), (q_loop_step, kv_loop_step), tiled).
     params_q_kv_step = [
         (32, (128, 128), 0),
@@ -5626,6 +5653,11 @@ def enumerate_qmma_flash_kernels(specs,
         # skip if head_size_v is not 128 for separate-q-k-v
         if input_layout == InputLayout.SEPARATE_Q_K_V and head_size_v != 128:
             continue
+        # The skip-softmax port targets the non-tiled noloop kernel only.
+        # The tiled MLA variants (e.g. (192,128), (576,512)) are not ported, so
+        # do not enumerate skip-softmax cubins for them.
+        if enable_skip_softmax and tiled:
+            continue
         specs.append(
             kernel_spec(sm=sm,
                         sm_mma=89,
@@ -5655,7 +5687,8 @@ def enumerate_qmma_flash_kernels(specs,
                         input_layout=input_layout,
                         sage_block_sizes=sage_block_sizes,
                         output_dtype=output_dtype,
-                        is_mtp=(head_size == 576 and head_size_v == 512)))
+                        is_mtp=(head_size == 576 and head_size_v == 512),
+                        enable_skip_softmax=enable_skip_softmax))
 
 
 def enumerate_imma_kernels(specs, sm=80):
@@ -6794,24 +6827,41 @@ def enumerate_kernels():
 
     if 'ENABLE_SM120' in os.environ:
         # SM 120
-        enumerate_hmma_flash_kernels(specs, sm=120, dtype='fp16')
-        enumerate_hmma_flash_kernels(specs, sm=120, dtype='bf16')
-        enumerate_hmma_flash_kernels(specs,
-                                     sm=120,
-                                     dtype='bf16',
-                                     head_size_v=128)
-        enumerate_hmma_flash_kernels(specs,
-                                     sm=120,
-                                     dtype='bf16',
-                                     head_size_v=512)
+        # Generate both the regular and the skip-softmax variants for the
+        # non-warpspec sm_120 path (covers Qwen3.5-style hybrid attention).
+        for enable_skip_softmax in (False, True):
+            enumerate_hmma_flash_kernels(specs,
+                                         sm=120,
+                                         dtype='fp16',
+                                         enable_skip_softmax=enable_skip_softmax)
+            enumerate_hmma_flash_kernels(specs,
+                                         sm=120,
+                                         dtype='bf16',
+                                         enable_skip_softmax=enable_skip_softmax)
+            enumerate_hmma_flash_kernels(specs,
+                                         sm=120,
+                                         dtype='bf16',
+                                         head_size_v=128,
+                                         enable_skip_softmax=enable_skip_softmax)
+            enumerate_hmma_flash_kernels(specs,
+                                         sm=120,
+                                         dtype='bf16',
+                                         head_size_v=512,
+                                         enable_skip_softmax=enable_skip_softmax)
+            enumerate_qmma_flash_kernels(
+                specs,
+                sm=120,
+                dtype='e4m3_fp32',
+                enable_skip_softmax=enable_skip_softmax)
+            # Add bf16 output kernels for e4m3 input (MLA and standard head sizes).
+            enumerate_qmma_flash_kernels(
+                specs,
+                sm=120,
+                dtype='e4m3_fp32',
+                head_sizes=[128, 192, 576],
+                output_dtype="bf16",
+                enable_skip_softmax=enable_skip_softmax)
         enumerate_qmma_kernels(specs, sm=120)
-        enumerate_qmma_flash_kernels(specs, sm=120, dtype='e4m3_fp32')
-        # Add bf16 output kernels for e4m3 input (MLA and standard head sizes).
-        enumerate_qmma_flash_kernels(specs,
-                                     sm=120,
-                                     dtype='e4m3_fp32',
-                                     head_sizes=[128, 192, 576],
-                                     output_dtype="bf16")
 
     if 'ENABLE_HMMA_FP32' in os.environ:
         enumerate_hmma_flash_kernels(specs, sm=80, dtype='fp16_fp32')

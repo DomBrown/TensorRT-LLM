@@ -498,14 +498,30 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
                     && (mLaunchParams.attention_input_layout == AttentionInputLayout::SEPARATE_Q_K_V))));
     }
 
+    // Debug: force non-tiled flash attention (matches the kernel variant generated for skip-softmax on sm_120/121).
+    {
+        static int const sForceNonTiled = []()
+        {
+            char const* env = std::getenv("TRTLLM_FORCE_NON_TILED_FMHA");
+            return env ? std::atoi(env) : 0;
+        }();
+        if (sForceNonTiled)
+        {
+            mLaunchParams.granular_tiling = false;
+        }
+    }
+
     // Setup launch params for skip softmax attention
     mLaunchParams.enableSkipSoftmax = false;
     if (runnerParams.skipSoftmaxThresholdScaleFactor > 0)
     {
-        if (!isSm90 || !mLaunchParams.warp_specialization || !mLaunchParams.flash_attention)
+        bool const isSm120f = (mSM == kSM_120 || mSM == kSM_121);
+        bool const hopperWarpspec = isSm90 && mLaunchParams.warp_specialization;
+        bool const sm120NonWarpspec = isSm120f && !mLaunchParams.warp_specialization;
+        if (!mLaunchParams.flash_attention || !(hopperWarpspec || sm120NonWarpspec))
         {
             TLLM_CHECK_WITH_INFO(false,
-                "Skip softmax attention is only supported on Hopper with warp specialization and flash attention.");
+                "Skip softmax attention requires either Hopper+warpspec or sm_120/sm_121 non-warpspec with flash attention.");
         }
         mLaunchParams.enableSkipSoftmax = true;
     }

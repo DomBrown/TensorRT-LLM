@@ -319,10 +319,17 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     constexpr int BMM2_TAIL_MMAS_K_BOUND = Mma_tile_o::MMAS_K;
     constexpr int BMM2_MAIN_MMAS_K_BOUND = Kernel_traits::TOTAL_BMM2_MMAS_K - BMM2_TAIL_MMAS_K_BOUND;
 
+    // Skip-softmax: single shared-memory word holds the CTA-wide AND of warp-level
+    // votes. Each KV iteration resets it to 1, every warp that disagrees does a
+    // single atomicAnd(&vote, 0u) from lane 0, and one __syncthreads() suffices for
+    // both the init and the read fence.
+    __shared__ uint32_t skip_softmax_vote_smem;
+
     for (int kv_loop = kv_loop_start; kv_loop < kv_loop_end; kv_loop += Cta_tile_p::N)
     {
 
         bool const first_step = (kv_loop == kv_loop_start);
+        bool tile_negligible = false;
         // It is possible that all tokens are masked out (sliding-window-attention).
         bool const apply_sliding_window_mask
             = (mask_sliding_window && (kv_loop <= sliding_window_mask_left || kv_loop >= sliding_window_mask_right));
@@ -488,28 +495,86 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
                 __syncthreads();
             }
 
-            // Update last step's acc_o.
-            acc_o_normalizer.update(acc_o, global_max, tmp, global_sum);
-            // Apply expf of softmax.
-            // It is possible that all elts are -FLT_MAX with sliding_window_causal or custom_mask.
-            softmax.template apply_exp_with_mask<CHECK_NEG_INF>(global_max);
+            // ------------------------------------------------------------
+            // Skip-softmax CTA-wide vote (tiled kernel).
+            //
+            // Skip the tile when, for every row owned by every warp, the new
+            // tile's max <= prev_max AND exp(tile_max - prev_max) < threshold.
+            // On skip we restore global_max = tmp so subsequent iters see the
+            // unchanged running max, and we bypass the softmax tail + BMM2
+            // GEMM tiles for this iteration. The V load pipeline keeps running
+            // so the next iteration's BMM2 has the V it needs.
+            // ------------------------------------------------------------
+            if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
+            {
+                float const threshold = params.skip_softmax_threshold_scale_factor
+                    / static_cast<float>(binfo.actual_kv_seqlen);
+                bool skip = true;
+#pragma unroll
+                for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
+                {
+                    if (global_max[i] > tmp[i])
+                    {
+                        skip = false;
+                    }
+                    else
+                    {
+                        float const ratio = __expf(global_max[i] - tmp[i]);
+                        if (!(ratio < threshold))
+                        {
+                            skip = false;
+                        }
+                    }
+                }
+                // Warp-AND, then a single CTA-wide AND via atomicAnd on one smem word.
+                skip = __all_sync(0xffffffffu, skip);
+                if (threadIdx.x == 0)
+                {
+                    skip_softmax_vote_smem = 1u;
+                }
+                __syncthreads();
+                int const lane_id = threadIdx.x & 31;
+                if (lane_id == 0 && !skip)
+                {
+                    atomicAnd(&skip_softmax_vote_smem, 0u);
+                }
+                __syncthreads();
+                tile_negligible = (skip_softmax_vote_smem != 0u);
+                if (tile_negligible)
+                {
+#pragma unroll
+                    for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
+                    {
+                        global_max[i] = tmp[i];
+                    }
+                }
+            }
+
+            if (!tile_negligible)
+            {
+                // Update last step's acc_o.
+                acc_o_normalizer.update(acc_o, global_max, tmp, global_sum);
+                // Apply expf of softmax.
+                // It is possible that all elts are -FLT_MAX with sliding_window_causal or custom_mask.
+                softmax.template apply_exp_with_mask<CHECK_NEG_INF>(global_max);
 
 // Update the global sum.
 // TODO Can we just zero out tmp and reduce into that
 #pragma unroll
-            for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
-            {
-                tmp[i] = global_sum[i];
-                global_sum[i] = 0.f;
-            }
+                for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
+                {
+                    tmp[i] = global_sum[i];
+                    global_sum[i] = 0.f;
+                }
 
-            // Compute the sum.
-            softmax.template reduce<fmha::Sum_>(global_sum);
+                // Compute the sum.
+                softmax.template reduce<fmha::Sum_>(global_sum);
 
 #pragma unroll
-            for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
-            {
-                global_sum[i] += tmp[i];
+                for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
+                {
+                    global_sum[i] += tmp[i];
+                }
             }
         }
 
@@ -525,11 +590,16 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
 #if defined(STORE_S)
         gmem_s.move();
 #endif
-        // Repack for the next BMM.
+        // Repack for the next BMM. Only needed when the tile is not negligible
+        // (otherwise frag_p is unused).
         fmha::Fragment_a<Traits_p, fmha::Row> frag_p[Kernel_traits::TOTAL_BMM2_MMAS_K][Mma_tile_o::MMAS_M];
-        softmax.pack(frag_p);
+        if (!tile_negligible)
+        {
+            softmax.pack(frag_p);
+        }
 
-        // BMM2 main loop
+        // BMM2 main loop. We always run the V load pipeline so the next iteration
+        // has its V tiles ready; we only skip the BMM2 GEMM when the tile vote agreed.
         for (int bmm2_k = 0; bmm2_k < BMM2_MAIN_MMAS_K_BOUND; bmm2_k += Mma_tile_o::MMAS_K)
         {
             // Trigger the load for next V values
@@ -545,12 +615,15 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
             fmha::depbar_<USE_LDGSTS, 1>();
             __syncthreads();
 
-#pragma unroll
-            for (int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki)
+            if (!tile_negligible)
             {
-                int p_ki = bmm2_k + ki;
-                smem_v.load(frag_v[ki], ki);
-                fmha::gemm(acc_o, frag_p[p_ki], frag_v[ki]);
+#pragma unroll
+                for (int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki)
+                {
+                    int p_ki = bmm2_k + ki;
+                    smem_v.load(frag_v[ki], ki);
+                    fmha::gemm(acc_o, frag_p[p_ki], frag_v[ki]);
+                }
             }
 
             // Make sure we are done reading the data (smem).
@@ -603,13 +676,17 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
                 __syncthreads();
             }
 
-// Do this part of O = P^T * V^T.
-#pragma unroll
-            for (int ki = 0; ki < BMM2_TAIL_MMAS_K_BOUND; ++ki)
+// Do this part of O = P^T * V^T. Skip the GEMM when the tile was voted negligible,
+// but keep the smem_v buffer-pointer state machine consistent.
+            if (!tile_negligible)
             {
-                int p_ki = BMM2_MAIN_MMAS_K_BOUND + ki;
-                smem_v.load(frag_v[ki], ki);
-                fmha::gemm(acc_o, frag_p[p_ki], frag_v[ki]);
+#pragma unroll
+                for (int ki = 0; ki < BMM2_TAIL_MMAS_K_BOUND; ++ki)
+                {
+                    int p_ki = BMM2_MAIN_MMAS_K_BOUND + ki;
+                    smem_v.load(frag_v[ki], ki);
+                    fmha::gemm(acc_o, frag_p[p_ki], frag_v[ki]);
+                }
             }
 
             smem_v.move_to_next_read_buffer();
