@@ -324,6 +324,21 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     // single atomicAnd(&vote, 0u) from lane 0, and one __syncthreads() suffices for
     // both the init and the read fence.
     __shared__ uint32_t skip_softmax_vote_smem;
+    // Loop-invariant: actual_kv_seqlen does not change within one CTA invocation,
+    // so the threshold is fixed for the entire KV loop. We test
+    //   expf(global_max[i] - tmp[i]) < threshold
+    //   <=>  (global_max[i] - tmp[i]) < log(threshold)
+    // so we precompute log(threshold) once and the per-row test becomes a
+    // single FP compare — no expf call inside the hot path.
+    float const skip_softmax_log_threshold = Kernel_traits::ENABLE_SKIP_SOFTMAX
+        ? __logf(params.skip_softmax_threshold_scale_factor / static_cast<float>(binfo.actual_kv_seqlen))
+        : 0.0f;
+#ifdef SKIP_SOFTMAX_STAT
+    // Per-CTA counters for skip-softmax statistics. Accumulated atomically to
+    // global at end of kernel when the host has set the counter pointers.
+    uint32_t skip_softmax_total = 0;
+    uint32_t skip_softmax_skipped = 0;
+#endif
 
     for (int kv_loop = kv_loop_start; kv_loop < kv_loop_end; kv_loop += Cta_tile_p::N)
     {
@@ -334,6 +349,18 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
         bool const apply_sliding_window_mask
             = (mask_sliding_window && (kv_loop <= sliding_window_mask_left || kv_loop >= sliding_window_mask_right));
         bool const apply_mask = params.has_alibi || (kv_loop >= kv_mask_loop_start) || apply_sliding_window_mask;
+
+        // Skip-softmax vote init: pre-set the shared vote word to "all-skip" at the
+        // top of every kv iteration. The BMM1's natural __syncthreads() below will
+        // make this visible to all warps before they atomicAnd into it, so we avoid
+        // an explicit init barrier on the vote path.
+        if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
+        {
+            if (threadIdx.x == 0)
+            {
+                skip_softmax_vote_smem = 1u;
+            }
+        }
 
         // Declare the accumulators for the 1st gemm.
         fmha::Fragment_accumulator<Traits_p> acc_p[Mma_tile_p::MMAS_M][Mma_tile_p::MMAS_N];
@@ -507,41 +534,34 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
             // ------------------------------------------------------------
             if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
             {
-                float const threshold = params.skip_softmax_threshold_scale_factor
-                    / static_cast<float>(binfo.actual_kv_seqlen);
+                // Per-warp skip vote — no CTA-wide sync.
+                //
+                // Each warp owns its own Q rows, its own slice of acc_o, its
+                // own frag_p, and its own global_max/global_sum. The BMM2
+                // HMMA is per-warp, so a warp can skip its GEMM independently
+                // without affecting other warps. The natural __syncthreads()
+                // inside BMM2 main/tail still execute for all warps (they live
+                // outside the per-warp `if (!tile_negligible)` gate), so no
+                // deadlock risk.
+                //
+                // Predicate: tile_max[i] - prev_max[i] < log(threshold)
+                // for every row owned by this warp. Computed branchless and
+                // reduced with a single __all_sync.
+#ifdef SKIP_SOFTMAX_STAT
+                ++skip_softmax_total;
+#endif
                 bool skip = true;
 #pragma unroll
                 for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
                 {
-                    if (global_max[i] > tmp[i])
-                    {
-                        skip = false;
-                    }
-                    else
-                    {
-                        float const ratio = __expf(global_max[i] - tmp[i]);
-                        if (!(ratio < threshold))
-                        {
-                            skip = false;
-                        }
-                    }
+                    skip = skip && ((global_max[i] - tmp[i]) < skip_softmax_log_threshold);
                 }
-                // Warp-AND, then a single CTA-wide AND via atomicAnd on one smem word.
-                skip = __all_sync(0xffffffffu, skip);
-                if (threadIdx.x == 0)
-                {
-                    skip_softmax_vote_smem = 1u;
-                }
-                __syncthreads();
-                int const lane_id = threadIdx.x & 31;
-                if (lane_id == 0 && !skip)
-                {
-                    atomicAnd(&skip_softmax_vote_smem, 0u);
-                }
-                __syncthreads();
-                tile_negligible = (skip_softmax_vote_smem != 0u);
+                tile_negligible = __all_sync(0xffffffffu, skip);
                 if (tile_negligible)
                 {
+#ifdef SKIP_SOFTMAX_STAT
+                    ++skip_softmax_skipped;
+#endif
 #pragma unroll
                     for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
                     {
@@ -737,6 +757,16 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
         fmha::Softmax_saver<Cta_tile_o, Mma_tile> saver(params, binfo);
         saver.store(q_loop, global_sum, global_max);
     }
+#ifdef SKIP_SOFTMAX_STAT
+    if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
+    {
+        if (threadIdx.x == 0 && params.skip_softmax_total_blocks != nullptr)
+        {
+            atomicAdd(params.skip_softmax_total_blocks, skip_softmax_total);
+            atomicAdd(params.skip_softmax_skipped_blocks, skip_softmax_skipped);
+        }
+    }
+#endif
 } // device_flash_attention_1xN
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
