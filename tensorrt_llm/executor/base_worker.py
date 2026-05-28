@@ -15,9 +15,11 @@
 import copy
 import datetime
 import enum
+import faulthandler as _faulthandler
 import gc
 import json
 import os
+import sys as _sys
 import weakref
 from pathlib import Path
 from queue import Queue
@@ -25,6 +27,11 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import psutil
 import torch
+
+try:
+    _faulthandler.enable(file=_sys.stderr, all_threads=True)
+except Exception:
+    pass
 
 from tensorrt_llm.logger import logger
 

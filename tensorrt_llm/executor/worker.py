@@ -1,8 +1,16 @@
+import faulthandler as _faulthandler
 import gc
 import os
+import sys as _sys
 import threading
 import time
 import traceback
+
+# Injected for sm_121 silent-crash debugging.
+try:
+    _faulthandler.enable(file=_sys.stderr, all_threads=True)
+except Exception:
+    pass
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import List, Optional, Union

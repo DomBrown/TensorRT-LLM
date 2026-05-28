@@ -1418,7 +1418,11 @@ class AutoTuner:
 
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
         for spec in constraint_specs:
+            if spec.input_idx >= len(base_profile):
+                continue
             if base_profile[spec.input_idx] == [0]:
+                continue
+            if spec.dim_idx >= len(base_profile[spec.input_idx]):
                 continue
             base_profile[spec.input_idx][spec.dim_idx] = -1
 
