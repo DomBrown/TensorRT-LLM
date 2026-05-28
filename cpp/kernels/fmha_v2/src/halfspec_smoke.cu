@@ -33,6 +33,8 @@
  * (~4 MB). Correctness validation is phase 6 (runtime gen_token compare).
  */
 
+#include <cstdio>
+
 #include <fused_multihead_attention.h>
 #include <fused_multihead_attention_kernel.h>
 #include <fmha/traits.h>
@@ -43,9 +45,16 @@
 namespace fmha_smoke
 {
 
+// NOTE: the `S` template arg is the *kv loop step* (per-iter KV tile size),
+// not the runtime maximum sequence length. For head_dim=256 the existing
+// setup.py uses kv_loop_step=128. The runtime kv seqlen is read from
+// binfo.actual_kv_seqlen and the kv loop iterates in chunks of S.
+//
+// Also: with TMA box size capped at 256 elements per axis, S must be <=256
+// (we load STEP_KV = Cta_tile_p::N = S elements per TMA box call).
 using Smoke_Ktraits = fmha::ws_sm120::Kernel_traits_halfspec_sm120<
     /*Traits_=*/fmha::Ampere_hmma_bf16_traits,
-    /*S=*/8192,
+    /*S=*/128,
     /*VALID_D_=*/256,
     /*VALID_DV_=*/256,
     /*STEP_Q_=*/64,
@@ -53,7 +62,7 @@ using Smoke_Ktraits = fmha::ws_sm120::Kernel_traits_halfspec_sm120<
     /*WARPS_N_=*/1,
     /*VERSION_=*/2,
     /*MASK_VERSION_=*/3, // 3 = causal
-    /*RING_DEPTH_=*/3,
+    /*RING_DEPTH_=*/1,
     /*ENABLE_SKIP_SOFTMAX_=*/false,
     /*NUM_PRODUCER_WARPS_=*/1>;
 
@@ -63,4 +72,53 @@ extern "C" __global__ __launch_bounds__(fmha_smoke::Smoke_Ktraits::THREADS, 1)
 void halfspec_smoke_kernel(bert::Fused_multihead_attention_params_v2 const params)
 {
     fused_multihead_attention::device_flash_attention_ws_sm120<fmha_smoke::Smoke_Ktraits>(params);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// Host-side launcher for the halfspec smoke kernel.
+//
+// Sets up the TMA descriptors via DMA::Host::init_params, sizes shared memory,
+// configures the launch attribute that lets the kernel use >48KB smem, and
+// launches the kernel on the given stream.
+//
+// Returns the cudaError_t from the launch -- the caller is responsible for
+// checking it (and running a separate sync to surface launch-time aborts).
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+extern "C" cudaError_t launch_halfspec_smoke(
+    bert::Fused_multihead_attention_params_v2 params,
+    bert::Fused_multihead_attention_launch_params const& launch_params,
+    cudaStream_t stream)
+{
+    // 1. Build the TMA descriptors host-side. Populates
+    //    params.tma_desc_q / _k / _v in place.
+    fmha::ws_sm120::DMA<fmha_smoke::Smoke_Ktraits>::Host dma_host;
+    dma_host.init_params(params, launch_params, stream);
+
+    // 2. Size the smem allocation. With RING_DEPTH=3 and head_dim=256 BF16 +
+    //    STEP_Q/KV=64, the Shared struct is ~150 KB, comfortably above the
+    //    48 KB cudaFuncAttributeMaxDynamicSharedMemorySize default.
+    constexpr int smem_bytes = static_cast<int>(fmha_smoke::Smoke_Ktraits::BYTES_PER_SMEM);
+    std::fprintf(stderr, "[halfspec-runtest] BYTES_PER_SMEM = %d\n", smem_bytes);
+    if (smem_bytes >= 48 * 1024)
+    {
+        cudaError_t err = cudaFuncSetAttribute(halfspec_smoke_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        if (err != cudaSuccess)
+        {
+            return err;
+        }
+    }
+
+    // 3. Grid = (Q-tiles, H, B). One CTA per (Q-tile, head, batch). Each CTA
+    //    has THREADS threads (1 producer warp + WARPS_M*WARPS_N consumer
+    //    warps = 5 warps total = 160 threads).
+    int const q_tiles = (params.s + fmha_smoke::Smoke_Ktraits::STEP_Q - 1)
+                      / fmha_smoke::Smoke_Ktraits::STEP_Q;
+    dim3 const grid(q_tiles, params.h, params.b);
+    dim3 const block(fmha_smoke::Smoke_Ktraits::THREADS);
+
+    halfspec_smoke_kernel<<<grid, block, smem_bytes, stream>>>(params);
+    return cudaGetLastError();
 }

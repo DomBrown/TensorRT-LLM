@@ -125,13 +125,26 @@ struct DMA
         // depends on Gmem_tile_q's TMA-descriptor layout; the existing
         // ws::DMA in fmha/warpspec/dma.h has the canonical setup we should
         // mirror.
+        // The TMA descriptors built by Host::init_params are 3D
+        // (Multiple_tma_descriptor<3>) over tensors of shape
+        // (D, H_or_HKV, total_seqlen). So the cp.async.bulk.tensor call
+        // must also be 3D with a 3-element coord array.
+        //
+        // Coord ordering matches the tensor_size layout:
+        //   coord[0] = D offset (always 0; the box covers the full head dim)
+        //   coord[1] = head index (this CTA's bidh)
+        //   coord[2] = seq position
+        int const bidh    = static_cast<int>(blockIdx.y);
+        int const bidh_kv = bidh / static_cast<int>(params.h_q_per_kv);
+
         {
             int const q_slot = cbw_q.tmaReserve(elect_one_, TX_BYTES_Q);
             uint32_t const q_smem = __nvvm_get_smem_pointer(&shared->smem_q[q_slot][0]);
             uint32_t const q_bar = __nvvm_get_smem_pointer(cbw_q.barrier_ptr(q_slot));
-            int32_t const coord[2] = {0, static_cast<int32_t>(blockIdx.y * STEP_Q)};
-            // 2D, TILED, no multicast.
-            fmha::utmaldg<2, fmha::cudaTmaDescType::TILED, false>(desc_q, q_smem, q_bar, coord, elect_one_);
+            // Q starts at q_loop * STEP_Q rows; for now this kernel handles
+            // one Q-tile per CTA so the row offset is blockIdx.x * STEP_Q.
+            int32_t const coord[3] = {0, bidh, static_cast<int32_t>(blockIdx.x * STEP_Q)};
+            fmha::utmaldg<3, fmha::cudaTmaDescType::TILED, false>(desc_q, q_smem, q_bar, coord, elect_one_);
         }
 
         // --- KV loop: one (K, V) load per iter ------------------------------
@@ -141,15 +154,15 @@ struct DMA
             int const k_slot = cbw_k.tmaReserve(elect_one_, TX_BYTES_K);
             uint32_t const k_smem = __nvvm_get_smem_pointer(&shared->smem_k[k_slot][0]);
             uint32_t const k_bar = __nvvm_get_smem_pointer(cbw_k.barrier_ptr(k_slot));
-            int32_t const k_coord[2] = {0, kv_loop};
-            fmha::utmaldg<2, fmha::cudaTmaDescType::TILED, false>(desc_k, k_smem, k_bar, k_coord, elect_one_);
+            int32_t const k_coord[3] = {0, bidh_kv, kv_loop};
+            fmha::utmaldg<3, fmha::cudaTmaDescType::TILED, false>(desc_k, k_smem, k_bar, k_coord, elect_one_);
 
             // V
             int const v_slot = cbw_v.tmaReserve(elect_one_, TX_BYTES_V);
             uint32_t const v_smem = __nvvm_get_smem_pointer(&shared->smem_v[v_slot][0]);
             uint32_t const v_bar = __nvvm_get_smem_pointer(cbw_v.barrier_ptr(v_slot));
-            int32_t const v_coord[2] = {0, kv_loop};
-            fmha::utmaldg<2, fmha::cudaTmaDescType::TILED, false>(desc_v, v_smem, v_bar, v_coord, elect_one_);
+            int32_t const v_coord[3] = {0, bidh_kv, kv_loop};
+            fmha::utmaldg<3, fmha::cudaTmaDescType::TILED, false>(desc_v, v_smem, v_bar, v_coord, elect_one_);
         }
 
         // Producer exits. The consumers' cbw_*.complete() acks have already

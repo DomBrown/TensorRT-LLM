@@ -291,18 +291,34 @@ struct Kernel_traits_halfspec_sm120
         fmha::ws::CircularBufferBarriers<RING_DEPTH> v_barriers;
 
         // Initialize all mbarriers. Called by thread 0 of the CTA at startup.
+        //
+        // Counts:
+        //   entryProducedBarriers: arrival count = 1
+        //     (only the elect-one DMA thread arrives via tmaReserve, which
+        //      calls bar_arrive_set_transactioncnt; the TMA completion's
+        //      tx-bytes arrival fires separately and is gated by expect_tx).
+        //   entryConsumedBarriers: arrival count = 1
+        //     (only tidx==0 of the consumer group arrives via
+        //      cbr_*.complete(tidx == 0, slot)).
+        //
+        // Mirrors the Hopper warpspec pattern in fmha/warpspec/kernel_traits.h
+        // where tma_*_tracker.init(tid0, 1, CTAS_PER_CGA) is used with
+        // CTAS_PER_CGA == 1 for the single-CTA / no-cluster case.
         inline __device__ void init(bool tid0)
         {
-            // CircularBufferBarriers has no init() of its own; we lean on the
-            // CircularBuffer<...>::init() helper which takes barrier addrs +
-            // producer/consumer counts. For halfspec:
-            //   - producer count = NUM_PRODUCER_WARPS * 32 = 32 (one warp)
-            //   - consumer count = NUM_CONSUMER_WARPS * 32 (rest of the CTA)
-            //
-            // TODO(phase 5): wire up the actual init() call with the correct
-            // producer / consumer thread counts here. The Hopper warpspec's
-            // tma_q_tracker.init(tid0, 1, CTAS_PER_CGA) pattern in
-            // fmha/warpspec/kernel_traits.h:548 is the reference shape.
+            if (tid0)
+            {
+#pragma unroll
+                for (int i = 0; i < RING_DEPTH; i++)
+                {
+                    fmha::bar_create(&q_barriers.entryProducedBarriers[i], 1);
+                    fmha::bar_create(&q_barriers.entryConsumedBarriers[i], 1);
+                    fmha::bar_create(&k_barriers.entryProducedBarriers[i], 1);
+                    fmha::bar_create(&k_barriers.entryConsumedBarriers[i], 1);
+                    fmha::bar_create(&v_barriers.entryProducedBarriers[i], 1);
+                    fmha::bar_create(&v_barriers.entryConsumedBarriers[i], 1);
+                }
+            }
         }
     };
 
