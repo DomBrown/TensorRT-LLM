@@ -42,6 +42,42 @@ namespace ws_sm120
 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// halfspec-local TMA load helper using `shared::cta` (single-CTA) variant.
+//
+// The Hopper fmha::utmaldg<...> uses `shared::cluster` qualifier, which
+// requires cluster launch (cluster_dim > 0) to be valid PTX. sm_120 / sm_121
+// kernels are launched without an explicit cluster attribute, so the
+// shared::cluster variant emits an Illegal Instruction at runtime even
+// though it assembles successfully. The `shared::cta` variant is the
+// single-CTA-no-cluster form and is what we need on consumer Blackwell.
+//
+// Mirrors fmha::utmaldg<3, TILED, false> body but with shared::cta.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ void utmaldg_3d_cta(fmha::cudaTmaDesc const* p_desc,
+    uint32_t smem_ptr, uint32_t smem_barrier, int32_t const (&coord)[3], uint32_t elect_one)
+{
+    if (elect_one)
+    {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        // Note the `.tile` qualifier: required on sm_120 / sm_121 PTX (omitting
+        // it emits an illegal-instruction at runtime). The trtllmGenKernels FMHA
+        // shipping today uses the same `.shared::cta.global.tile` variant
+        // (cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/cuda_ptx/cuda_ptx.h:2073).
+        asm volatile(
+            "cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
+            "[%0], [%1, {%2, %3, %4}], [%5];\n"
+            :
+            : "r"(smem_ptr), "l"(reinterpret_cast<uint64_t>(p_desc)),
+              "r"(coord[0]), "r"(coord[1]), "r"(coord[2]),
+              "r"(smem_barrier)
+            : "memory");
+#endif
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename Kernel_traits>
 struct DMA
@@ -144,7 +180,7 @@ struct DMA
             // Q starts at q_loop * STEP_Q rows; for now this kernel handles
             // one Q-tile per CTA so the row offset is blockIdx.x * STEP_Q.
             int32_t const coord[3] = {0, bidh, static_cast<int32_t>(blockIdx.x * STEP_Q)};
-            fmha::utmaldg<3, fmha::cudaTmaDescType::TILED, false>(desc_q, q_smem, q_bar, coord, elect_one_);
+            utmaldg_3d_cta(desc_q, q_smem, q_bar, coord, elect_one_);
         }
 
         // --- KV loop: one (K, V) load per iter ------------------------------
@@ -155,14 +191,14 @@ struct DMA
             uint32_t const k_smem = __nvvm_get_smem_pointer(&shared->smem_k[k_slot][0]);
             uint32_t const k_bar = __nvvm_get_smem_pointer(cbw_k.barrier_ptr(k_slot));
             int32_t const k_coord[3] = {0, bidh_kv, kv_loop};
-            fmha::utmaldg<3, fmha::cudaTmaDescType::TILED, false>(desc_k, k_smem, k_bar, k_coord, elect_one_);
+            utmaldg_3d_cta(desc_k, k_smem, k_bar, k_coord, elect_one_);
 
             // V
             int const v_slot = cbw_v.tmaReserve(elect_one_, TX_BYTES_V);
             uint32_t const v_smem = __nvvm_get_smem_pointer(&shared->smem_v[v_slot][0]);
             uint32_t const v_bar = __nvvm_get_smem_pointer(cbw_v.barrier_ptr(v_slot));
             int32_t const v_coord[3] = {0, bidh_kv, kv_loop};
-            fmha::utmaldg<3, fmha::cudaTmaDescType::TILED, false>(desc_v, v_smem, v_bar, v_coord, elect_one_);
+            utmaldg_3d_cta(desc_v, v_smem, v_bar, v_coord, elect_one_);
         }
 
         // Producer exits. The consumers' cbw_*.complete() acks have already
