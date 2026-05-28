@@ -319,17 +319,14 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     constexpr int BMM2_TAIL_MMAS_K_BOUND = Mma_tile_o::MMAS_K;
     constexpr int BMM2_MAIN_MMAS_K_BOUND = Kernel_traits::TOTAL_BMM2_MMAS_K - BMM2_TAIL_MMAS_K_BOUND;
 
-    // Skip-softmax: single shared-memory word holds the CTA-wide AND of warp-level
-    // votes. Each KV iteration resets it to 1, every warp that disagrees does a
-    // single atomicAnd(&vote, 0u) from lane 0, and one __syncthreads() suffices for
-    // both the init and the read fence.
-    __shared__ uint32_t skip_softmax_vote_smem;
-    // Loop-invariant: actual_kv_seqlen does not change within one CTA invocation,
-    // so the threshold is fixed for the entire KV loop. We test
+    // Skip-softmax: per-warp vote uses only __all_sync within each warp -- no
+    // shared memory, no CTA-wide barrier. Loop-invariant: actual_kv_seqlen
+    // does not change within one CTA invocation, so the log-threshold is
+    // fixed for the entire KV loop. We test
     //   expf(global_max[i] - tmp[i]) < threshold
     //   <=>  (global_max[i] - tmp[i]) < log(threshold)
     // so we precompute log(threshold) once and the per-row test becomes a
-    // single FP compare — no expf call inside the hot path.
+    // single FP compare -- no expf call inside the hot path.
     float const skip_softmax_log_threshold = Kernel_traits::ENABLE_SKIP_SOFTMAX
         ? __logf(params.skip_softmax_threshold_scale_factor / static_cast<float>(binfo.actual_kv_seqlen))
         : 0.0f;
@@ -349,18 +346,6 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
         bool const apply_sliding_window_mask
             = (mask_sliding_window && (kv_loop <= sliding_window_mask_left || kv_loop >= sliding_window_mask_right));
         bool const apply_mask = params.has_alibi || (kv_loop >= kv_mask_loop_start) || apply_sliding_window_mask;
-
-        // Skip-softmax vote init: pre-set the shared vote word to "all-skip" at the
-        // top of every kv iteration. The BMM1's natural __syncthreads() below will
-        // make this visible to all warps before they atomicAnd into it, so we avoid
-        // an explicit init barrier on the vote path.
-        if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
-        {
-            if (threadIdx.x == 0)
-            {
-                skip_softmax_vote_smem = 1u;
-            }
-        }
 
         // Declare the accumulators for the 1st gemm.
         fmha::Fragment_accumulator<Traits_p> acc_p[Mma_tile_p::MMAS_M][Mma_tile_p::MMAS_N];
@@ -485,6 +470,14 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
             __syncthreads();
         }
 
+        // Hoist frag_p above the first_step/else branches so the skip-softmax
+        // path can move softmax.pack inside the softmax-tail gate (combines
+        // softmax-tail and pack into one `if (!tile_negligible)` block).
+        // For the baseline (non-skip-softmax) path, pack is still issued
+        // outside the branch in the post-softmax section below -- semantically
+        // identical to the original structure.
+        fmha::Fragment_a<Traits_p, fmha::Row> frag_p[Kernel_traits::TOTAL_BMM2_MMAS_K][Mma_tile_o::MMAS_M];
+
         // First step of the flash attention
         if (first_step)
         {
@@ -502,6 +495,13 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
 
             // Compute the sum.
             softmax.template reduce<fmha::Sum_>(global_sum);
+
+            if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
+            {
+                // Combined pack -- saves the trailing `if (!tile_negligible)`
+                // pack call (tile_negligible is false on first_step anyway).
+                softmax.pack(frag_p);
+            }
         }
         else
         {
@@ -523,38 +523,34 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
             }
 
             // ------------------------------------------------------------
-            // Skip-softmax CTA-wide vote (tiled kernel).
+            // Skip-softmax per-warp vote (tiled kernel).
             //
-            // Skip the tile when, for every row owned by every warp, the new
+            // Skip the tile when, for every row owned by this warp, the new
             // tile's max <= prev_max AND exp(tile_max - prev_max) < threshold.
             // On skip we restore global_max = tmp so subsequent iters see the
             // unchanged running max, and we bypass the softmax tail + BMM2
             // GEMM tiles for this iteration. The V load pipeline keeps running
             // so the next iteration's BMM2 has the V it needs.
+            //
+            // Per-warp: each warp owns its own Q rows, its own slice of
+            // acc_o, its own frag_p, and its own global_max/global_sum. BMM2
+            // HMMA is per-warp, so a warp can skip its GEMM independently.
+            // The natural __syncthreads() inside BMM2 still execute for all
+            // warps (outside the per-warp gate), so no deadlock risk.
+            //
+            // Predicate: tile_max[i] - prev_max[i] < log(threshold)
+            // reduced with a single __all_sync.
             // ------------------------------------------------------------
             if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
             {
-                // Per-warp skip vote — no CTA-wide sync.
-                //
-                // Each warp owns its own Q rows, its own slice of acc_o, its
-                // own frag_p, and its own global_max/global_sum. The BMM2
-                // HMMA is per-warp, so a warp can skip its GEMM independently
-                // without affecting other warps. The natural __syncthreads()
-                // inside BMM2 main/tail still execute for all warps (they live
-                // outside the per-warp `if (!tile_negligible)` gate), so no
-                // deadlock risk.
-                //
-                // Predicate: tile_max[i] - prev_max[i] < log(threshold)
-                // for every row owned by this warp. Computed branchless and
-                // reduced with a single __all_sync.
 #ifdef SKIP_SOFTMAX_STAT
                 ++skip_softmax_total;
 #endif
-                bool skip = true;
+                bool skip = ((global_max[0] - tmp[0]) < skip_softmax_log_threshold);
 #pragma unroll
-                for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
+                for (int i = 1; i < Softmax::ROWS_PER_THREAD; i++)
                 {
-                    skip = skip && ((global_max[i] - tmp[i]) < skip_softmax_log_threshold);
+                    skip = skip & ((global_max[i] - tmp[i]) < skip_softmax_log_threshold);
                 }
                 tile_negligible = __all_sync(0xffffffffu, skip);
                 if (tile_negligible)
@@ -595,6 +591,12 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
                 {
                     global_sum[i] += tmp[i];
                 }
+
+                if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
+                {
+                    // Combined pack inside the softmax-tail gate.
+                    softmax.pack(frag_p);
+                }
             }
         }
 
@@ -610,33 +612,78 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
 #if defined(STORE_S)
         gmem_s.move();
 #endif
-        // Repack for the next BMM. Only needed when the tile is not negligible
-        // (otherwise frag_p is unused).
-        fmha::Fragment_a<Traits_p, fmha::Row> frag_p[Kernel_traits::TOTAL_BMM2_MMAS_K][Mma_tile_o::MMAS_M];
-        if (!tile_negligible)
+        // Baseline (non-skip-softmax) pack: original location, unconditional.
+        // For the skip-softmax build this pack was already issued inside the
+        // softmax-tail gate above, so we skip it here.
+        if constexpr (!Kernel_traits::ENABLE_SKIP_SOFTMAX)
         {
             softmax.pack(frag_p);
         }
 
         // BMM2 main loop. We always run the V load pipeline so the next iteration
         // has its V tiles ready; we only skip the BMM2 GEMM when the tile vote agreed.
-        for (int bmm2_k = 0; bmm2_k < BMM2_MAIN_MMAS_K_BOUND; bmm2_k += Mma_tile_o::MMAS_K)
+        //
+        // For the skip-softmax build we split the loop into two specialized paths
+        // (skip vs no-skip) based on the warp-level tile_negligible decided
+        // BEFORE the loop. This lets the compiler instantiate two clean loop
+        // bodies with no dynamic branch inside the inner unrolled MMAS_K loop,
+        // and keeps frag_p / acc_o live only in the no-skip path.
+        if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
         {
-            // Trigger the load for next V values
-            gmem_v.move();
-            smem_v.move_to_next_write_buffer();
-            gmem_v.load(smem_v);
-
-            // Push the LDGDEPBAR instruction after the loads for K.
-            fmha::ldgdepbar<USE_LDGSTS>();
-            gmem_v.commit(smem_v);
-
-            // Leave 1 outstanding batch loadings
-            fmha::depbar_<USE_LDGSTS, 1>();
-            __syncthreads();
-
-            if (!tile_negligible)
+            if (tile_negligible)
             {
+                // Skip path: V load pipeline only, no HMMA, no frag_p reads.
+                for (int bmm2_k = 0; bmm2_k < BMM2_MAIN_MMAS_K_BOUND; bmm2_k += Mma_tile_o::MMAS_K)
+                {
+                    gmem_v.move();
+                    smem_v.move_to_next_write_buffer();
+                    gmem_v.load(smem_v);
+                    fmha::ldgdepbar<USE_LDGSTS>();
+                    gmem_v.commit(smem_v);
+                    fmha::depbar_<USE_LDGSTS, 1>();
+                    __syncthreads();
+                    __syncthreads();
+                    smem_v.move_to_next_read_buffer();
+                }
+            }
+            else
+            {
+                // No-skip path: full BMM2 with HMMAs.
+                for (int bmm2_k = 0; bmm2_k < BMM2_MAIN_MMAS_K_BOUND; bmm2_k += Mma_tile_o::MMAS_K)
+                {
+                    gmem_v.move();
+                    smem_v.move_to_next_write_buffer();
+                    gmem_v.load(smem_v);
+                    fmha::ldgdepbar<USE_LDGSTS>();
+                    gmem_v.commit(smem_v);
+                    fmha::depbar_<USE_LDGSTS, 1>();
+                    __syncthreads();
+#pragma unroll
+                    for (int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki)
+                    {
+                        int p_ki = bmm2_k + ki;
+                        smem_v.load(frag_v[ki], ki);
+                        fmha::gemm(acc_o, frag_p[p_ki], frag_v[ki]);
+                    }
+                    __syncthreads();
+                    smem_v.move_to_next_read_buffer();
+                }
+            }
+        }
+        else
+        {
+            // Baseline path (no skip-softmax): tile_negligible is always false,
+            // so this is the same as the no-skip loop above. Keep it as the
+            // original single-loop form to avoid disturbing the baseline kernel.
+            for (int bmm2_k = 0; bmm2_k < BMM2_MAIN_MMAS_K_BOUND; bmm2_k += Mma_tile_o::MMAS_K)
+            {
+                gmem_v.move();
+                smem_v.move_to_next_write_buffer();
+                gmem_v.load(smem_v);
+                fmha::ldgdepbar<USE_LDGSTS>();
+                gmem_v.commit(smem_v);
+                fmha::depbar_<USE_LDGSTS, 1>();
+                __syncthreads();
 #pragma unroll
                 for (int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki)
                 {
@@ -644,12 +691,9 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
                     smem_v.load(frag_v[ki], ki);
                     fmha::gemm(acc_o, frag_p[p_ki], frag_v[ki]);
                 }
+                __syncthreads();
+                smem_v.move_to_next_read_buffer();
             }
-
-            // Make sure we are done reading the data (smem).
-            __syncthreads();
-
-            smem_v.move_to_next_read_buffer();
         }
 
         // BMM2 tail loop

@@ -382,11 +382,18 @@ inline __device__ void device_flash_attention_nl(Params const& params)
     float global_max[Softmax::ROWS_PER_THREAD];
     float global_sum[Softmax::ROWS_PER_THREAD];
 
-    // Skip-softmax: per-warp vote slots in shared memory. Declared once outside the
-    // KV loop so it is reused every iteration. Sized to the number of warps in the
-    // CTA so each warp can write its sub-vote.
-    constexpr int SKIP_SOFTMAX_NUM_WARPS = Cta_tile_p::WARPS_M * Cta_tile_p::WARPS_N * Cta_tile_p::WARPS_K;
-    __shared__ uint32_t skip_softmax_vote_smem[SKIP_SOFTMAX_NUM_WARPS > 0 ? SKIP_SOFTMAX_NUM_WARPS : 1];
+    // Skip-softmax: per-warp vote. No shared memory; no CTA-wide sync. Each
+    // warp owns its own Q rows, acc_o slice, frag_p and softmax state, so
+    // a warp can skip its BMM2 independently. The natural __syncthreads()
+    // inside the kv-iter body still run for all warps (they're outside the
+    // gate), so no deadlock risk.
+    //
+    // Loop-invariant: actual_kv_seqlen is fixed for the CTA, so we precompute
+    // log(threshold) once. The per-row predicate then collapses to a single
+    // FP compare (delta < log_threshold), no expf in the hot loop.
+    float const skip_softmax_log_threshold = Kernel_traits::ENABLE_SKIP_SOFTMAX
+        ? __logf(params.skip_softmax_threshold_scale_factor / static_cast<float>(binfo.actual_kv_seqlen))
+        : 0.0f;
 
     for (int kv_loop = kv_loop_start; kv_loop < kv_loop_end; kv_loop += Cta_tile_p::N)
     {
@@ -538,62 +545,31 @@ inline __device__ void device_flash_attention_nl(Params const& params)
             }
 
             // ------------------------------------------------------------
-            // Skip-softmax CTA-wide vote.
+            // Skip-softmax per-warp vote (no CTA-wide sync).
             //
             // For each KV-tile after the first, check whether this tile's
             // contribution to the running softmax is negligible:
-            //   skip_i = (tile_max[i] <= prev_max[i])
-            //         && expf(tile_max[i] - prev_max[i]) < threshold
-            // where threshold = skip_softmax_threshold_scale_factor / actual_kv_seqlen.
-            // If ALL rows owned by ALL warps in the CTA agree, we skip the
-            // BMM2 (P @ V) for this tile and restore the running max so the
-            // following iterations remain numerically correct.
+            //   skip_i = (tile_max[i] - prev_max[i]) < log(threshold)
+            // The `tile_max > prev_max` short-circuit is redundant for any
+            // threshold < 1, and exp(delta) < threshold is equivalent to
+            // delta < log(threshold) -- precomputed once outside the loop, so
+            // the predicate is a single FP compare.
+            // Reduce across the warp with __all_sync; each warp decides
+            // independently whether to skip its slice of acc_o.
             // ------------------------------------------------------------
             if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
             {
-                float const threshold = params.skip_softmax_threshold_scale_factor
-                    / static_cast<float>(binfo.actual_kv_seqlen);
                 bool skip = true;
 #pragma unroll
                 for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
                 {
-                    // If the new tile's max strictly exceeds the running max
-                    // it dominates; we cannot skip.
-                    if (global_max[i] > tmp[i])
-                    {
-                        skip = false;
-                    }
-                    else
-                    {
-                        // tile_max <= prev_max; skip if exp(delta) < threshold.
-                        float const ratio = __expf(global_max[i] - tmp[i]);
-                        if (!(ratio < threshold))
-                        {
-                            skip = false;
-                        }
-                    }
+                    skip = skip && ((global_max[i] - tmp[i]) < skip_softmax_log_threshold);
                 }
-                // Warp-level AND.
-                skip = __all_sync(0xffffffffu, skip);
-                // CTA-wide AND via shared memory.
-                int const warp_id = threadIdx.x >> 5;
-                int const lane_id = threadIdx.x & 31;
-                if (lane_id == 0)
-                {
-                    skip_softmax_vote_smem[warp_id] = skip ? 1u : 0u;
-                }
-                __syncthreads();
-                uint32_t all_skip = 1u;
-#pragma unroll
-                for (int w = 0; w < SKIP_SOFTMAX_NUM_WARPS; w++)
-                {
-                    all_skip &= skip_softmax_vote_smem[w];
-                }
-                tile_negligible = (all_skip != 0u);
+                tile_negligible = __all_sync(0xffffffffu, skip);
                 if (tile_negligible)
                 {
                     // Restore running max so the next iter sees the un-updated
-                    // accumulator state.
+                    // accumulator state for this warp's rows.
 #pragma unroll
                     for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
                     {
