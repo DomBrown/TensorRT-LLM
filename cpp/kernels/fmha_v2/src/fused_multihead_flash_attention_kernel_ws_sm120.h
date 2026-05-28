@@ -118,7 +118,7 @@ inline __device__ void device_flash_attention_ws_sm120(Params const& params)
     {
         setmaxnreg_compute();
         fmha::ws_sm120::Compute<Kernel_traits> compute;
-        compute.run(warp_id - 1, tidx_in_compute_group, shared, params);
+        compute.run(tidx_in_compute_group, shared, params);
     }
 }
 

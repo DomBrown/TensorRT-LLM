@@ -85,35 +85,43 @@ template <
 struct Kernel_traits_halfspec_sm120
 {
 
-    // Compose the existing tiled kernel traits with our ring-depth override.
+    // Compose the existing PACKED_QKV tiled kernel traits with our halfspec
+    // overrides. Kernel_traits_v2 (in fmha/kernel_traits.h) bakes in
+    // fmha::v2::Gmem_tile_qkv for Q / K / V, which is the right gmem tile
+    // for the PACKED_QKV input layout TRT-LLM passes for Qwen3.5 prefill.
     //
-    // FLAGS: bit 0x1 = USE_LDGSTS_Q, 0x2 = USE_LDGSTS_K, 0x4 = USE_LDGSTS_V
-    //         (we leave LDGSTS bits OFF on halfspec; the producer warp issues
-    //         TMA instead, but the *smem layout* expected by the consumer
-    //         remains the same as the LDGSTS path).
-    //        bit 0x200 = NO_LOOP (we ARE a no-loop variant)
-    //        bit 0x1000 = USE_GRANULAR_TILING (yes; same as noloop_tiled.h)
-    // The other bits keep the production defaults.
+    // FLAGS: bit 0x1   = USE_LDGSTS_Q
+    //        bit 0x2   = USE_LDGSTS_K
+    //        bit 0x4   = USE_LDGSTS_V
+    //                    Halfspec leaves all three LDGSTS bits OFF; the
+    //                    producer warp issues TMA, not LDGSTS. The smem
+    //                    layout is governed by BYTES_PER_LDG (=16,
+    //                    independent of USE_LDGSTS) and the buffer count
+    //                    (controlled by USE_GRANULAR_TILING), so turning
+    //                    LDGSTS off does NOT change the layout the
+    //                    consumer reads via ldmatrix. It also satisfies
+    //                    gmem_tile_qkv_packed.h's static assertion that
+    //                    USE_LDGSTS=>(PRED_REGS==1 || IS_HOPPER), which
+    //                    we'd fail on sm_120 with non-trivial Q tiles.
+    //        bit 0x200 = NO_LOOP (we are a no-loop kernel)
+    //        bit 0x1000= USE_GRANULAR_TILING (matches noloop_tiled.h)
     static constexpr uint32_t TILED_FLAGS = 0x200u  // NO_LOOP
         | 0x1000u                                   // USE_GRANULAR_TILING
         ;
 
-    using Base = fmha::Kernel_traits_<Traits_,
-        /*Gmem_tile_q_=*/fmha::Gmem_tile_q,         // unused on halfspec (TMA replaces)
-        /*Gmem_tile_k_=*/fmha::Gmem_tile_k,         // unused
-        /*Gmem_tile_v_=*/fmha::Gmem_tile_v,         // unused
-        /*Gmem_tile_o_=*/fmha::Gmem_tile_o,         // still used in the epilogue
-        S, VALID_D_, VALID_DV_,
+    using Base = fmha::Kernel_traits_v2<Traits_,
+        /*S=*/S, /*D=*/VALID_D_, /*DV=*/VALID_DV_,
         /*STEP=*/STEP_Q_,
-        WARPS_M_, WARPS_N_,
-        /*CTAS_PER_HEAD_=*/1,
-        TILED_FLAGS,
-        VERSION_, MASK_VERSION_,
+        /*WARPS_M=*/WARPS_M_, /*WARPS_N=*/WARPS_N_,
+        /*CTAS_PER_HEAD=*/1,
+        /*FLAGS=*/TILED_FLAGS,
+        /*MASK_VERSION=*/MASK_VERSION_,
         /*BMM2_FP16_EPILOGUE=*/true,
-        /*SAGE_BLOCK_SIZE_Q_=*/0,
-        /*SAGE_BLOCK_SIZE_K_=*/0,
-        /*SAGE_BLOCK_SIZE_V_=*/0,
-        /*ENABLE_SKIP_SOFTMAX_=*/ENABLE_SKIP_SOFTMAX_>;
+        /*OutputType=*/typename Traits_::A_type,
+        /*SAGE_BLOCK_SIZE_Q=*/0,
+        /*SAGE_BLOCK_SIZE_K=*/0,
+        /*SAGE_BLOCK_SIZE_V=*/0,
+        /*ENABLE_SKIP_SOFTMAX=*/ENABLE_SKIP_SOFTMAX_>;
 
     // Carry through the math types -- these are what compute_sync_mma.h needs.
     using Traits_p = typename Base::Traits_p;
@@ -202,6 +210,18 @@ struct Kernel_traits_halfspec_sm120
     {
         ELEMENT_BYTES = sizeof(typename Traits_p::A_type)
     };
+    enum
+    {
+        TOTAL_BMM2_MMAS_K = Base::TOTAL_BMM2_MMAS_K
+    };
+    enum
+    {
+        ENABLE_BMM1_SOFTCAPPING_SCALE = Base::ENABLE_BMM1_SOFTCAPPING_SCALE
+    };
+    enum
+    {
+        IS_MTP = Base::IS_MTP
+    };
 
     // Skip-softmax knob.
     static constexpr bool ENABLE_SKIP_SOFTMAX = ENABLE_SKIP_SOFTMAX_;
@@ -242,12 +262,25 @@ struct Kernel_traits_halfspec_sm120
     // The smem tile sizes come from the underlying Smem_tile_q/k/v::BYTES_PER_TILE
     // multiplied by RING_DEPTH. We allocate flat byte arrays here and let the
     // consumer construct Smem_tile_* views at the right slot offset each iter.
+    // Bytes per ring slot for Q, K, V smem tiles. We need the storage to
+    // hold ONE tile of each (not RING_DEPTH * one_tile -- the buffer count
+    // baked into Smem_tile_*::BYTES_PER_TILE is the underlying base's count,
+    // which already accounts for the granular-tiling 2-buffer ping-pong;
+    // the halfspec ring is a SEPARATE concept on top, so each slot is
+    // sized to fit one underlying double-buffer pair).
+    static constexpr int BYTES_PER_SMEM_Q_SLOT = Smem_tile_q::BYTES_PER_TILE;
+    static constexpr int BYTES_PER_SMEM_K_SLOT = Smem_tile_k::BYTES_PER_TILE;
+    static constexpr int BYTES_PER_SMEM_V_SLOT = Smem_tile_v::BYTES_PER_TILE;
+
     struct __align__(128) Shared
     {
-        // Each ring slot is a Smem_tile_*::BYTES_PER_TILE-sized block.
-        uint8_t smem_q_storage[RING_DEPTH][Smem_tile_q::BYTES_PER_TILE / RING_DEPTH];
-        uint8_t smem_k_storage[RING_DEPTH][Smem_tile_k::BYTES_PER_TILE / RING_DEPTH];
-        uint8_t smem_v_storage[RING_DEPTH][Smem_tile_v::BYTES_PER_TILE / RING_DEPTH];
+        // Ring of Q / K / V smem buffers. Each slot is sized to one full
+        // underlying Smem_tile (with its internal double-buffer ping-pong
+        // for granular tiling). RING_DEPTH slots live side-by-side so the
+        // TMA producer can fly ahead of the sync-MMA consumer.
+        uint8_t smem_q[RING_DEPTH][BYTES_PER_SMEM_Q_SLOT];
+        uint8_t smem_k[RING_DEPTH][BYTES_PER_SMEM_K_SLOT];
+        uint8_t smem_v[RING_DEPTH][BYTES_PER_SMEM_V_SLOT];
 
         // mbarrier pairs: producer arrives on entryProducedBarriers[slot] when
         // its cp.async.bulk.tensor completes; consumer arrives on

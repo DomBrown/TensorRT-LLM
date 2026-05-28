@@ -42,6 +42,7 @@
 #include <fmha/softmax.h>
 #include <fmha/utils.h>
 #include <fmha/warpspec/circular_buffer.h>
+#include <fused_multihead_attention_kernel.h>  // Single_cta, Block_info_padded
 
 namespace fmha
 {
@@ -108,7 +109,8 @@ struct Compute
         int const bidh = blockIdx.y;
         int const q_loop = blockIdx.x;  // 1 CTA per (B, H, Q-tile)
 
-        Single_cta<Kernel_traits::VERSION> const binfo(params, bidb, bidh, 0, tidx);
+        fused_multihead_attention::Single_cta<Kernel_traits::VERSION> const binfo(
+            params, bidb, bidh, 0, tidx);
 
         int const q_sequence_start = q_loop * STEP_Q + (binfo.actual_kv_seqlen - binfo.actual_q_seqlen);
         if (binfo.stop_early(q_loop * STEP_Q))
@@ -119,7 +121,7 @@ struct Compute
         // Mask + softmax setup.
         fmha::Mask_dispatcher<Traits_p, Cta_tile_p, Kernel_traits::MASK_VERSION, /*IS_MTP=*/false> mask(
             params, binfo, tidx);
-        // softmax tail buffer is in shared->smem_v_storage's tail; noloop_tiled
+        // softmax tail buffer is in shared->smem_v's tail; noloop_tiled
         // gives softmax `smem_[Smem_tile_q::BYTES_PER_TILE]` which is the
         // K/V smem region. On halfspec we don't share -- softmax does not
         // touch the K/V smem ring. If Softmax::USE_SHARED_MEMORY is needed,
@@ -136,7 +138,7 @@ struct Compute
 
         // ----- Wait for Q (only loaded once per CTA) ------------------------
         int const q_slot = cbr_q.wait();
-        Smem_tile_q smem_q(&shared->smem_q_storage[q_slot][0], tidx);
+        Smem_tile_q smem_q(&shared->smem_q[q_slot][0], tidx);
 
         // ----- Per-row state shared by the whole KV loop --------------------
         fmha::Fragment_accumulator<Traits_o> acc_o[Mma_tile_o::MMAS_M][Mma_tile_o::VALID_MMAS_N];
@@ -174,7 +176,7 @@ struct Compute
 
             // Wait for this iter's K slot.
             int const k_slot = cbr_k.wait();
-            Smem_tile_k smem_k(&shared->smem_k_storage[k_slot][0], tidx);
+            Smem_tile_k smem_k(&shared->smem_k[k_slot][0], tidx);
 
             fmha::Fragment_accumulator<Traits_p> acc_p[Mma_tile_p::MMAS_M][Mma_tile_p::MMAS_N];
             using Acc_type_p = typename Traits_p::Accumulator_type;
@@ -187,7 +189,7 @@ struct Compute
 
             // ---- BMM1 main loop ----
             // Replaces noloop_tiled.h's per-iter LDGSTS reload + ldgdepbar +
-            // __syncthreads with: K is already in smem_k_storage[k_slot]
+            // __syncthreads with: K is already in smem_k[k_slot]
             // (the producer's TMA + mbarrier guarantees that). We just read.
             for (int bmm1_k = 0; bmm1_k < BMM1_MAIN_MMAS_K_BOUND; bmm1_k += Mma_tile_p::MMAS_K)
             {
@@ -305,7 +307,7 @@ struct Compute
 
             // ---- BMM2: wait for V, then BMM2 split for skip-softmax ----
             int const v_slot = cbr_v.wait();
-            Smem_tile_v smem_v(&shared->smem_v_storage[v_slot][0], tidx);
+            Smem_tile_v smem_v(&shared->smem_v[v_slot][0], tidx);
 
             typename Smem_tile_v::Fragment frag_v[Mma_tile_o::MMAS_K][Mma_tile_o::VALID_MMAS_N];
 
