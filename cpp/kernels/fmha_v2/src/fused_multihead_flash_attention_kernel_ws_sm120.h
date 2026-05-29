@@ -49,6 +49,8 @@
 // Status: SKELETON.  See fmha/warpspec_sm120/README.md for the
 // TODO checklist and the path from here to a buildable kernel.
 
+#include <cuda.h>  // CUtensorMap
+
 #include <fmha/utils.h>
 #include <fmha/warpspec_sm120/compute_sync_mma.h>
 #include <fmha/warpspec_sm120/dma_sync_mma.h>
@@ -67,16 +69,27 @@ namespace
 constexpr int DMA_NREG = 40;       // producer: TMA issue + coord math only
 constexpr int COMPUTE_NREG = 232;  // consumers: acc_o + softmax + frag_p live
 
+// NB: `setmaxnreg.{dec,inc}` is a Hopper / datacenter-Blackwell feature
+// (sm_90, sm_100, sm_103). It is NOT supported on *consumer* Blackwell
+// (sm_120 / sm_121) -- ptxas rejects it with a hard error there. So the
+// producer/consumer register-budget split simply does not exist on the
+// halfspec target hardware; these helpers compile to a no-op for sm_120/121.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && __CUDA_ARCH__ < 1200
+#define FMHA_HAS_SETMAXNREG 1
+#else
+#define FMHA_HAS_SETMAXNREG 0
+#endif
+
 inline __device__ void setmaxnreg_dma()
 {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if FMHA_HAS_SETMAXNREG
     asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(DMA_NREG));
 #endif
 }
 
 inline __device__ void setmaxnreg_compute()
 {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if FMHA_HAS_SETMAXNREG
     asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(COMPUTE_NREG));
 #endif
 }
@@ -86,7 +99,8 @@ inline __device__ void setmaxnreg_compute()
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename Kernel_traits, typename Params>
-inline __device__ void device_flash_attention_ws_sm120(Params const& params)
+inline __device__ void device_flash_attention_ws_sm120(Params const& params,
+    CUtensorMap const* desc_q, CUtensorMap const* desc_k, CUtensorMap const* desc_v)
 {
     using Shared = typename Kernel_traits::Shared;
 
@@ -112,7 +126,7 @@ inline __device__ void device_flash_attention_ws_sm120(Params const& params)
         setmaxnreg_dma();
         uint32_t const elect_one = (lane == 0) ? 1u : 0u;
         fmha::ws_sm120::DMA<Kernel_traits> dma(elect_one);
-        dma.run(params, shared);
+        dma.run(params, shared, desc_q, desc_k, desc_v);
     }
     else
     {

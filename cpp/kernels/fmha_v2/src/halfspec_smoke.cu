@@ -35,6 +35,8 @@
 
 #include <cstdio>
 
+#include <cuda.h>  // CUtensorMap
+
 #include <fused_multihead_attention.h>
 #include <fused_multihead_attention_kernel.h>
 #include <fmha/traits.h>
@@ -69,9 +71,15 @@ using Smoke_Ktraits = fmha::ws_sm120::Kernel_traits_halfspec_sm120<
 } // namespace fmha_smoke
 
 extern "C" __global__ __launch_bounds__(fmha_smoke::Smoke_Ktraits::THREADS, 1)
-void halfspec_smoke_kernel(bert::Fused_multihead_attention_params_v2 const params)
+void halfspec_smoke_kernel(bert::Fused_multihead_attention_params_v2 const params,
+    __grid_constant__ const CUtensorMap tma_q,
+    __grid_constant__ const CUtensorMap tma_k,
+    __grid_constant__ const CUtensorMap tma_v)
 {
-    fused_multihead_attention::device_flash_attention_ws_sm120<fmha_smoke::Smoke_Ktraits>(params);
+    // The CUtensorMaps live in const/param space (grid_constant); passing
+    // their addresses to cp.async.bulk.tensor is a valid tensormap operand.
+    fused_multihead_attention::device_flash_attention_ws_sm120<fmha_smoke::Smoke_Ktraits>(
+        params, &tma_q, &tma_k, &tma_v);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -91,10 +99,11 @@ extern "C" cudaError_t launch_halfspec_smoke(
     bert::Fused_multihead_attention_launch_params const& launch_params,
     cudaStream_t stream)
 {
-    // 1. Build the TMA descriptors host-side. Populates
-    //    params.tma_desc_q / _k / _v in place.
+    // 1. Build the three TMA descriptors host-side (cuTensorMapEncodeTiled).
+    //    These are passed to the kernel as __grid_constant__ params.
+    CUtensorMap tma_q{}, tma_k{}, tma_v{};
     fmha::ws_sm120::DMA<fmha_smoke::Smoke_Ktraits>::Host dma_host;
-    dma_host.init_params(params, launch_params, stream);
+    dma_host.init_params(params, launch_params, tma_q, tma_k, tma_v);
 
     // 2. Size the smem allocation. With RING_DEPTH=3 and head_dim=256 BF16 +
     //    STEP_Q/KV=64, the Shared struct is ~150 KB, comfortably above the
@@ -119,6 +128,6 @@ extern "C" cudaError_t launch_halfspec_smoke(
     dim3 const grid(q_tiles, params.h, params.b);
     dim3 const block(fmha_smoke::Smoke_Ktraits::THREADS);
 
-    halfspec_smoke_kernel<<<grid, block, smem_bytes, stream>>>(params);
+    halfspec_smoke_kernel<<<grid, block, smem_bytes, stream>>>(params, tma_q, tma_k, tma_v);
     return cudaGetLastError();
 }

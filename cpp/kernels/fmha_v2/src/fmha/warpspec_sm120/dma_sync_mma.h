@@ -28,6 +28,10 @@
 // of sm_120 / sm_121) and the CircularBufferWriter from
 // fmha/warpspec/circular_buffer.h (Arrive_wait-based, also CC >= 9.0).
 
+#include <cstdio>
+
+#include <cuda.h>  // CUtensorMap + cuTensorMapEncodeTiled (driver API)
+
 #include <fmha/hopper/arrive_wait.h>
 #include <fmha/hopper/tma_descriptor.h>
 #include <fmha/hopper/tma_types.h>
@@ -52,10 +56,16 @@ namespace ws_sm120
 // though it assembles successfully. The `shared::cta` variant is the
 // single-CTA-no-cluster form and is what we need on consumer Blackwell.
 //
-// Mirrors fmha::utmaldg<3, TILED, false> body but with shared::cta.
+// CRITICAL (proven 2026-05-29): the descriptor passed here MUST be a driver
+// API `CUtensorMap` built by `cuTensorMapEncodeTiled` (128 bytes). The
+// fmha_v2 hand-rolled `fmha::cudaTmaDesc` (64 bytes, Hopper-era bit layout)
+// is REJECTED by Blackwell's TMA engine -- UTMALDG.3D faults with an
+// "Illegal Instruction" at runtime even though the PTX assembles. A minimal
+// reproducer confirmed: hand-rolled desc -> illegal instruction; encode-tiled
+// CUtensorMap -> loads correct data on GB10 (sm_121).
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline __device__ void utmaldg_3d_cta(fmha::cudaTmaDesc const* p_desc,
+inline __device__ void utmaldg_3d_cta(void const* p_desc,
     uint32_t smem_ptr, uint32_t smem_barrier, int32_t const (&coord)[3], uint32_t elect_one)
 {
     if (elect_one)
@@ -131,8 +141,14 @@ struct DMA
     // Runs on a single warp (32 threads); only thread 0 (`elect_one`) issues
     // the cp.async.bulk.tensor.* instructions. The other 31 threads still
     // participate in mbarrier arrives where needed.
+    //
+    // The three TMA descriptors are CUtensorMaps built host-side by
+    // Host::init_params (cuTensorMapEncodeTiled) and passed in as
+    // __grid_constant__ kernel params (their addresses live in const/param
+    // space, which is a valid tensormap operand space for cp.async.bulk.tensor).
     template <typename Params>
-    inline __device__ void run(Params const& params, Shared* shared)
+    inline __device__ void run(Params const& params, Shared* shared,
+        CUtensorMap const* desc_q, CUtensorMap const* desc_k, CUtensorMap const* desc_v)
     {
         fused_multihead_attention::Single_cta<Kernel_traits::VERSION> const binfo(
             params, blockIdx.z, blockIdx.y, 0, /*tidx=*/0);
@@ -143,31 +159,17 @@ struct DMA
 
         int const kv_loop_end = binfo.actual_kv_seqlen;
 
-        // The TMA descriptors are built once on the host and passed via
-        // params. See fmha_v2 setup.py for the existing
-        // `setup_tma_descriptors_*` helpers (we reuse those for sm_120).
-        cudaTmaDesc const* desc_q = &params.tma_desc_q;
-        cudaTmaDesc const* desc_k = &params.tma_desc_k;
-        cudaTmaDesc const* desc_v = &params.tma_desc_v;
-
         Cbw_q cbw_q(&shared->q_barriers);
         Cbw_k cbw_k(&shared->k_barriers);
         Cbw_v cbw_v(&shared->v_barriers);
 
         // --- Q load: once per CTA -------------------------------------------
         //
-        // We issue a single 2D TMA load into ring slot 0. Coordinate args are
-        // (col_offset_in_features, row_offset_in_seq). The exact coord pattern
-        // depends on Gmem_tile_q's TMA-descriptor layout; the existing
-        // ws::DMA in fmha/warpspec/dma.h has the canonical setup we should
-        // mirror.
-        // The TMA descriptors built by Host::init_params are 3D
-        // (Multiple_tma_descriptor<3>) over tensors of shape
-        // (D, H_or_HKV, total_seqlen). So the cp.async.bulk.tensor call
-        // must also be 3D with a 3-element coord array.
-        //
-        // Coord ordering matches the tensor_size layout:
-        //   coord[0] = D offset (always 0; the box covers the full head dim)
+        // The Host::init_params CUtensorMaps are 3D over tensors of shape
+        // (D, H_or_HKV, total_seqlen), so the cp.async.bulk.tensor call is 3D
+        // with a 3-element coord array. Coord ordering matches that layout:
+        //   coord[0] = D offset (always 0; the box currently covers the full
+        //              head dim -- see phase 6c: this must become chunked)
         //   coord[1] = head index (this CTA's bidh)
         //   coord[2] = seq position
         int const bidh    = static_cast<int>(blockIdx.y);
@@ -213,127 +215,128 @@ struct DMA
     // Host-side TMA descriptor setup.
     //
     // Called once per LLM forward (or once per layer if descriptors are layer-
-    // varying) before the kernel launch. Populates params.tma_desc_q / _k / _v
-    // with cudaTmaDesc values that:
-    //   * Use SWIZZLE_128B for the smem layout (tensor-core-friendly, matches
-    //     what ldmatrix.x4 expects on the consumer side).
-    //   * Use F16_RN format (BF16 is treated as 2-byte ints by the TMA engine;
-    //     F16_RN is the right opaque format for 2-byte types -- the engine
-    //     does no element-wise conversion, just moves bytes).
-    //   * Use 3D tensor (D, H_or_HKV, total_seqlen) and a 3D box of
-    //     (D, 1, STEP_Q / STEP_KV).
+    // varying) before the kernel launch. Builds three driver-API CUtensorMaps
+    // (cuTensorMapEncodeTiled) for Q / K / V. These are passed into the kernel
+    // as __grid_constant__ params (see halfspec_smoke.cu).
+    //
+    // Why the driver API (not the fmha_v2 hand-rolled fmha::cudaTmaDesc):
+    //   The 64-byte hand-rolled descriptor uses a Hopper-era bit layout that
+    //   Blackwell's TMA engine rejects -- UTMALDG faults at runtime. The
+    //   128-byte CUtensorMap from cuTensorMapEncodeTiled is the only portable,
+    //   Blackwell-valid form (it is what the shipping trtllmGenKernels FMHA
+    //   uses). Proven via reproducer on GB10 (sm_121).
+    //
+    // Each descriptor:
+    //   * 3D tensor (D, H_or_HKV, total_seqlen), fastest-varying axis = head
+    //     dim (contiguous), and a 3D box of (D, 1, STEP_Q / STEP_KV).
+    //   * Element format BFloat16 / Float16 (2-byte).
+    //
+    // Swizzle note: cuTensorMapEncodeTiled requires the leading box dim *in
+    // bytes* (boxDim[0] * ELEMENT_BYTES) to be <= the swizzle width. For
+    // head_dim=256 BF16 that is 512 bytes, which exceeds the 128B max, so the
+    // whole-head-dim box only encodes with SWIZZLE_NONE. Matching a 128B
+    // swizzle (what the consumer Smem_tile ldmatrix wants) requires splitting
+    // the head-dim load into <=64-element chunks -- that is the remaining
+    // producer/consumer layout-matching work (see README phase plan). For now
+    // we pick the widest swizzle the leading dim permits.
     //
     // Scope of v0:
-    //   * BF16 (or FP16) only -- FP8 (E4M3) needs a separate Host that uses
-    //     U8 desc_format and the V-transpose path, mirroring the Hopper
-    //     Kernel_traits_Hopper_qgmma_e4m3_fp32 variant.
-    //   * PACKED_QKV input layout only ([total_seqlen, H, D] + KV after Q).
-    //     CONTIGUOUS_Q_KV, SEPARATE_Q_K_V, Q_PAGED_KV are TODOs.
-    //   * No TMA store -- the epilogue still uses the existing Gmem_tile_o
-    //     scalar STG path.
+    //   * BF16 / FP16 only (2-byte). FP8 needs U8 format + V-transpose.
+    //   * PACKED_QKV input layout only.
+    //   * No TMA store -- epilogue still uses the scalar STG Gmem_tile_o path.
     ////////////////////////////////////////////////////////////////////////////////////////////////
 
     struct Host
     {
         Host() = default;
 
+        // Pick the widest swizzle the leading box dim (bytes) permits.
+        static CUtensorMapSwizzle pick_swizzle(uint32_t lead_bytes)
+        {
+            if (lead_bytes % 128 == 0 && lead_bytes <= 128)
+                return CU_TENSOR_MAP_SWIZZLE_128B;
+            if (lead_bytes % 64 == 0 && lead_bytes <= 64)
+                return CU_TENSOR_MAP_SWIZZLE_64B;
+            if (lead_bytes % 32 == 0 && lead_bytes <= 32)
+                return CU_TENSOR_MAP_SWIZZLE_32B;
+            return CU_TENSOR_MAP_SWIZZLE_NONE;
+        }
+
+        // Encode one 3D tiled descriptor. tensor_size / box_size are in
+        // elements (fastest-varying first); the global stride of dim>=1 is in
+        // bytes (dim 0 is implicitly contiguous at element size).
+        static void encode(CUtensorMap& out, void* gmem_ptr, uint32_t const (&tensor_size)[3],
+            uint64_t seq_stride_bytes, uint32_t const (&box_size)[3])
+        {
+            CUtensorMapDataType fmt = (Kernel_traits::ELEMENT_BYTES == 2)
+                ? CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
+                : CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
+
+            // globalDim fastest-first: (D, H, seq).
+            uint64_t global_dim[3] = {tensor_size[0], tensor_size[1], tensor_size[2]};
+            // globalStrides are for dims 1.. (dim 0 implicit). Bytes.
+            //   dim1 (head)  stride = D * ELEMENT_BYTES (next head)
+            //   dim2 (seq)   stride = seq_stride_bytes
+            uint64_t global_stride[2]
+                = {static_cast<uint64_t>(tensor_size[0]) * Kernel_traits::ELEMENT_BYTES, seq_stride_bytes};
+            uint32_t box_dim[3] = {box_size[0], box_size[1], box_size[2]};
+            uint32_t elem_stride[3] = {1, 1, 1};
+
+            uint32_t const lead_bytes = box_size[0] * Kernel_traits::ELEMENT_BYTES;
+            CUtensorMapSwizzle swizzle = pick_swizzle(lead_bytes);
+
+            CUresult res = cuTensorMapEncodeTiled(&out, fmt, /*rank=*/3, gmem_ptr, global_dim,
+                global_stride, box_dim, elem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
+                CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+            if (res != CUDA_SUCCESS)
+            {
+                char const* err = nullptr;
+                cuGetErrorString(res, &err);
+                fprintf(stderr,
+                    "[halfspec] cuTensorMapEncodeTiled failed: %s "
+                    "(dim=%u,%u,%u box=%u,%u,%u lead_bytes=%u swizzle=%d)\n",
+                    err, tensor_size[0], tensor_size[1], tensor_size[2], box_size[0], box_size[1],
+                    box_size[2], lead_bytes, static_cast<int>(swizzle));
+            }
+        }
+
         template <typename Params, typename Launch_params>
-        void init_params(Params& params, Launch_params const& launch_params, cudaStream_t /*stream*/) const
+        void init_params(Params& params, Launch_params const& launch_params, CUtensorMap& tma_q,
+            CUtensorMap& tma_k, CUtensorMap& tma_v) const
         {
             uint32_t const d = params.d;
             uint32_t const dv = params.dv;
             uint32_t const h = params.h;
             uint32_t const h_kv = params.h_kv;
 
-            // Total sequence length across the batch.
             uint32_t const total_seqlen = params.is_s_padded
                 ? static_cast<uint32_t>(params.b * params.s)
                 : static_cast<uint32_t>(launch_params.total_q_seqlen);
 
-            // ---- Constants shared by all 3 descriptors -------------------------
-            uint32_t const traversal_stride[3] = {1, 1, 1};
-            uint32_t const oob_fill = 0;
-            uint32_t const fp32_to_tf32 = 0;
-
-            // SWIZZLE_128B: the standard tensor-core-friendly smem layout.
-            // Both the non-Hopper Smem_tile_a/b (used by halfspec) and the
-            // Hopper Smem_tile_hopper_a/b (used by Hopper warpspec) are
-            // bank-conflict-free when fed by a 128B-swizzled TMA, so this
-            // choice is safe across both consumer styles.
-            static constexpr fmha::cudaTmaDescSwizzle swizzle_mode
-                = fmha::cudaTmaDescSwizzle::SWIZZLE_128B;
-
-            // F16_RN is the right opaque format for 2-byte element types
-            // (BF16 / FP16). The TMA engine does no element-wise conversion;
-            // it just routes bytes through the swizzle.
             static_assert(Kernel_traits::ELEMENT_BYTES == 2,
-                "halfspec v0 only supports BF16 / FP16 (2-byte elements). "
-                "FP8 needs a separate Host that uses U8 format and the V "
-                "transpose path.");
-            static constexpr fmha::cudaTmaDescFormat desc_format
-                = fmha::cudaTmaDescFormat::F16_RN;
-
+                "halfspec v0 only supports BF16 / FP16 (2-byte elements).");
             static_assert(STEP_Q <= 256 && STEP_KV <= 256,
                 "TMA box dimensions are capped at 256 elements per axis.");
 
-            // ---- Q descriptor -------------------------------------------------
-            //
-            // Tensor layout in gmem: [total_seqlen, H, D]
-            // Tensor size (elements, fastest-varying first): (D, H, total_seqlen)
-            // Box size:                                       (D, 1, STEP_Q)
-            //
-            // Strides (in bytes, slowest-varying first, excluding the
-            // implicit byte-per-element axis 0):
-            //   stride[0] = D * ELEMENT_BYTES         (within-head row)
-            //   stride[1] = params.q_stride_in_bytes  (across heads -- this
-            //                                          accounts for the
-            //                                          packed QKV layout
-            //                                          where (H_q + H_kv +
-            //                                          H_kv) heads of D
-            //                                          elements lie along
-            //                                          axis 1)
-            uint32_t const tensor_size_q[3] = {d, h, total_seqlen};
-            uint64_t const tensor_stride_q[2]
-                = {d * Kernel_traits::ELEMENT_BYTES, static_cast<uint64_t>(params.q_stride_in_bytes)};
-            uint32_t const box_size_q[3] = {static_cast<uint32_t>(Kernel_traits::D), 1, STEP_Q};
             char* const q_ptr = reinterpret_cast<char*>(params.qkv_ptr);
-
-            fmha::Multiple_tma_descriptor<3> q_desc;
-            q_desc.set_tma_desctriptor(q_ptr, desc_format,
-                fmha::cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode,
-                fmha::cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_q, tensor_stride_q,
-                traversal_stride, box_size_q, oob_fill, fp32_to_tf32, &params.tma_desc_q);
-
-            // ---- K, V descriptors ---------------------------------------------
-            //
-            // PACKED_QKV layout, MQA/GQA-style (H_q + H_kv + H_kv heads):
-            //   k_ptr = qkv_ptr + h     * d  * sizeof(elt)
-            //   v_ptr = k_ptr   + h_kv  * d  * sizeof(elt)
-            //
-            // K tensor size:    (D,  H_kv, total_seqlen)
-            // V tensor size:    (DV, H_kv, total_seqlen)
-            // Box for both K/V: (D or DV, 1, STEP_KV)
-            uint32_t const tensor_size_k[3] = {d, h_kv, total_seqlen};
-            uint32_t const tensor_size_v[3] = {dv, h_kv, total_seqlen};
-            uint64_t const tensor_stride_k[2]
-                = {d * Kernel_traits::ELEMENT_BYTES, static_cast<uint64_t>(params.k_stride_in_bytes)};
-            uint64_t const tensor_stride_v[2]
-                = {dv * Kernel_traits::ELEMENT_BYTES, static_cast<uint64_t>(params.v_stride_in_bytes)};
-            uint32_t const box_size_k[3] = {static_cast<uint32_t>(Kernel_traits::D), 1, STEP_KV};
-            uint32_t const box_size_v[3] = {static_cast<uint32_t>(Kernel_traits::DV), 1, STEP_KV};
-
+            // PACKED_QKV (H_q + H_kv + H_kv heads of D elements):
             char* const k_ptr = q_ptr + h * d * Kernel_traits::ELEMENT_BYTES;
             char* const v_ptr = k_ptr + h_kv * d * Kernel_traits::ELEMENT_BYTES;
 
-            fmha::Multiple_tma_descriptor<3> kv_desc;
-            kv_desc.set_tma_desctriptor(k_ptr, desc_format,
-                fmha::cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode,
-                fmha::cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_k, tensor_stride_k,
-                traversal_stride, box_size_k, oob_fill, fp32_to_tf32, &params.tma_desc_k);
-            kv_desc.set_tma_desctriptor(v_ptr, desc_format,
-                fmha::cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode,
-                fmha::cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_v, tensor_stride_v,
-                traversal_stride, box_size_v, oob_fill, fp32_to_tf32, &params.tma_desc_v);
+            // ---- Q ----
+            uint32_t const tensor_size_q[3] = {d, h, total_seqlen};
+            uint32_t const box_size_q[3] = {static_cast<uint32_t>(Kernel_traits::D), 1, STEP_Q};
+            encode(tma_q, q_ptr, tensor_size_q, static_cast<uint64_t>(params.q_stride_in_bytes), box_size_q);
+
+            // ---- K ----
+            uint32_t const tensor_size_k[3] = {d, h_kv, total_seqlen};
+            uint32_t const box_size_k[3] = {static_cast<uint32_t>(Kernel_traits::D), 1, STEP_KV};
+            encode(tma_k, k_ptr, tensor_size_k, static_cast<uint64_t>(params.k_stride_in_bytes), box_size_k);
+
+            // ---- V ----
+            uint32_t const tensor_size_v[3] = {dv, h_kv, total_seqlen};
+            uint32_t const box_size_v[3] = {static_cast<uint32_t>(Kernel_traits::DV), 1, STEP_KV};
+            encode(tma_v, v_ptr, tensor_size_v, static_cast<uint64_t>(params.v_stride_in_bytes), box_size_v);
         }
     };
 };
