@@ -67,13 +67,49 @@ Validated on GB10: builds, runs to completion, **0 memcheck errors, 0 racecheck
 hazards**. Q/K use the proven-correct 128B swizzle; V currently uses
 `SWIZZLE_NONE` (runs, but numerically unverified — see remaining work).
 
-### Remaining for numeric correctness (6c.2 → 6d)
+### V is an architectural blocker for the single-box TMA approach (verified 2026-05-29)
 
-- **V smem-swizzle match.** `Smem_tile_v` is a different type than the Q/K
-  `Smem_tile_a/b`; its expected layout must be checked the same way Q/K were
-  (`tma_swizzle_verify.cu`) and the V descriptor swizzle/box adjusted to match.
+The V swizzle verification (the Q/K-style check applied to `Smem_tile_v`) came
+back **negative**: V cannot be filled by the chunked-128B-TMA scheme that works
+for Q/K. Why:
+
+- `Smem_tile_v` (Ampere bf16) derives from the same `Smem_tile_without_skews`
+  base, but with `LEAD_DIM = Cta_tile_o::N = DV = 256`, giving
+  `BYTES_PER_ROW = 512` (vs 128 for Q/K) and `ROWS = 32` (kv-positions/chunk).
+  The XOR swizzle (`chunk ^ (row%8)`) is still the 128B pattern, but it now
+  repeats across **four** 128-byte segments within each 512-byte row.
+- `cuTensorMapEncodeTiled` caps the **leading box dim at the swizzle width**
+  (≤128 bytes). V's leading dim is the full DV (512 bytes), so the V box only
+  encodes with `SWIZZLE_NONE` (confirmed: 128B/64B/32B all return
+  `invalid argument`; only NONE is OK). `SWIZZLE_NONE` is plain row-major and
+  does **not** match the consumer's XOR-swizzled read (`ldsmt` + offset XOR
+  toggles), so it would compute wrong results.
+- Issuing four per-segment 128B-swizzle TMAs cannot compose into the strided
+  512-byte-row layout either: each `cp.async.bulk.tensor` writes a contiguous
+  (128-byte-pitch) swizzled block to its smem destination; there is no
+  smem-row-pitch argument to interleave segments into 512-byte rows.
+
+So a correct V needs one of (a design fork — see "How to continue"):
+
+1. **Consumer-side LDGSTS V (hybrid).** Keep Q/K on the TMA producer; load V in
+   the consumer warps via the proven `Gmem_tile_v` + `Smem_tile_v` path
+   (verbatim from `noloop_tiled.h`), using a consumer-group named barrier in
+   place of `__syncthreads()` (the producer warp must not be caught in it).
+   Lowest risk, correct; V just isn't TMA-accelerated (V loads are a minority
+   vs the BMM1 Q/K loads).
+2. **Custom non-swizzled V smem tile.** Store V row-major (`SWIZZLE_NONE`) via
+   TMA and write a halfspec `Smem_tile_v` read that drops the XOR toggles.
+   Correct but bank-conflicted; needs careful custom `ldsmt` addressing.
+3. **Re-tile BMM2 so V uses 128-byte rows** (tile DV into 64-wide groups).
+   Deepest change — ripples through `Mma_tile_o`, `frag_v`, the BMM2 loop and
+   `acc_o`/epilogue.
+4. **CuTe DSL** (the README's long-term recommendation).
+
+### Also remaining for numeric correctness (independent of the V fork)
+
 - **Epilogue.** `compute_sync_mma.h` still stubs the O normalize + store; wire
-  up `Smem_tile_o` + `Gmem_tile_o` (verbatim from `noloop_tiled.h`).
+  up `Smem_tile_o` + `Gmem_tile_o` (from `noloop_tiled.h`) with a consumer-group
+  named barrier replacing `__syncthreads()`.
 - **Numeric validation.** The runtest uses zeroed inputs; add non-zero inputs +
   a reference (or run in-engine) to confirm `gen_token` matches `noloop_tiled.h`.
 
