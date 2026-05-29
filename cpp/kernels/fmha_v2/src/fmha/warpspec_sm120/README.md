@@ -11,14 +11,15 @@ host-reference harness (`halfspec_validate.cu`) confirms the complete kernel —
 chunked-128B-TMA Q/K + dv-chunked-128B-TMA V + BMM1 + softmax + causal mask +
 BMM2 + epilogue + scales — matches reference attention to bf16-rounding accuracy
 (distinct-V `max_abs 6e-4`, V-const `max_abs 2e-4`), with 0 compute-sanitizer
-memcheck errors and 0 racecheck hazards. The whole halfspec data path is now
-TMA-driven and validated, and it **also builds cleanly in the production cmake
-target** `_context_attention_kernels_120` (not just standalone nvcc). What
-remains is in-engine integration (setup.py codegen, dispatcher wiring) and the
-perf sweep. NB: the phase-6d end-to-end check (`gen_token=13477`) needs a real
-Qwen3.6-35B-A3B run, which the current GB10 dev box can't host (no
-`LLM_MODELS_ROOT`), so 6d's runtime validation must happen on a machine with the
-model. Files in this directory plus
+memcheck errors and 0 racecheck hazards. **Validated across multiple kv-tiles
+(S ∈ {129,200,256,300,384,512}), including non-tile-aligned lengths** — so the
+flash-attention online-softmax update path and the causal partial-tile edges are
+covered, not just a single tile. The whole halfspec data path is now TMA-driven
+and validated, it **builds cleanly in the production cmake target**
+`_context_attention_kernels_120`, and it is **wired into the runner behind
+`TRTLLM_USE_HALFSPEC_FMHA`** (both object targets compile). The remaining step is
+the in-engine `gen_token=13477` check (needs a full wheel build + a real
+Qwen3.6-35B-A3B run) and the perf sweep. Files in this directory plus
 `fused_multihead_flash_attention_kernel_ws_sm120.h` establish:
 
 - the producer/consumer warp-role dispatch
