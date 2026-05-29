@@ -121,6 +121,11 @@ struct Compute
         // Mask + softmax setup.
         fmha::Mask_dispatcher<Traits_p, Cta_tile_p, Kernel_traits::MASK_VERSION, /*IS_MTP=*/false> mask(
             params, binfo, tidx);
+        // Initialize the mask's query-row offset for this Q-tile. Without this,
+        // the causal diagonal defaults to q_sequence_start=0 and every Q-tile
+        // after the first masks against the wrong row range. (noloop_tiled.h
+        // does the same via mask.load() before the kv loop.)
+        mask.load(q_sequence_start);
         // softmax tail buffer is in shared->smem_v's tail; noloop_tiled
         // gives softmax `smem_[Smem_tile_q::BYTES_PER_TILE]` which is the
         // K/V smem region. On halfspec we don't share -- softmax does not
