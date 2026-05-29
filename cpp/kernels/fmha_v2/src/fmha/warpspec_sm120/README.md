@@ -6,11 +6,13 @@
 
 ## Status (as of 2026-05-29)
 
-**Builds + launches + passes the TMA load instruction on GB10 (sm_121).**
-Two phase-6 blockers were root-caused and fixed this session; the kernel now
-fails at a *third*, fully-characterized blocker (consumer smem layout). Files
-in this directory plus `fused_multihead_flash_attention_kernel_ws_sm120.h`
-establish:
+**Builds, launches, and runs the full chunked TMA + sync-MMA pipeline to
+completion on GB10 (sm_121) — 0 compute-sanitizer memcheck errors, 0 racecheck
+hazards.** Numerics are not yet validated (epilogue is still a stub and the
+runtest uses zeroed inputs); V's smem-swizzle match is still open. But the
+producer/consumer chunked handshake — the structural heart of halfspec — is in
+place and verified race-free. Files in this directory plus
+`fused_multihead_flash_attention_kernel_ws_sm120.h` establish:
 
 - the producer/consumer warp-role dispatch
 - a Blackwell-valid TMA load: `cuTensorMapEncodeTiled` `CUtensorMap`
@@ -34,22 +36,46 @@ establish:
    The producer/consumer register-budget split therefore **does not exist** on
    this hardware — guarded to `__CUDA_ARCH__ ∈ [900,1200)` (no-op on sm_120/121).
 
-### Current blocker (the real remaining work)
+### 6c.1 — chunked producer + per-chunk granular handshake (DONE, 2026-05-29)
 
 The consumer reuses the LDGSTS `Smem_tile_q/k/v` with `USE_GRANULAR_TILING`.
-Each smem slot holds only **`[STEP, D/2]`** (the head-dim is streamed in
-64-element / 128-byte granular chunks across a double-buffered tile). So:
+Each granular buffer holds only **`[STEP, D/2]`** worth (the contraction dim is
+streamed in chunks across a 2-deep ping-pong). A single full-head-dim TMA box
+(`[STEP, 256]`, 64 KB) was 2× the buffer → "Out-of-range shared address"; and
+three full boxes (Q+K+V = 160 KB) exceed GB10's ~99 KB cap
+(`sharedMemPerBlockOptin = 101376`).
 
-- a single full-head-dim TMA box (`[STEP, 256]`, 64 KB) is **2× the slot** →
-  "Out-of-range shared address" at the producer thread, and
-- the three full boxes (Q+K+V = 160 KB) **exceed GB10's ~99 KB smem cap**
-  (`sharedMemPerBlockOptin = 101376`).
+Fixed by making the producer stream **chunks** that match the consumer's
+granular buffers, and restructuring the handshake to per-chunk:
 
-Both point to the same fix: the producer must issue **chunked `[STEP, 64]`
-(128-byte) TMA loads with 128B swizzle** into the granular sub-buffers, instead
-of one giant box. This also satisfies the `cuTensorMapEncodeTiled` swizzle
-rule (leading box dim bytes ≤ swizzle width) and matches the consumer's
-ldmatrix chunking.
+- `kernel_traits.h`: the granular double-buffer *is* the ring. `GRANULAR_DEPTH
+  = Smem_tile::BUFFERS_PER_TILE (=2)`; `Shared` holds one flat
+  `Smem_tile::BYTES_PER_TILE` region per tensor (`q_buf/k_buf/v_buf(slot)`
+  index buffer `slot`); barriers are depth-2; the consumed barrier arrival
+  count is `CONSUMER_THREADS` so every consumer thread arrives (doubles as the
+  pre-recycle sync). Chunk counts: `NUM_BMM1_CHUNKS = 4` (head-dim/64),
+  `NUM_BMM2_CHUNKS = 4` (kv-pos/32).
+- `dma_sync_mma.h`: per kv-tile, stream Q/K head-dim chunks (box `(64,1,STEP)`,
+  128B swizzle, `coord[0]=c*64`) and V kv-position chunks (box `(DV,1,32)`,
+  `coord[2]=kv_loop+c*32`) into buffer `c % 2`. Producer kv-loop range matches
+  the consumer's exactly (causal-aware) so the consumed-barrier handshake can't
+  deadlock.
+- `compute_sync_mma.h`: BMM1/BMM2 now stream chunks — per chunk: `cbr.wait()`,
+  MMAs, all-thread `cbr.complete()` + `advance()`, `move_to_next_read_buffer()`.
+
+Validated on GB10: builds, runs to completion, **0 memcheck errors, 0 racecheck
+hazards**. Q/K use the proven-correct 128B swizzle; V currently uses
+`SWIZZLE_NONE` (runs, but numerically unverified — see remaining work).
+
+### Remaining for numeric correctness (6c.2 → 6d)
+
+- **V smem-swizzle match.** `Smem_tile_v` is a different type than the Q/K
+  `Smem_tile_a/b`; its expected layout must be checked the same way Q/K were
+  (`tma_swizzle_verify.cu`) and the V descriptor swizzle/box adjusted to match.
+- **Epilogue.** `compute_sync_mma.h` still stubs the O normalize + store; wire
+  up `Smem_tile_o` + `Gmem_tile_o` (verbatim from `noloop_tiled.h`).
+- **Numeric validation.** The runtest uses zeroed inputs; add non-zero inputs +
+  a reference (or run in-engine) to confirm `gen_token` matches `noloop_tiled.h`.
 
 **Viability DE-RISKED (2026-05-29): the port works with the existing consumer
 smem tiles — no rewrite needed.** The make-or-break question was whether the
@@ -106,7 +132,9 @@ LDGSTS → TMA. There's no LDGSTS-based stepping stone that saves work.
 | 5 | Build (`scripts/build_wheel.py`), iterate on compile errors and ptxas warnings. | done |
 | 6a | TMA descriptor: hand-rolled `cudaTmaDesc` → `cuTensorMapEncodeTiled` `CUtensorMap` (Blackwell-valid). UTMALDG no longer faults. | **done (2026-05-29)** |
 | 6b | Guard `setmaxnreg` off for sm_120/121 (unsupported there). | **done (2026-05-29)** |
-| 6c | **Producer/consumer smem layout match.** Issue chunked `[STEP,64]` 128B-swizzle TMA loads (D/64 = 4 chunks/tile for head_dim 256) into the granular `Smem_tile` double-buffer, with per-chunk mbarriers synced to the consumer's granular iteration. Swizzle equivalence VERIFIED (see above) — no consumer rewrite. Remaining: chunk-loop plumbing + per-chunk handshake. | 2–4 days |
+| 6c.1 | **Chunked producer + per-chunk granular handshake.** Chunked `[STEP,64]` 128B-swizzle Q/K loads + `[DV,32]` V loads into the granular double-buffer; consumer streams chunks (per-chunk wait/complete + `move_to_next_read_buffer`). Runs to completion on GB10, 0 memcheck/racecheck. | **done (2026-05-29)** |
+| 6c.2 | V smem-swizzle match (verify `Smem_tile_v` layout like Q/K; fix V descriptor) + epilogue (`Smem_tile_o`/`Gmem_tile_o` store). | 1–2 days |
+| 6d | Numeric validation: non-zero inputs + reference, confirm `gen_token=13477` matches `noloop_tiled.h`. | 1 day |
 | 6d | Correctness validation: 1-token gen on Qwen3.6-35B-A3B prefill at L=49 152, confirm `gen_token=13477` matches `noloop_tiled.h`. | 1 day |
 | 7 | Performance sweep: `RING_DEPTH ∈ {2,3,4}`, ring placement, smem layout for ldmatrix bank-conflict-free reads. (Register-budget split is N/A on sm_120/121.) | 3–5 days |
 | 8 | Compare to baseline + skip-softmax at L ∈ {8k,16k,24k,32k,40k,49k} with the same `bench_prefill_35b_trtllm.py` harness. | 1 day |

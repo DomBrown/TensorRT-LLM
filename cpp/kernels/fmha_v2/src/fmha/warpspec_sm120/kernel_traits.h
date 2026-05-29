@@ -246,77 +246,91 @@ struct Kernel_traits_halfspec_sm120
     static constexpr int DMA_SYNC_BARRIER_ID = 0x1;
     static constexpr int MMA_SYNC_BARRIER_ID = 0x2;
 
-    // Ring readers / writers. Single CTA cluster (no DSMEM on consumer
-    // Blackwell -- CTAS_PER_CGA=1).
+    // Named-barrier id for the consumer group's pre-recycle sync (all consumer
+    // warps must finish reading a granular buffer before tid0 lets the producer
+    // overwrite it).
+    static constexpr int CONSUMER_SYNC_BARRIER_ID = 0x5;
+
+    // Single CTA cluster (no DSMEM on consumer Blackwell -- CTAS_PER_CGA=1).
     static constexpr int CTAS_PER_CGA = 1;
 
-    using Circular_buffer_q_reader = typename fmha::ws::CircularBuffer<RING_DEPTH, CTAS_PER_CGA>::Reader;
-    using Circular_buffer_q_writer = typename fmha::ws::CircularBuffer<RING_DEPTH, CTAS_PER_CGA>::Writer;
-    using Circular_buffer_k_reader = typename fmha::ws::CircularBuffer<RING_DEPTH, CTAS_PER_CGA>::Reader;
-    using Circular_buffer_k_writer = typename fmha::ws::CircularBuffer<RING_DEPTH, CTAS_PER_CGA>::Writer;
-    using Circular_buffer_v_reader = typename fmha::ws::CircularBuffer<RING_DEPTH, CTAS_PER_CGA>::Reader;
-    using Circular_buffer_v_writer = typename fmha::ws::CircularBuffer<RING_DEPTH, CTAS_PER_CGA>::Writer;
+    enum
+    {
+        CONSUMER_THREADS = NUM_CONSUMER_WARPS * 32
+    };
 
-    // Shared struct: smem ring tiles + barrier arrays.
+    // ----- Granular head-dim / kv-position chunking ---------------------------
     //
-    // The smem tile sizes come from the underlying Smem_tile_q/k/v::BYTES_PER_TILE
-    // multiplied by RING_DEPTH. We allocate flat byte arrays here and let the
-    // consumer construct Smem_tile_* views at the right slot offset each iter.
-    // Bytes per ring slot for Q, K, V smem tiles. We need the storage to
-    // hold ONE tile of each (not RING_DEPTH * one_tile -- the buffer count
-    // baked into Smem_tile_*::BYTES_PER_TILE is the underlying base's count,
-    // which already accounts for the granular-tiling 2-buffer ping-pong;
-    // the halfspec ring is a SEPARATE concept on top, so each slot is
-    // sized to fit one underlying double-buffer pair).
-    static constexpr int BYTES_PER_SMEM_Q_SLOT = Smem_tile_q::BYTES_PER_TILE;
-    static constexpr int BYTES_PER_SMEM_K_SLOT = Smem_tile_k::BYTES_PER_TILE;
-    static constexpr int BYTES_PER_SMEM_V_SLOT = Smem_tile_v::BYTES_PER_TILE;
+    // The consumer reuses the existing LDGSTS Smem_tile_q/k/v which, with
+    // USE_GRANULAR_TILING, stream the contraction dim in chunks through a
+    // BUFFERS_PER_TILE-deep ping-pong (== GRANULAR_DEPTH below). The halfspec
+    // TMA producer fills those exact granular buffers chunk by chunk -- it does
+    // NOT add a ring on top. So the barrier depth == the granular buffer count.
+    static constexpr int GRANULAR_DEPTH = Smem_tile_k::BUFFERS_PER_TILE;
+    static_assert(GRANULAR_DEPTH == Smem_tile_q::BUFFERS_PER_TILE
+            && GRANULAR_DEPTH == Smem_tile_v::BUFFERS_PER_TILE,
+        "halfspec assumes Q/K/V share the same granular buffer depth.");
 
+    // Bytes of one granular buffer (one chunk) for Q / K / V.
+    static constexpr int BYTES_PER_BUFFER_Q = Smem_tile_q::BYTES_PER_BUFFER;
+    static constexpr int BYTES_PER_BUFFER_K = Smem_tile_k::BYTES_PER_BUFFER;
+    static constexpr int BYTES_PER_BUFFER_V = Smem_tile_v::BYTES_PER_BUFFER;
+
+    // BMM1 streams the head dim in chunks of Cta_tile_p::K elements; BMM2
+    // streams kv-positions in chunks of Cta_tile_o::K. Number of chunks per
+    // kv-tile for each gemm:
+    static constexpr int BMM1_CHUNK_ELTS = Cta_tile_p::K;   // head-dim elements / chunk
+    static constexpr int NUM_BMM1_CHUNKS = Mma_tile_p::VALID_MMAS_K / Mma_tile_p::MMAS_K;
+    static constexpr int BMM2_CHUNK_ELTS = Cta_tile_o::K;   // kv-positions / chunk
+    static constexpr int NUM_BMM2_CHUNKS = TOTAL_BMM2_MMAS_K / Mma_tile_o::MMAS_K;
+
+    using Circular_buffer_q_reader = typename fmha::ws::CircularBuffer<GRANULAR_DEPTH, CTAS_PER_CGA>::Reader;
+    using Circular_buffer_q_writer = typename fmha::ws::CircularBuffer<GRANULAR_DEPTH, CTAS_PER_CGA>::Writer;
+    using Circular_buffer_k_reader = typename fmha::ws::CircularBuffer<GRANULAR_DEPTH, CTAS_PER_CGA>::Reader;
+    using Circular_buffer_k_writer = typename fmha::ws::CircularBuffer<GRANULAR_DEPTH, CTAS_PER_CGA>::Writer;
+    using Circular_buffer_v_reader = typename fmha::ws::CircularBuffer<GRANULAR_DEPTH, CTAS_PER_CGA>::Reader;
+    using Circular_buffer_v_writer = typename fmha::ws::CircularBuffer<GRANULAR_DEPTH, CTAS_PER_CGA>::Writer;
+
+    // Shared struct: the granular smem tiles (flat, == GRANULAR_DEPTH buffers
+    // laid out contiguously) + barrier arrays. The TMA producer writes chunk c
+    // into buffer (c % GRANULAR_DEPTH); the consumer's Smem_tile cycles its
+    // internal read buffer via move_to_next_read_buffer in lockstep.
     struct __align__(128) Shared
     {
-        // Ring of Q / K / V smem buffers. Each slot is sized to one full
-        // underlying Smem_tile (with its internal double-buffer ping-pong
-        // for granular tiling). RING_DEPTH slots live side-by-side so the
-        // TMA producer can fly ahead of the sync-MMA consumer.
-        uint8_t smem_q[RING_DEPTH][BYTES_PER_SMEM_Q_SLOT];
-        uint8_t smem_k[RING_DEPTH][BYTES_PER_SMEM_K_SLOT];
-        uint8_t smem_v[RING_DEPTH][BYTES_PER_SMEM_V_SLOT];
+        uint8_t smem_q[Smem_tile_q::BYTES_PER_TILE];
+        uint8_t smem_k[Smem_tile_k::BYTES_PER_TILE];
+        uint8_t smem_v[Smem_tile_v::BYTES_PER_TILE];
 
-        // mbarrier pairs: producer arrives on entryProducedBarriers[slot] when
-        // its cp.async.bulk.tensor completes; consumer arrives on
-        // entryConsumedBarriers[slot] when it's done reading the slot and the
-        // producer can recycle it.
-        fmha::ws::CircularBufferBarriers<RING_DEPTH> q_barriers;
-        fmha::ws::CircularBufferBarriers<RING_DEPTH> k_barriers;
-        fmha::ws::CircularBufferBarriers<RING_DEPTH> v_barriers;
+        fmha::ws::CircularBufferBarriers<GRANULAR_DEPTH> q_barriers;
+        fmha::ws::CircularBufferBarriers<GRANULAR_DEPTH> k_barriers;
+        fmha::ws::CircularBufferBarriers<GRANULAR_DEPTH> v_barriers;
+
+        // Smem address of granular buffer `slot` for each tensor (producer TMA
+        // destination / consumer tile base + slot stride).
+        inline __device__ uint8_t* q_buf(int slot) { return &smem_q[slot * BYTES_PER_BUFFER_Q]; }
+        inline __device__ uint8_t* k_buf(int slot) { return &smem_k[slot * BYTES_PER_BUFFER_K]; }
+        inline __device__ uint8_t* v_buf(int slot) { return &smem_v[slot * BYTES_PER_BUFFER_V]; }
 
         // Initialize all mbarriers. Called by thread 0 of the CTA at startup.
-        //
-        // Counts:
-        //   entryProducedBarriers: arrival count = 1
-        //     (only the elect-one DMA thread arrives via tmaReserve, which
-        //      calls bar_arrive_set_transactioncnt; the TMA completion's
-        //      tx-bytes arrival fires separately and is gated by expect_tx).
-        //   entryConsumedBarriers: arrival count = 1
-        //     (only tidx==0 of the consumer group arrives via
-        //      cbr_*.complete(tidx == 0, slot)).
-        //
-        // Mirrors the Hopper warpspec pattern in fmha/warpspec/kernel_traits.h
-        // where tma_*_tracker.init(tid0, 1, CTAS_PER_CGA) is used with
-        // CTAS_PER_CGA == 1 for the single-CTA / no-cluster case.
+        //   entryProducedBarriers: count 1 -- the elect-one DMA thread arms the
+        //     transaction count via tmaReserve; the TMA completion's tx-bytes
+        //     arrival flips the barrier.
+        //   entryConsumedBarriers: count CONSUMER_THREADS -- every consumer
+        //     thread arrives once it has finished reading the buffer, which also
+        //     serves as the pre-recycle sync (no separate __syncthreads needed).
         inline __device__ void init(bool tid0)
         {
             if (tid0)
             {
 #pragma unroll
-                for (int i = 0; i < RING_DEPTH; i++)
+                for (int i = 0; i < GRANULAR_DEPTH; i++)
                 {
                     fmha::bar_create(&q_barriers.entryProducedBarriers[i], 1);
-                    fmha::bar_create(&q_barriers.entryConsumedBarriers[i], 1);
+                    fmha::bar_create(&q_barriers.entryConsumedBarriers[i], CONSUMER_THREADS);
                     fmha::bar_create(&k_barriers.entryProducedBarriers[i], 1);
-                    fmha::bar_create(&k_barriers.entryConsumedBarriers[i], 1);
+                    fmha::bar_create(&k_barriers.entryConsumedBarriers[i], CONSUMER_THREADS);
                     fmha::bar_create(&v_barriers.entryProducedBarriers[i], 1);
-                    fmha::bar_create(&v_barriers.entryConsumedBarriers[i], 1);
+                    fmha::bar_create(&v_barriers.entryConsumedBarriers[i], CONSUMER_THREADS);
                 }
             }
         }

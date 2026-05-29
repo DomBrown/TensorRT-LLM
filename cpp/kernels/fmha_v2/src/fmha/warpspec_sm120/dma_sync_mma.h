@@ -119,18 +119,27 @@ struct DMA
         ELEMENT_BYTES = Kernel_traits::ELEMENT_BYTES
     };
 
-    // Bytes per K-tile TMA load = STEP_KV rows x D cols x dtype_bytes.
+    using Cta_tile_p = typename Kernel_traits::Cta_tile_p;
+
     enum
     {
-        TX_BYTES_K = STEP_KV * D * ELEMENT_BYTES
+        CAUSAL_MASK = Kernel_traits::CAUSAL_MASK
+    };
+
+    // Per-granular-chunk transaction byte counts (one chunk == one granular
+    // smem buffer). These MUST equal the smem buffer sizes so the TMA fills
+    // exactly one buffer (no over/underrun).
+    enum
+    {
+        TX_BYTES_Q = Kernel_traits::BYTES_PER_BUFFER_Q
     };
     enum
     {
-        TX_BYTES_V = STEP_KV * DV * ELEMENT_BYTES
+        TX_BYTES_K = Kernel_traits::BYTES_PER_BUFFER_K
     };
     enum
     {
-        TX_BYTES_Q = STEP_Q * D * ELEMENT_BYTES
+        TX_BYTES_V = Kernel_traits::BYTES_PER_BUFFER_V
     };
 
     explicit inline __device__ DMA(uint32_t elect_one)
@@ -139,73 +148,81 @@ struct DMA
     }
 
     // Runs on a single warp (32 threads); only thread 0 (`elect_one`) issues
-    // the cp.async.bulk.tensor.* instructions. The other 31 threads still
-    // participate in mbarrier arrives where needed.
+    // the cp.async.bulk.tensor.* instructions.
     //
     // The three TMA descriptors are CUtensorMaps built host-side by
     // Host::init_params (cuTensorMapEncodeTiled) and passed in as
-    // __grid_constant__ kernel params (their addresses live in const/param
-    // space, which is a valid tensormap operand space for cp.async.bulk.tensor).
+    // __grid_constant__ kernel params. Each is a chunk descriptor:
+    //   Q/K box = (BMM1_CHUNK_ELTS=64 head-dim, 1, STEP_Q / STEP_KV), 128B swiz
+    //   V   box = (DV, 1, BMM2_CHUNK_ELTS=32 kv-positions)
+    //
+    // Per kv-tile the producer streams the head dim of Q/K in NUM_BMM1_CHUNKS
+    // chunks (selected by coord[0]=c*64) and the kv-positions of V in
+    // NUM_BMM2_CHUNKS chunks (coord[2]=kv_loop+c*32), each into granular buffer
+    // (chunk % GRANULAR_DEPTH). The CircularBuffer consumed-barrier throttles
+    // the producer to <= GRANULAR_DEPTH chunks ahead of the consumer.
     template <typename Params>
     inline __device__ void run(Params const& params, Shared* shared,
         CUtensorMap const* desc_q, CUtensorMap const* desc_k, CUtensorMap const* desc_v)
     {
+        int const tidx = static_cast<int>(threadIdx.x) & 31;
         fused_multihead_attention::Single_cta<Kernel_traits::VERSION> const binfo(
-            params, blockIdx.z, blockIdx.y, 0, /*tidx=*/0);
-        if (binfo.stop_early(0))
+            params, blockIdx.z, blockIdx.y, 0, tidx);
+        if (binfo.stop_early(blockIdx.x * STEP_Q))
         {
             return;
         }
 
-        int const kv_loop_end = binfo.actual_kv_seqlen;
+        int const bidh = static_cast<int>(blockIdx.y);
+        int const bidh_kv = bidh / static_cast<int>(params.h_q_per_kv);
+        int const q_row = static_cast<int>(blockIdx.x) * STEP_Q;
+
+        // kv-loop range -- MUST match the consumer's exactly (else the
+        // consumed-barrier handshake deadlocks). Mirror compute_sync_mma.h.
+        int const q_sequence_start = q_row + (binfo.actual_kv_seqlen - binfo.actual_q_seqlen);
+        int const valid_seqlen = CAUSAL_MASK
+            ? min(q_sequence_start + int(Cta_tile_p::M), binfo.actual_kv_seqlen)
+            : binfo.actual_kv_seqlen;
+        int const kv_loop_end = fmha::div_up(valid_seqlen, int(Cta_tile_p::N)) * int(Cta_tile_p::N);
 
         Cbw_q cbw_q(&shared->q_barriers);
         Cbw_k cbw_k(&shared->k_barriers);
         Cbw_v cbw_v(&shared->v_barriers);
 
-        // --- Q load: once per CTA -------------------------------------------
-        //
-        // The Host::init_params CUtensorMaps are 3D over tensors of shape
-        // (D, H_or_HKV, total_seqlen), so the cp.async.bulk.tensor call is 3D
-        // with a 3-element coord array. Coord ordering matches that layout:
-        //   coord[0] = D offset (always 0; the box currently covers the full
-        //              head dim -- see phase 6c: this must become chunked)
-        //   coord[1] = head index (this CTA's bidh)
-        //   coord[2] = seq position
-        int const bidh    = static_cast<int>(blockIdx.y);
-        int const bidh_kv = bidh / static_cast<int>(params.h_q_per_kv);
-
-        {
-            int const q_slot = cbw_q.tmaReserve(elect_one_, TX_BYTES_Q);
-            uint32_t const q_smem = __nvvm_get_smem_pointer(&shared->smem_q[q_slot][0]);
-            uint32_t const q_bar = __nvvm_get_smem_pointer(cbw_q.barrier_ptr(q_slot));
-            // Q starts at q_loop * STEP_Q rows; for now this kernel handles
-            // one Q-tile per CTA so the row offset is blockIdx.x * STEP_Q.
-            int32_t const coord[3] = {0, bidh, static_cast<int32_t>(blockIdx.x * STEP_Q)};
-            utmaldg_3d_cta(desc_q, q_smem, q_bar, coord, elect_one_);
-        }
-
-        // --- KV loop: one (K, V) load per iter ------------------------------
         for (int kv_loop = 0; kv_loop < kv_loop_end; kv_loop += STEP_KV)
         {
-            // K
-            int const k_slot = cbw_k.tmaReserve(elect_one_, TX_BYTES_K);
-            uint32_t const k_smem = __nvvm_get_smem_pointer(&shared->smem_k[k_slot][0]);
-            uint32_t const k_bar = __nvvm_get_smem_pointer(cbw_k.barrier_ptr(k_slot));
-            int32_t const k_coord[3] = {0, bidh_kv, kv_loop};
-            utmaldg_3d_cta(desc_k, k_smem, k_bar, k_coord, elect_one_);
+            // ---- BMM1: head-dim chunks of K and Q ----
+#pragma unroll
+            for (int c = 0; c < Kernel_traits::NUM_BMM1_CHUNKS; ++c)
+            {
+                int const head_off = c * Kernel_traits::BMM1_CHUNK_ELTS;
 
-            // V
-            int const v_slot = cbw_v.tmaReserve(elect_one_, TX_BYTES_V);
-            uint32_t const v_smem = __nvvm_get_smem_pointer(&shared->smem_v[v_slot][0]);
-            uint32_t const v_bar = __nvvm_get_smem_pointer(cbw_v.barrier_ptr(v_slot));
-            int32_t const v_coord[3] = {0, bidh_kv, kv_loop};
-            utmaldg_3d_cta(desc_v, v_smem, v_bar, v_coord, elect_one_);
+                int const k_slot = cbw_k.tmaReserve(elect_one_, TX_BYTES_K);
+                uint32_t const k_smem = __nvvm_get_smem_pointer(shared->k_buf(k_slot));
+                uint32_t const k_bar = __nvvm_get_smem_pointer(cbw_k.barrier_ptr(k_slot));
+                int32_t const k_coord[3] = {head_off, bidh_kv, kv_loop};
+                utmaldg_3d_cta(desc_k, k_smem, k_bar, k_coord, elect_one_);
+
+                int const q_slot = cbw_q.tmaReserve(elect_one_, TX_BYTES_Q);
+                uint32_t const q_smem = __nvvm_get_smem_pointer(shared->q_buf(q_slot));
+                uint32_t const q_bar = __nvvm_get_smem_pointer(cbw_q.barrier_ptr(q_slot));
+                int32_t const q_coord[3] = {head_off, bidh, q_row};
+                utmaldg_3d_cta(desc_q, q_smem, q_bar, q_coord, elect_one_);
+            }
+
+            // ---- BMM2: kv-position chunks of V ----
+#pragma unroll
+            for (int c = 0; c < Kernel_traits::NUM_BMM2_CHUNKS; ++c)
+            {
+                int const kv_off = kv_loop + c * Kernel_traits::BMM2_CHUNK_ELTS;
+
+                int const v_slot = cbw_v.tmaReserve(elect_one_, TX_BYTES_V);
+                uint32_t const v_smem = __nvvm_get_smem_pointer(shared->v_buf(v_slot));
+                uint32_t const v_bar = __nvvm_get_smem_pointer(cbw_v.barrier_ptr(v_slot));
+                int32_t const v_coord[3] = {0, bidh_kv, kv_off};
+                utmaldg_3d_cta(desc_v, v_smem, v_bar, v_coord, elect_one_);
+            }
         }
-
-        // Producer exits. The consumers' cbw_*.complete() acks have already
-        // been gated on entry-consumed mbarriers via the ring's wait() each
-        // iter; nothing else to do.
     }
 
     uint32_t elect_one_;
@@ -323,19 +340,29 @@ struct DMA
             char* const k_ptr = q_ptr + h * d * Kernel_traits::ELEMENT_BYTES;
             char* const v_ptr = k_ptr + h_kv * d * Kernel_traits::ELEMENT_BYTES;
 
-            // ---- Q ----
+            // Chunk widths: BMM1 streams the head dim in BMM1_CHUNK_ELTS-wide
+            // (=64, 128B) chunks -> box leading dim 64 -> 128B swizzle (matches
+            // the consumer Smem_tile_q/k granular buffer layout, verified). BMM2
+            // streams kv-positions in BMM2_CHUNK_ELTS-wide (=32) chunks -> box
+            // seq dim 32, leading = full DV (SWIZZLE_NONE for now -- Smem_tile_v
+            // layout match is a follow-up).
+            constexpr uint32_t Q_CHUNK = Kernel_traits::BMM1_CHUNK_ELTS;
+            constexpr uint32_t K_CHUNK = Kernel_traits::BMM1_CHUNK_ELTS;
+            constexpr uint32_t V_KV_CHUNK = Kernel_traits::BMM2_CHUNK_ELTS;
+
+            // ---- Q ----  tensor (D, H, seq); box (chunk, 1, STEP_Q)
             uint32_t const tensor_size_q[3] = {d, h, total_seqlen};
-            uint32_t const box_size_q[3] = {static_cast<uint32_t>(Kernel_traits::D), 1, STEP_Q};
+            uint32_t const box_size_q[3] = {Q_CHUNK, 1, STEP_Q};
             encode(tma_q, q_ptr, tensor_size_q, static_cast<uint64_t>(params.q_stride_in_bytes), box_size_q);
 
-            // ---- K ----
+            // ---- K ----  tensor (D, H_kv, seq); box (chunk, 1, STEP_KV)
             uint32_t const tensor_size_k[3] = {d, h_kv, total_seqlen};
-            uint32_t const box_size_k[3] = {static_cast<uint32_t>(Kernel_traits::D), 1, STEP_KV};
+            uint32_t const box_size_k[3] = {K_CHUNK, 1, STEP_KV};
             encode(tma_k, k_ptr, tensor_size_k, static_cast<uint64_t>(params.k_stride_in_bytes), box_size_k);
 
-            // ---- V ----
+            // ---- V ----  tensor (DV, H_kv, seq); box (DV, 1, kv-chunk)
             uint32_t const tensor_size_v[3] = {dv, h_kv, total_seqlen};
-            uint32_t const box_size_v[3] = {static_cast<uint32_t>(Kernel_traits::DV), 1, STEP_KV};
+            uint32_t const box_size_v[3] = {static_cast<uint32_t>(Kernel_traits::DV), 1, V_KV_CHUNK};
             encode(tma_v, v_ptr, tensor_size_v, static_cast<uint64_t>(params.v_stride_in_bytes), box_size_v);
         }
     };

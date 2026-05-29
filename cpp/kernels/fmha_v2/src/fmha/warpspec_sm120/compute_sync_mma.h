@@ -131,14 +131,19 @@ struct Compute
             "halfspec consumer needs Softmax::USE_SHARED_MEMORY = false; if your "
             "kernel_traits enables it, add a softmax_scratch buffer to Shared.");
 
-        // Ring readers.
+        // Per-granular-buffer ring readers (Q/K stream the head dim, V streams
+        // kv-positions; each cycles GRANULAR_DEPTH buffers).
         Cbr_q cbr_q(&shared->q_barriers);
         Cbr_k cbr_k(&shared->k_barriers);
         Cbr_v cbr_v(&shared->v_barriers);
 
-        // ----- Wait for Q (only loaded once per CTA) ------------------------
-        int const q_slot = cbr_q.wait();
-        Smem_tile_q smem_q(&shared->smem_q[q_slot][0], tidx);
+        // Smem tiles constructed at the granular tile base (buffer 0). Each
+        // tile advances its internal read buffer via move_to_next_read_buffer
+        // in lockstep with the per-chunk barrier handshake below. The producer
+        // (dma_sync_mma.h) TMAs chunk c into buffer (c % GRANULAR_DEPTH).
+        Smem_tile_q smem_q(shared->q_buf(0), tidx);
+        Smem_tile_k smem_k(shared->k_buf(0), tidx);
+        Smem_tile_v smem_v(shared->v_buf(0), tidx);
 
         // ----- Per-row state shared by the whole KV loop --------------------
         fmha::Fragment_accumulator<Traits_o> acc_o[Mma_tile_o::MMAS_M][Mma_tile_o::VALID_MMAS_N];
@@ -149,12 +154,13 @@ struct Compute
         float global_max[Softmax::ROWS_PER_THREAD];
         float global_sum[Softmax::ROWS_PER_THREAD];
 
+        // Tail-chunk MMA validity bound for BMM1 (head-dim chunking). When
+        // VALID_K is a multiple of the chunk K (the common case, e.g. D=256,
+        // chunk=64), all MMAs in every chunk are valid; otherwise the last
+        // chunk only runs its first BMM1_TAIL_MMAS_K_BOUND MMAs.
         constexpr int BMM1_VALID_MMAS_K = Mma_tile_p::VALID_MMAS_K;
         constexpr int BMM1_TAIL_MMAS_K_BOUND
             = BMM1_VALID_MMAS_K % Mma_tile_p::MMAS_K ? BMM1_VALID_MMAS_K % Mma_tile_p::MMAS_K : Mma_tile_p::MMAS_K;
-        constexpr int BMM1_MAIN_MMAS_K_BOUND = BMM1_VALID_MMAS_K - BMM1_TAIL_MMAS_K_BOUND;
-        constexpr int BMM2_TAIL_MMAS_K_BOUND = Mma_tile_o::MMAS_K;
-        constexpr int BMM2_MAIN_MMAS_K_BOUND = Kernel_traits::TOTAL_BMM2_MMAS_K - BMM2_TAIL_MMAS_K_BOUND;
 
         // Skip-softmax: precompute log(threshold/L) once (this branch's contribution).
         float const skip_softmax_log_threshold = ENABLE_SKIP_SOFTMAX
@@ -174,10 +180,6 @@ struct Compute
             bool tile_negligible = false;
             bool const apply_mask = params.has_alibi || (kv_loop >= kv_mask_loop_start);
 
-            // Wait for this iter's K slot.
-            int const k_slot = cbr_k.wait();
-            Smem_tile_k smem_k(&shared->smem_k[k_slot][0], tidx);
-
             fmha::Fragment_accumulator<Traits_p> acc_p[Mma_tile_p::MMAS_M][Mma_tile_p::MMAS_N];
             using Acc_type_p = typename Traits_p::Accumulator_type;
             fmha::Clear_accumulator<Acc_type_p, Cta_tile_p::WARPS_K>::apply(acc_p);
@@ -187,37 +189,39 @@ struct Compute
             typename Smem_tile_q::Fragment frag_q[Mma_tile_p::MMAS_K][Mma_tile_p::MMAS_M];
             typename Smem_tile_k::Fragment frag_k[Mma_tile_p::MMAS_K][Mma_tile_p::MMAS_N];
 
-            // ---- BMM1 main loop ----
-            // Replaces noloop_tiled.h's per-iter LDGSTS reload + ldgdepbar +
-            // __syncthreads with: K is already in smem_k[k_slot]
-            // (the producer's TMA + mbarrier guarantees that). We just read.
-            for (int bmm1_k = 0; bmm1_k < BMM1_MAIN_MMAS_K_BOUND; bmm1_k += Mma_tile_p::MMAS_K)
+            // ---- BMM1: stream the head dim in NUM_BMM1_CHUNKS granular chunks.
+            // Each chunk c is a separate TMA-filled buffer (chunk % GRANULAR_DEPTH);
+            // we wait on its produced barrier, do MMAS_K MMAs, then signal
+            // consumed (all consumer threads arrive -> doubles as the
+            // pre-recycle sync) and advance to the next granular read buffer.
+            // This replaces noloop_tiled.h's per-chunk LDGSTS reload +
+            // ldgdepbar + __syncthreads.
+#pragma unroll
+            for (int chunk = 0; chunk < Kernel_traits::NUM_BMM1_CHUNKS; ++chunk)
             {
+                bool const is_tail = (chunk == Kernel_traits::NUM_BMM1_CHUNKS - 1);
+                int const k_slot = cbr_k.wait();
+                int const q_slot = cbr_q.wait();
 #pragma unroll
                 for (int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki)
                 {
                     smem_q.load(frag_q[ki], ki);
                     smem_k.load(frag_k[ki], ki);
-                    fmha::gemm(acc_p, frag_q[ki], frag_k[ki]);
-                }
-            }
-
-            // ---- BMM1 tail ----
-            {
-#pragma unroll
-                for (int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki)
-                {
-                    smem_q.load(frag_q[ki], ki);
-                    smem_k.load(frag_k[ki], ki);
-                    if (Cta_tile_p::VALID_K % Cta_tile_p::K == 0 || ki < BMM1_TAIL_MMAS_K_BOUND)
+                    if (!is_tail || Cta_tile_p::VALID_K % Cta_tile_p::K == 0 || ki < BMM1_TAIL_MMAS_K_BOUND)
                     {
                         fmha::gemm(acc_p, frag_q[ki], frag_k[ki]);
                     }
                 }
+                // Every consumer thread arrives on the consumed barrier (count
+                // == CONSUMER_THREADS), so the producer cannot overwrite the
+                // buffer until all reads are done.
+                cbr_k.complete(/*arrive=*/1, k_slot);
+                cbr_k.advance();
+                cbr_q.complete(/*arrive=*/1, q_slot);
+                cbr_q.advance();
+                smem_k.move_to_next_read_buffer();
+                smem_q.move_to_next_read_buffer();
             }
-
-            // K is done; let the producer recycle this slot.
-            cbr_k.complete(tidx == 0, k_slot);
 
             // ---- Softmax ----
             softmax.unpack(acc_p);
@@ -305,76 +309,32 @@ struct Compute
                 softmax.pack(frag_p);
             }
 
-            // ---- BMM2: wait for V, then BMM2 split for skip-softmax ----
-            int const v_slot = cbr_v.wait();
-            Smem_tile_v smem_v(&shared->smem_v[v_slot][0], tidx);
-
+            // ---- BMM2: stream V kv-positions in NUM_BMM2_CHUNKS granular
+            // chunks. Same per-chunk handshake as BMM1. We ALWAYS consume the V
+            // chunks (so the producer's pipeline drains) but skip the HMMAs when
+            // the skip-softmax vote marked the tile negligible.
             typename Smem_tile_v::Fragment frag_v[Mma_tile_o::MMAS_K][Mma_tile_o::VALID_MMAS_N];
 
-            if constexpr (ENABLE_SKIP_SOFTMAX)
-            {
-                if (tile_negligible)
-                {
-                    // Skip path: no HMMAs, no frag_p reads. Just consume V.
-                    // (V load already happened producer-side; we just need to
-                    // signal the slot consumed.)
-                }
-                else
-                {
-                    // No-skip path: full BMM2.
-                    for (int bmm2_k = 0; bmm2_k < BMM2_MAIN_MMAS_K_BOUND; bmm2_k += Mma_tile_o::MMAS_K)
-                    {
+            bool const do_bmm2 = !(ENABLE_SKIP_SOFTMAX && tile_negligible);
 #pragma unroll
-                        for (int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki)
-                        {
-                            int const p_ki = bmm2_k + ki;
-                            smem_v.load(frag_v[ki], ki);
-                            fmha::gemm(acc_o, frag_p[p_ki], frag_v[ki]);
-                        }
-                    }
-                    // BMM2 tail (kv_loop > 0 always; first_step is handled above).
-#pragma unroll
-                    for (int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki)
-                    {
-                        int const p_ki = BMM2_MAIN_MMAS_K_BOUND + ki;
-                        if (ki < BMM2_TAIL_MMAS_K_BOUND)
-                        {
-                            smem_v.load(frag_v[ki], ki);
-                            fmha::gemm(acc_o, frag_p[p_ki], frag_v[ki]);
-                        }
-                    }
-                }
-            }
-            else
+            for (int chunk = 0; chunk < Kernel_traits::NUM_BMM2_CHUNKS; ++chunk)
             {
-                // Baseline path (no skip-softmax): always-execute BMM2.
-                for (int bmm2_k = 0; bmm2_k < BMM2_MAIN_MMAS_K_BOUND; bmm2_k += Mma_tile_o::MMAS_K)
+                int const v_slot = cbr_v.wait();
+                if (do_bmm2)
                 {
 #pragma unroll
                     for (int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki)
                     {
-                        int const p_ki = bmm2_k + ki;
+                        int const p_ki = chunk * Mma_tile_o::MMAS_K + ki;
                         smem_v.load(frag_v[ki], ki);
                         fmha::gemm(acc_o, frag_p[p_ki], frag_v[ki]);
                     }
                 }
-#pragma unroll
-                for (int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki)
-                {
-                    int const p_ki = BMM2_MAIN_MMAS_K_BOUND + ki;
-                    if (ki < BMM2_TAIL_MMAS_K_BOUND)
-                    {
-                        smem_v.load(frag_v[ki], ki);
-                        fmha::gemm(acc_o, frag_p[p_ki], frag_v[ki]);
-                    }
-                }
+                cbr_v.complete(/*arrive=*/1, v_slot);
+                cbr_v.advance();
+                smem_v.move_to_next_read_buffer();
             }
-
-            // V done; recycle the slot.
-            cbr_v.complete(tidx == 0, v_slot);
         }
-
-        cbr_q.complete(tidx == 0, q_slot);
 
         // ---- Epilogue: normalize acc_o by global_sum, store O ----
         // Verbatim same epilogue as noloop_tiled.h: normalize, smem_tile_o,
