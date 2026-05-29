@@ -6,16 +6,15 @@
 
 ## Status (as of 2026-05-29)
 
-**Builds, runs, and is NUMERICALLY CORRECT for everything except the V tile
-(BMM2 operand) on GB10 (sm_121).** A host-reference harness
-(`halfspec_validate.cu`) confirms BMM1 + softmax + causal mask + BMM2 + epilogue
-+ scales all compute correct attention to bf16-rounding accuracy (max_abs 2e-4)
-when V is held constant across the dv dimension (which isolates out the V
-swizzle). The epilogue is implemented; 0 memcheck errors / 0 racecheck hazards.
-The single remaining correctness gap is V's smem-swizzle (its 512-byte row can't
-be TMA-swizzled — see below); a distinct-V test fails on exactly that. Files in
-this directory plus `fused_multihead_flash_attention_kernel_ws_sm120.h`
-establish:
+**Builds, runs, and is FULLY NUMERICALLY CORRECT on GB10 (sm_121).** A
+host-reference harness (`halfspec_validate.cu`) confirms the complete kernel —
+chunked-128B-TMA Q/K + dv-chunked-128B-TMA V + BMM1 + softmax + causal mask +
+BMM2 + epilogue + scales — matches reference attention to bf16-rounding accuracy
+(distinct-V `max_abs 6e-4`, V-const `max_abs 2e-4`), with 0 compute-sanitizer
+memcheck errors and 0 racecheck hazards. The whole halfspec data path is now
+TMA-driven and validated. What remains is in-engine integration (setup.py
+codegen, dispatcher wiring) and the perf sweep. Files in this directory plus
+`fused_multihead_flash_attention_kernel_ws_sm120.h` establish:
 
 - the producer/consumer warp-role dispatch
 - a Blackwell-valid TMA load: `cuTensorMapEncodeTiled` `CUtensorMap`
@@ -108,7 +107,7 @@ So a correct V needs one of (a design fork — see "How to continue"):
    the BMM2 loop and `acc_o`.
 4. **CuTe DSL** (the README's long-term recommendation).
 
-### Chosen V path: re-tile BMM2 to 64-wide DV chunks (6c.3, in progress)
+### Chosen V path: re-tile BMM2 to 64-wide DV chunks (6c.3, DONE + validated)
 
 Instantiate the V smem tile with a `Cta_tile` whose `N = 64` (one DV chunk), so
 `Smem_tile_v` gets `LEAD_DIM = 64` → `BYTES_PER_ROW = 128` — the **same
@@ -192,8 +191,9 @@ LDGSTS → TMA. There's no LDGSTS-based stepping stone that saves work.
 | 6b | Guard `setmaxnreg` off for sm_120/121 (unsupported there). | **done (2026-05-29)** |
 | 6c.1 | **Chunked producer + per-chunk granular handshake.** Chunked `[STEP,64]` 128B-swizzle Q/K loads + `[DV,32]` V loads into the granular double-buffer; consumer streams chunks (per-chunk wait/complete + `move_to_next_read_buffer`). Runs to completion on GB10, 0 memcheck/racecheck. | **done (2026-05-29)** |
 | 6c.2 | Epilogue (O store) + numeric harness; fixed the missing `mask.load` causal bug. BMM1+softmax+mask+BMM2+epilogue+scales validated (V-const PASS). V swizzle verified as a blocker (needs re-tile). | **done (2026-05-29)** |
-| 6c.3 | Re-tile BMM2 to 64-wide DV chunks so V uses 128-byte rows (same proven layout as K); validate distinct-V O against the host reference. | 1–3 days |
-| 6d | End-to-end: confirm `gen_token=13477` matches `noloop_tiled.h` in-engine. | 1 day |
+| 6c.3 | Re-tile BMM2 to 64-wide DV chunks so V uses 128-byte rows (same proven layout as K). Producer streams 4 dv x 4 kv V sub-tiles; consumer BMM2 contracts per dv-chunk into the acc_o sub-range. distinct-V validates at bf16 accuracy. | **done (2026-05-29)** |
+| 6d | In-engine integration: setup.py codegen branch + fmhaRunner dispatch (flag-gated); confirm `gen_token=13477` matches `noloop_tiled.h`. | 1–2 days |
+| 7 | Perf sweep (RING_DEPTH, ring placement, ldmatrix bank conflicts). | 3–5 days |
 | 6d | Correctness validation: 1-token gen on Qwen3.6-35B-A3B prefill at L=49 152, confirm `gen_token=13477` matches `noloop_tiled.h`. | 1 day |
 | 7 | Performance sweep: `RING_DEPTH ∈ {2,3,4}`, ring placement, smem layout for ldmatrix bank-conflict-free reads. (Register-budget split is N/A on sm_120/121.) | 3–5 days |
 | 8 | Compare to baseline + skip-softmax at L ∈ {8k,16k,24k,32k,40k,49k} with the same `bench_prefill_35b_trtllm.py` harness. | 1 day |

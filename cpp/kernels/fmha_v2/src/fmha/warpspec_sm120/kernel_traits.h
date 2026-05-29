@@ -153,8 +153,22 @@ struct Kernel_traits_halfspec_sm120
     // if profiling shows ring depth > 2 is needed.
     using Smem_tile_q = typename Base::Smem_tile_q;
     using Smem_tile_k = typename Base::Smem_tile_k;
-    using Smem_tile_v = typename Base::Smem_tile_v;
     using Smem_tile_o = typename Base::Smem_tile_o;
+
+    // ----- V re-tiled to 64-wide DV chunks (6c.3) -----------------------------
+    //
+    // The Base Smem_tile_v packs the full DV (256) into the lead dim, giving
+    // 512-byte smem rows that no TMA swizzle mode can reproduce (the encode caps
+    // the leading box dim at the 128-byte swizzle width). We instead tile DV
+    // into BMM2_DV_CHUNK=64-wide groups so the V smem tile has LEAD_DIM=64 ->
+    // 128-byte rows == the same proven layout as K (TMA-128B-swizzle fillable),
+    // and the existing Smem_tile_v `N==64` ldsmt read path applies unchanged.
+    static constexpr int BMM2_DV_CHUNK = 64;
+    using Cta_tile_v = typename Traits_o::template Cta_tile_extd<Cta_tile_o::M, BMM2_DV_CHUNK, Cta_tile_o::K,
+        BMM2_DV_CHUNK, S, WARPS_M_, 1, WARPS_N_>;
+    using Smem_tile_v = fmha::Smem_tile_v<Traits_o, Cta_tile_v, Base::BUFFERS_PER_TILE_SMEM_V>;
+    // MMA tile for the dv-chunk V read (MMAS_K kv-steps, MMAS_N = 64/16 dv tiles).
+    using Mma_tile_v = typename Traits_o::template Mma_tile<Cta_tile_v>;
 
     using Gmem_tile_o = typename Base::Gmem_tile_o;
 
@@ -276,13 +290,18 @@ struct Kernel_traits_halfspec_sm120
     static constexpr int BYTES_PER_BUFFER_K = Smem_tile_k::BYTES_PER_BUFFER;
     static constexpr int BYTES_PER_BUFFER_V = Smem_tile_v::BYTES_PER_BUFFER;
 
-    // BMM1 streams the head dim in chunks of Cta_tile_p::K elements; BMM2
-    // streams kv-positions in chunks of Cta_tile_o::K. Number of chunks per
-    // kv-tile for each gemm:
+    // BMM1 streams the head dim in chunks of Cta_tile_p::K (=64) elements.
     static constexpr int BMM1_CHUNK_ELTS = Cta_tile_p::K;   // head-dim elements / chunk
     static constexpr int NUM_BMM1_CHUNKS = Mma_tile_p::VALID_MMAS_K / Mma_tile_p::MMAS_K;
-    static constexpr int BMM2_CHUNK_ELTS = Cta_tile_o::K;   // kv-positions / chunk
-    static constexpr int NUM_BMM2_CHUNKS = TOTAL_BMM2_MMAS_K / Mma_tile_o::MMAS_K;
+
+    // BMM2 V is tiled in BOTH kv-positions (Cta_tile_o::K = 32 each) and DV
+    // (BMM2_DV_CHUNK = 64 each). Each V sub-tile is one [kv-chunk, dv-chunk]
+    // granular buffer ([32, 64] -> 128-byte rows). The producer streams
+    // NUM_BMM2_DV_CHUNKS * NUM_BMM2_KV_CHUNKS sub-tiles per kv-tile.
+    static constexpr int BMM2_KV_CHUNK_ELTS = Cta_tile_o::K;          // 32
+    static constexpr int NUM_BMM2_KV_CHUNKS = TOTAL_BMM2_MMAS_K / Mma_tile_o::MMAS_K;  // 4
+    static constexpr int NUM_BMM2_DV_CHUNKS = VALID_DV / BMM2_DV_CHUNK;               // 4
+    static constexpr int NUM_BMM2_CHUNKS = NUM_BMM2_KV_CHUNKS * NUM_BMM2_DV_CHUNKS;    // 16
 
     using Circular_buffer_q_reader = typename fmha::ws::CircularBuffer<GRANULAR_DEPTH, CTAS_PER_CGA>::Reader;
     using Circular_buffer_q_writer = typename fmha::ws::CircularBuffer<GRANULAR_DEPTH, CTAS_PER_CGA>::Writer;

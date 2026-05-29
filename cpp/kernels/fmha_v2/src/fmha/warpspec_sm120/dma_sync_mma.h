@@ -210,17 +210,25 @@ struct DMA
                 utmaldg_3d_cta(desc_q, q_smem, q_bar, q_coord, elect_one_);
             }
 
-            // ---- BMM2: kv-position chunks of V ----
+            // ---- BMM2: V sub-tiles, tiled in DV (outer) x kv-positions (inner).
+            // Each sub-tile is a [BMM2_KV_CHUNK_ELTS kv, BMM2_DV_CHUNK dv] box
+            // (128-byte rows, 128B swizzle -- same layout as K). The consumer
+            // reads them in the same (dv, kv) order.
 #pragma unroll
-            for (int c = 0; c < Kernel_traits::NUM_BMM2_CHUNKS; ++c)
+            for (int dvc = 0; dvc < Kernel_traits::NUM_BMM2_DV_CHUNKS; ++dvc)
             {
-                int const kv_off = kv_loop + c * Kernel_traits::BMM2_CHUNK_ELTS;
+                int const dv_off = dvc * Kernel_traits::BMM2_DV_CHUNK;
+#pragma unroll
+                for (int kvc = 0; kvc < Kernel_traits::NUM_BMM2_KV_CHUNKS; ++kvc)
+                {
+                    int const kv_off = kv_loop + kvc * Kernel_traits::BMM2_KV_CHUNK_ELTS;
 
-                int const v_slot = cbw_v.tmaReserve(elect_one_, TX_BYTES_V);
-                uint32_t const v_smem = __nvvm_get_smem_pointer(shared->v_buf(v_slot));
-                uint32_t const v_bar = __nvvm_get_smem_pointer(cbw_v.barrier_ptr(v_slot));
-                int32_t const v_coord[3] = {0, bidh_kv, kv_off};
-                utmaldg_3d_cta(desc_v, v_smem, v_bar, v_coord, elect_one_);
+                    int const v_slot = cbw_v.tmaReserve(elect_one_, TX_BYTES_V);
+                    uint32_t const v_smem = __nvvm_get_smem_pointer(shared->v_buf(v_slot));
+                    uint32_t const v_bar = __nvvm_get_smem_pointer(cbw_v.barrier_ptr(v_slot));
+                    int32_t const v_coord[3] = {dv_off, bidh_kv, kv_off};
+                    utmaldg_3d_cta(desc_v, v_smem, v_bar, v_coord, elect_one_);
+                }
             }
         }
     }
@@ -348,7 +356,8 @@ struct DMA
             // layout match is a follow-up).
             constexpr uint32_t Q_CHUNK = Kernel_traits::BMM1_CHUNK_ELTS;
             constexpr uint32_t K_CHUNK = Kernel_traits::BMM1_CHUNK_ELTS;
-            constexpr uint32_t V_KV_CHUNK = Kernel_traits::BMM2_CHUNK_ELTS;
+            constexpr uint32_t V_DV_CHUNK = Kernel_traits::BMM2_DV_CHUNK;     // 64 (128-byte leading)
+            constexpr uint32_t V_KV_CHUNK = Kernel_traits::BMM2_KV_CHUNK_ELTS; // 32 kv-positions
 
             // ---- Q ----  tensor (D, H, seq); box (chunk, 1, STEP_Q)
             uint32_t const tensor_size_q[3] = {d, h, total_seqlen};
@@ -360,9 +369,11 @@ struct DMA
             uint32_t const box_size_k[3] = {K_CHUNK, 1, STEP_KV};
             encode(tma_k, k_ptr, tensor_size_k, static_cast<uint64_t>(params.k_stride_in_bytes), box_size_k);
 
-            // ---- V ----  tensor (DV, H_kv, seq); box (DV, 1, kv-chunk)
+            // ---- V ----  tensor (DV, H_kv, seq); box (dv-chunk=64, 1, kv-chunk=32)
+            // -> 128-byte leading dim -> 128B swizzle (matches the re-tiled
+            // Smem_tile_v with LEAD_DIM=64).
             uint32_t const tensor_size_v[3] = {dv, h_kv, total_seqlen};
-            uint32_t const box_size_v[3] = {static_cast<uint32_t>(Kernel_traits::DV), 1, V_KV_CHUNK};
+            uint32_t const box_size_v[3] = {V_DV_CHUNK, 1, V_KV_CHUNK};
             encode(tma_v, v_ptr, tensor_size_v, static_cast<uint64_t>(params.v_stride_in_bytes), box_size_v);
         }
     };

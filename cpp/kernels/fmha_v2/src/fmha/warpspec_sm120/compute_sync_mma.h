@@ -66,6 +66,8 @@ struct Compute
     using Cta_tile_o = typename Kernel_traits::Cta_tile_o;
     using Mma_tile_p = typename Kernel_traits::Mma_tile_p;
     using Mma_tile_o = typename Kernel_traits::Mma_tile_o;
+    // MMA tile for the dv-chunked V read (MMAS_K kv-steps x MMAS_N=64/16 dv tiles).
+    using Mma_tile_v = typename Kernel_traits::Mma_tile_v;
 
     using Smem_tile_q = typename Kernel_traits::Smem_tile_q;
     using Smem_tile_k = typename Kernel_traits::Smem_tile_k;
@@ -314,30 +316,46 @@ struct Compute
                 softmax.pack(frag_p);
             }
 
-            // ---- BMM2: stream V kv-positions in NUM_BMM2_CHUNKS granular
-            // chunks. Same per-chunk handshake as BMM1. We ALWAYS consume the V
-            // chunks (so the producer's pipeline drains) but skip the HMMAs when
-            // the skip-softmax vote marked the tile negligible.
-            typename Smem_tile_v::Fragment frag_v[Mma_tile_o::MMAS_K][Mma_tile_o::VALID_MMAS_N];
+            // ---- BMM2: V is tiled in DV (outer) x kv-positions (inner).
+            // Each sub-tile is a [kv-chunk, dv-chunk=64] 128-byte-row granular
+            // buffer. For dv-chunk dvc we contract all kv (across the kv-chunks)
+            // into the acc_o columns [dvc*MMAS_N .. +MMAS_N). frag_p (the
+            // softmax probs over all kv) is indexed by the global k-step
+            // kvc*MMAS_K + ki. We ALWAYS consume the V sub-tiles (to drain the
+            // producer pipeline) but skip the HMMAs on a negligible tile.
+            typename Smem_tile_v::Fragment frag_v[Mma_tile_v::MMAS_K][Mma_tile_v::VALID_MMAS_N];
 
             bool const do_bmm2 = !(ENABLE_SKIP_SOFTMAX && tile_negligible);
 #pragma unroll
-            for (int chunk = 0; chunk < Kernel_traits::NUM_BMM2_CHUNKS; ++chunk)
+            for (int dvc = 0; dvc < Kernel_traits::NUM_BMM2_DV_CHUNKS; ++dvc)
             {
-                int const v_slot = cbr_v.wait();
-                if (do_bmm2)
-                {
 #pragma unroll
-                    for (int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki)
+                for (int kvc = 0; kvc < Kernel_traits::NUM_BMM2_KV_CHUNKS; ++kvc)
+                {
+                    int const v_slot = cbr_v.wait();
+                    if (do_bmm2)
                     {
-                        int const p_ki = chunk * Mma_tile_o::MMAS_K + ki;
-                        smem_v.load(frag_v[ki], ki);
-                        fmha::gemm(acc_o, frag_p[p_ki], frag_v[ki]);
+#pragma unroll
+                        for (int ki = 0; ki < Mma_tile_v::MMAS_K; ++ki)
+                        {
+                            int const p_ki = kvc * Mma_tile_v::MMAS_K + ki;  // global frag_p k-step
+                            smem_v.load(frag_v[ki], ki);
+#pragma unroll
+                            for (int ni = 0; ni < Mma_tile_v::VALID_MMAS_N; ++ni)
+                            {
+                                int const acc_ni = dvc * Mma_tile_v::VALID_MMAS_N + ni;
+#pragma unroll
+                                for (int mi = 0; mi < Mma_tile_o::MMAS_M; ++mi)
+                                {
+                                    acc_o[mi][acc_ni].mma(frag_p[p_ki][mi], frag_v[ki][ni]);
+                                }
+                            }
+                        }
                     }
+                    cbr_v.complete(/*arrive=*/1, v_slot);
+                    cbr_v.advance();
+                    smem_v.move_to_next_read_buffer();
                 }
-                cbr_v.complete(/*arrive=*/1, v_slot);
-                cbr_v.advance();
-                smem_v.move_to_next_read_buffer();
             }
         }
 
