@@ -131,3 +131,45 @@ extern "C" cudaError_t launch_halfspec_smoke(
     halfspec_smoke_kernel<<<grid, block, smem_bytes, stream>>>(params, tma_q, tma_k, tma_v);
     return cudaGetLastError();
 }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// In-engine dispatch bridge (phase 6d).
+//
+// The production fmhaRunner uses `tensorrt_llm::kernels::Fused_multihead_attention_params_v2`
+// (defined in contextFusedMultiHeadAttention/fused_multihead_attention_common.h),
+// which is a separate but ABI-compatible struct from the fmha_v2 `bert::` one --
+// the generated kernels bridge them with reinterpret_cast, and we do the same.
+// Only the production build (which copies this file into fmha_v2_cu/ and compiles
+// with GENERATE_CUBIN=1) sees the common header; the standalone validation build
+// (nvcc -I fmha_v2/src) compiles without it, so guard the bridge accordingly.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if defined(GENERATE_CUBIN)
+#include "../fused_multihead_attention_common.h"
+#include "tensorrt_llm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
+{
+
+// Launcher with the signature the runner's dispatch hook expects (mirrors the
+// generated `run_fmha_v2_..._sm90` convention: kernels:: param/launch types,
+// reinterpret_cast to bert:: for the actual launch).
+void run_halfspec_bf16_d256_causal_sm120(
+    Fused_multihead_attention_params_v2& params, Launch_params const& launch_params, cudaStream_t stream)
+{
+    // The bert launch_params is NOT ABI-identical to kernels::Launch_params, so
+    // copy the one field Host::init_params reads (total_q_seqlen) rather than
+    // reinterpret_cast it.
+    bert::Fused_multihead_attention_launch_params blp{};
+    blp.total_q_seqlen = launch_params.total_q_seqlen;
+    blp.attention_input_layout = fmha::Attention_input_layout::PACKED_QKV;
+
+    launch_halfspec_smoke(
+        reinterpret_cast<bert::Fused_multihead_attention_params_v2&>(params), blp, stream);
+}
+
+} // namespace kernels
+TRTLLM_NAMESPACE_END
+#endif // GENERATE_CUBIN
