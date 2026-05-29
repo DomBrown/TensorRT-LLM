@@ -337,10 +337,39 @@ struct Compute
         }
 
         // ---- Epilogue: normalize acc_o by global_sum, store O ----
-        // Verbatim same epilogue as noloop_tiled.h: normalize, smem_tile_o,
-        // gmem_tile_o store. TODO(phase 5): wire up Gmem_tile_o + Smem_tile_o.
-        // For phase 1+2 we leave this as a stub; the structural skeleton plus
-        // the kv-loop body is what we needed to demonstrate.
+        // Ported from noloop_tiled.h, with two halfspec adaptations:
+        //   * __syncthreads() -> named_barrier over the CONSUMER_THREADS group
+        //     only (the producer warp is not part of the epilogue and must not
+        //     be caught in a CTA-wide barrier).
+        //   * Smem_tile_o aliases the start of the smem region (q/k/v buffers
+        //     are free once the kv-loop is done); it needs
+        //     Smem_tile_o::BYTES_PER_TILE bytes, which fits within the
+        //     q+k+v span ahead of the barrier arrays.
+        acc_o_normalizer.update_sum(global_max, global_sum);
+        acc_o_normalizer.final_update(acc_o, global_sum);
+
+        Gmem_tile_o gmem_o(params, binfo, tidx, q_loop * Gmem_tile_o::ROWS);
+        Smem_tile_o smem_o(&shared->smem_q[0], tidx);
+
+#pragma unroll
+        for (int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii)
+        {
+            // Swizzle the elements and do the final cross-warp reduction.
+            smem_o.store(acc_o, ii);
+            // Make sure the data is in shared memory (consumer group only).
+            fmha::named_barrier_wait(Kernel_traits::CONSUMER_SYNC_BARRIER_ID, Kernel_traits::CONSUMER_THREADS);
+
+            uint4 out[Gmem_tile_o::STGS_PER_LOOP];
+            smem_o.load(out);
+
+            // Make sure the data was read from shared memory before reuse.
+            if (ii < Gmem_tile_o::LOOPS - 1)
+            {
+                fmha::named_barrier_wait(Kernel_traits::CONSUMER_SYNC_BARRIER_ID, Kernel_traits::CONSUMER_THREADS);
+            }
+
+            gmem_o.store(out, ii);
+        }
     }
 };
 
