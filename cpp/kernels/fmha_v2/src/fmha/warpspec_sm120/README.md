@@ -49,9 +49,19 @@ Both point to the same fix: the producer must issue **chunked `[STEP, 64]`
 (128-byte) TMA loads with 128B swizzle** into the granular sub-buffers, instead
 of one giant box. This also satisfies the `cuTensorMapEncodeTiled` swizzle
 rule (leading box dim bytes ≤ swizzle width) and matches the consumer's
-ldmatrix chunking. **Open risk:** the fmha_v2 LDGSTS `Smem_tile` XOR swizzle
-may not equal any TMA hardware swizzle mode; if not, the consumer must move to
-TMA-swizzle-compatible (Hopper-style) smem tiles — a larger rewrite.
+ldmatrix chunking.
+
+**Viability DE-RISKED (2026-05-29): the port works with the existing consumer
+smem tiles — no rewrite needed.** The make-or-break question was whether the
+fmha_v2 LDGSTS `Smem_tile` XOR swizzle equals a TMA hardware swizzle mode. It
+does: both Q and K granular tiles use `BYTES_PER_ROW=128`, `BYTES_PER_STS=16`,
+`ROWS_PER_XOR_PATTERN=8`, `COLS_PER_XOR_PATTERN=1`, i.e. physical 16-byte chunk
+`= (col/8) ^ (row % 8)` — which is **byte-identical to the TMA 128B hardware
+swizzle**. Verified empirically on GB10 (`tma_swizzle_verify.cu`): a 128B-swizzle
+TMA load of a known `[8, 64]` bf16 tile places every logical element at exactly
+the fmha-predicted offset (e.g. phys row 1 = logical cols 8..15 then 0..7, the
+`row%8` chunk swap). So a chunked 128B-swizzle TMA fills `Smem_tile_q/k`
+directly and the consumer's ldmatrix reads correct data.
 
 ### Fast iteration loop (bypass the slow ~4 MB cmake build)
 
@@ -64,8 +74,11 @@ nvcc -arch=sm_120f -std=c++17 -I . \
 compute-sanitizer --tool memcheck /tmp/halfspec_runtest
 ```
 
-(`sm_120f` is family-specific and runs on GB10/sm_121. Minimal TMA descriptor
-reproducers live next to the runtest: `tma_minrepro.cu`, `tma_encode_probe.cu`.)
+(`sm_120f` is family-specific and runs on GB10/sm_121. Standalone driver-API
+reproducers live next to the runtest: `tma_minrepro.cu` (hand-rolled vs
+encode-tiled descriptor), `tma_encode_probe.cu` (swizzle/box constraints),
+`tma_swizzle_verify.cu` (TMA-128B == fmha XOR swizzle proof), `halfspec_sizes.cu`
+(smem slot / swizzle constants).)
 
 ## Why the naïve "just split warps" shortcut doesn't work
 
@@ -93,7 +106,7 @@ LDGSTS → TMA. There's no LDGSTS-based stepping stone that saves work.
 | 5 | Build (`scripts/build_wheel.py`), iterate on compile errors and ptxas warnings. | done |
 | 6a | TMA descriptor: hand-rolled `cudaTmaDesc` → `cuTensorMapEncodeTiled` `CUtensorMap` (Blackwell-valid). UTMALDG no longer faults. | **done (2026-05-29)** |
 | 6b | Guard `setmaxnreg` off for sm_120/121 (unsupported there). | **done (2026-05-29)** |
-| 6c | **Producer/consumer smem layout match.** Issue chunked `[STEP,64]` 128B-swizzle TMA loads into the granular `Smem_tile` sub-buffers (full-head-dim box overruns the slot and the 99 KB smem cap). Verify the LDGSTS XOR swizzle is reproducible by a TMA hardware swizzle mode; if not, move the consumer to TMA-swizzle smem tiles. | 3–6 days |
+| 6c | **Producer/consumer smem layout match.** Issue chunked `[STEP,64]` 128B-swizzle TMA loads (D/64 = 4 chunks/tile for head_dim 256) into the granular `Smem_tile` double-buffer, with per-chunk mbarriers synced to the consumer's granular iteration. Swizzle equivalence VERIFIED (see above) — no consumer rewrite. Remaining: chunk-loop plumbing + per-chunk handshake. | 2–4 days |
 | 6d | Correctness validation: 1-token gen on Qwen3.6-35B-A3B prefill at L=49 152, confirm `gen_token=13477` matches `noloop_tiled.h`. | 1 day |
 | 7 | Performance sweep: `RING_DEPTH ∈ {2,3,4}`, ring placement, smem layout for ldmatrix bank-conflict-free reads. (Register-budget split is N/A on sm_120/121.) | 3–5 days |
 | 8 | Compare to baseline + skip-softmax at L ∈ {8k,16k,24k,32k,40k,49k} with the same `bench_prefill_35b_trtllm.py` harness. | 1 day |
