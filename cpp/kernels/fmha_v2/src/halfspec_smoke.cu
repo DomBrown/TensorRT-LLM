@@ -34,13 +34,14 @@
  */
 
 #include <cstdio>
+#include <cstdlib> // std::getenv
 
 #include <cuda.h>  // CUtensorMap
 
-#include <fused_multihead_attention.h>
-#include <fused_multihead_attention_kernel.h>
 #include <fmha/traits.h>
 #include <fmha/warpspec_sm120/kernel_traits.h>
+#include <fused_multihead_attention.h>
+#include <fused_multihead_attention_kernel.h>
 
 #include "fused_multihead_flash_attention_kernel_ws_sm120.h"
 
@@ -48,38 +49,49 @@ namespace fmha_smoke
 {
 
 // NOTE: the `S` template arg is the *kv loop step* (per-iter KV tile size),
-// not the runtime maximum sequence length. For head_dim=256 the existing
-// setup.py uses kv_loop_step=128. The runtime kv seqlen is read from
-// binfo.actual_kv_seqlen and the kv loop iterates in chunks of S.
+// not the runtime maximum sequence length. setup.py uses kv_loop_step=128.
+// The runtime kv seqlen is read from binfo.actual_kv_seqlen and the kv loop
+// iterates in chunks of S.
 //
 // Also: with TMA box size capped at 256 elements per axis, S must be <=256
 // (we load STEP_KV = Cta_tile_p::N = S elements per TMA box call).
-using Smoke_Ktraits = fmha::ws_sm120::Kernel_traits_halfspec_sm120<
+//
+// Head-dim-parameterized halfspec traits. HEAD_DIM must be a multiple of the
+// 64-element (= 128-byte BF16) TMA chunk width so the Q/K head-dim chunks and
+// the 64-wide V dv-chunks keep 128-byte smem rows -- the layout that matches
+// the TMA 128B hardware swizzle. head_dim 128 and 256 both satisfy this; a
+// non-multiple-of-64 head dim would break the swizzle invariant.
+template <int HEAD_DIM>
+using Halfspec_ktraits = fmha::ws_sm120::Kernel_traits_halfspec_sm120<
     /*Traits_=*/fmha::Ampere_hmma_bf16_traits,
     /*S=*/128,
-    /*VALID_D_=*/256,
-    /*VALID_DV_=*/256,
+    /*VALID_D_=*/HEAD_DIM,
+    /*VALID_DV_=*/HEAD_DIM,
     /*STEP_Q_=*/64,
     /*WARPS_M_=*/4,
     /*WARPS_N_=*/1,
     /*VERSION_=*/2,
     /*MASK_VERSION_=*/3, // 3 = causal
     /*RING_DEPTH_=*/1,
-    /*ENABLE_SKIP_SOFTMAX_=*/false,
+    /*ENABLE_SKIP_SOFTMAX_=*/true,
     /*NUM_PRODUCER_WARPS_=*/1>;
+
+// Back-compat alias for the original d=256 smoke instantiation.
+using Smoke_Ktraits = Halfspec_ktraits<256>;
 
 } // namespace fmha_smoke
 
-extern "C" __global__ __launch_bounds__(fmha_smoke::Smoke_Ktraits::THREADS, 1)
-void halfspec_smoke_kernel(bert::Fused_multihead_attention_params_v2 const params,
-    __grid_constant__ const CUtensorMap tma_q,
-    __grid_constant__ const CUtensorMap tma_k,
-    __grid_constant__ const CUtensorMap tma_v)
+// Templated entry kernel -- one instantiation per head dim (128, 256). THREADS
+// is head-dim-independent (1 producer + WARPS_M*WARPS_N consumer warps), so the
+// launch_bounds value is identical across instantiations.
+template <typename Ktraits>
+__global__ __launch_bounds__(Ktraits::THREADS, 1) void halfspec_kernel(
+    bert::Fused_multihead_attention_params_v2 const params, __grid_constant__ const CUtensorMap tma_q,
+    __grid_constant__ const CUtensorMap tma_k, __grid_constant__ const CUtensorMap tma_v)
 {
     // The CUtensorMaps live in const/param space (grid_constant); passing
     // their addresses to cp.async.bulk.tensor is a valid tensormap operand.
-    fused_multihead_attention::device_flash_attention_ws_sm120<fmha_smoke::Smoke_Ktraits>(
-        params, &tma_q, &tma_k, &tma_v);
+    fused_multihead_attention::device_flash_attention_ws_sm120<Ktraits>(params, &tma_q, &tma_k, &tma_v);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -94,26 +106,32 @@ void halfspec_smoke_kernel(bert::Fused_multihead_attention_params_v2 const param
 // checking it (and running a separate sync to surface launch-time aborts).
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-extern "C" cudaError_t launch_halfspec_smoke(
-    bert::Fused_multihead_attention_params_v2 params,
-    bert::Fused_multihead_attention_launch_params const& launch_params,
-    cudaStream_t stream)
+template <typename Ktraits>
+static cudaError_t launch_halfspec(bert::Fused_multihead_attention_params_v2 params,
+    bert::Fused_multihead_attention_launch_params const& launch_params, cudaStream_t stream)
 {
     // 1. Build the three TMA descriptors host-side (cuTensorMapEncodeTiled).
     //    These are passed to the kernel as __grid_constant__ params.
     CUtensorMap tma_q{}, tma_k{}, tma_v{};
-    fmha::ws_sm120::DMA<fmha_smoke::Smoke_Ktraits>::Host dma_host;
+    typename fmha::ws_sm120::DMA<Ktraits>::Host dma_host;
     dma_host.init_params(params, launch_params, tma_q, tma_k, tma_v);
 
-    // 2. Size the smem allocation. With RING_DEPTH=3 and head_dim=256 BF16 +
-    //    STEP_Q/KV=64, the Shared struct is ~150 KB, comfortably above the
-    //    48 KB cudaFuncAttributeMaxDynamicSharedMemorySize default.
-    constexpr int smem_bytes = static_cast<int>(fmha_smoke::Smoke_Ktraits::BYTES_PER_SMEM);
-    std::fprintf(stderr, "[halfspec-runtest] BYTES_PER_SMEM = %d\n", smem_bytes);
+    // 2. Size the smem allocation. If it exceeds the 48 KB default, raise the
+    //    cudaFuncAttributeMaxDynamicSharedMemorySize cap before launch. (head_dim
+    //    128 needs roughly half the head_dim 256 footprint.)
+    constexpr int smem_bytes = static_cast<int>(Ktraits::BYTES_PER_SMEM);
+    // Per-launch diagnostic, off by default (this fires once per attention layer
+    // per forward and is very noisy). Set TRTLLM_HALFSPEC_VERBOSE=1 to confirm
+    // halfspec is dispatching for the prefill.
+    static bool const kVerbose = (std::getenv("TRTLLM_HALFSPEC_VERBOSE") != nullptr);
+    if (kVerbose)
+    {
+        std::fprintf(stderr, "[halfspec] BYTES_PER_SMEM = %d\n", smem_bytes);
+    }
     if (smem_bytes >= 48 * 1024)
     {
-        cudaError_t err = cudaFuncSetAttribute(halfspec_smoke_kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        cudaError_t err
+            = cudaFuncSetAttribute(halfspec_kernel<Ktraits>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
         if (err != cudaSuccess)
         {
             return err;
@@ -123,13 +141,29 @@ extern "C" cudaError_t launch_halfspec_smoke(
     // 3. Grid = (Q-tiles, H, B). One CTA per (Q-tile, head, batch). Each CTA
     //    has THREADS threads (1 producer warp + WARPS_M*WARPS_N consumer
     //    warps = 5 warps total = 160 threads).
-    int const q_tiles = (params.s + fmha_smoke::Smoke_Ktraits::STEP_Q - 1)
-                      / fmha_smoke::Smoke_Ktraits::STEP_Q;
+    int const q_tiles = (params.s + Ktraits::STEP_Q - 1) / Ktraits::STEP_Q;
     dim3 const grid(q_tiles, params.h, params.b);
-    dim3 const block(fmha_smoke::Smoke_Ktraits::THREADS);
+    dim3 const block(Ktraits::THREADS);
 
-    halfspec_smoke_kernel<<<grid, block, smem_bytes, stream>>>(params, tma_q, tma_k, tma_v);
+    halfspec_kernel<Ktraits><<<grid, block, smem_bytes, stream>>>(params, tma_q, tma_k, tma_v);
     return cudaGetLastError();
+}
+
+// Back-compat extern "C" entry for the standalone validation harness, which
+// links against `launch_halfspec_smoke` (the d=256 instantiation).
+extern "C" cudaError_t launch_halfspec_smoke(bert::Fused_multihead_attention_params_v2 params,
+    bert::Fused_multihead_attention_launch_params const& launch_params, cudaStream_t stream)
+{
+    return launch_halfspec<fmha_smoke::Smoke_Ktraits>(params, launch_params, stream);
+}
+
+// d=128 instantiation for the standalone bench/validation harness (e.g.
+// halfspec_bench.cu). Mirrors launch_halfspec_smoke; head_dim 128 is the other
+// shape the in-engine halfspec dispatch supports (Qwen3-30B-A3B etc.).
+extern "C" cudaError_t launch_halfspec_smoke_d128(bert::Fused_multihead_attention_params_v2 params,
+    bert::Fused_multihead_attention_launch_params const& launch_params, cudaStream_t stream)
+{
+    return launch_halfspec<fmha_smoke::Halfspec_ktraits<128>>(params, launch_params, stream);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -150,26 +184,41 @@ extern "C" cudaError_t launch_halfspec_smoke(
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
-// Launcher with the signature the runner's dispatch hook expects (mirrors the
+// Launchers with the signature the runner's dispatch hook expects (mirrors the
 // generated `run_fmha_v2_..._sm90` convention: kernels:: param/launch types,
-// reinterpret_cast to bert:: for the actual launch).
+// reinterpret_cast to bert:: for the actual launch). One per supported head
+// dim; both share the templated launch_halfspec<> path.
+//
+// The bert launch_params is NOT ABI-identical to kernels::Launch_params, so we
+// copy the one field Host::init_params reads (total_q_seqlen) rather than
+// reinterpret_cast it.
 void run_halfspec_bf16_d256_causal_sm120(
     Fused_multihead_attention_params_v2& params, Launch_params const& launch_params, cudaStream_t stream)
 {
-    // The bert launch_params is NOT ABI-identical to kernels::Launch_params, so
-    // copy the one field Host::init_params reads (total_q_seqlen) rather than
-    // reinterpret_cast it.
     bert::Fused_multihead_attention_launch_params blp{};
     blp.total_q_seqlen = launch_params.total_q_seqlen;
     blp.attention_input_layout = fmha::Attention_input_layout::PACKED_QKV;
 
-    launch_halfspec_smoke(
+    ::launch_halfspec<::fmha_smoke::Halfspec_ktraits<256>>(
+        reinterpret_cast<bert::Fused_multihead_attention_params_v2&>(params), blp, stream);
+}
+
+void run_halfspec_bf16_d128_causal_sm120(
+    Fused_multihead_attention_params_v2& params, Launch_params const& launch_params, cudaStream_t stream)
+{
+    bert::Fused_multihead_attention_launch_params blp{};
+    blp.total_q_seqlen = launch_params.total_q_seqlen;
+    blp.attention_input_layout = fmha::Attention_input_layout::PACKED_QKV;
+
+    ::launch_halfspec<::fmha_smoke::Halfspec_ktraits<128>>(
         reinterpret_cast<bert::Fused_multihead_attention_params_v2&>(params), blp, stream);
 }
 
 } // namespace kernels
+
 TRTLLM_NAMESPACE_END
 #endif // GENERATE_CUBIN

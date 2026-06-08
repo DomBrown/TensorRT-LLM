@@ -31,9 +31,12 @@ namespace kernels
 {
 
 // Halfspec (TMA-load + sync-MMA warp-specialized FMHA for sm_120/sm_121) launch
-// bridge, defined in the halfspec kernel TU (fmha_v2_cu/halfspec_smoke_sm120.cu).
+// bridges, defined in the halfspec kernel TU (fmha_v2_cu/halfspec_smoke_sm120.cu).
 // Flag-gated experimental path; see cpp/kernels/fmha_v2/src/fmha/warpspec_sm120/.
+// One bridge per supported head dim (128, 256).
 void run_halfspec_bf16_d256_causal_sm120(
+    Fused_multihead_attention_params_v2& params, Launch_params const& launch_params, cudaStream_t stream);
+void run_halfspec_bf16_d128_causal_sm120(
     Fused_multihead_attention_params_v2& params, Launch_params const& launch_params, cudaStream_t stream);
 
 namespace
@@ -274,18 +277,27 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
     // ----- Experimental halfspec FMHA dispatch (phase 6d, flag-gated) ---------
     //
     // When TRTLLM_USE_HALFSPEC_FMHA is set, route the matching config
-    // (sm_120/sm_121, BF16 in/out, head_dim 256, causal, PACKED_QKV) to the
-    // halfspec TMA-load + sync-MMA warp-specialized kernel. Falls through to the
-    // normal cubin/launcher path otherwise. Numerically validated standalone at
-    // bf16 accuracy; the in-engine gen_token check is the remaining step.
+    // (sm_120/sm_121, BF16 in/out, head_dim 128 or 256 with d==dv, causal,
+    // PACKED_QKV) to the halfspec TMA-load + sync-MMA warp-specialized kernel.
+    // Falls through to the normal cubin/launcher path otherwise. Numerically
+    // validated standalone at bf16 accuracy; the in-engine gen_token check is
+    // the remaining step.
     static bool const kHalfspecEnabled = (std::getenv("TRTLLM_USE_HALFSPEC_FMHA") != nullptr);
     if (kHalfspecEnabled && (mSM == kSM_120 || mSM == kSM_121) && mInputDataType == DATA_TYPE_BF16
-        && mOutputDataType == DATA_TYPE_BF16 && params.d == 256 && params.dv == 256
+        && mOutputDataType == DATA_TYPE_BF16 && params.d == params.dv
         && launch_params.attention_mask_type == ContextAttentionMaskType::CAUSAL
         && launch_params.attention_input_layout == AttentionInputLayout::PACKED_QKV)
     {
-        run_halfspec_bf16_d256_causal_sm120(params, launch_params, stream);
-        return;
+        if (params.d == 256)
+        {
+            run_halfspec_bf16_d256_causal_sm120(params, launch_params, stream);
+            return;
+        }
+        if (params.d == 128)
+        {
+            run_halfspec_bf16_d128_causal_sm120(params, launch_params, stream);
+            return;
+        }
     }
 
     bool forceUnroll = useForceUnroll(params, launch_params);

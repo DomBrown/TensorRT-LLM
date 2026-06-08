@@ -313,6 +313,21 @@ def generate_fmha_cu(project_dir, venv_python):
         move_if_updated(cu_file, dst_file)
         generated_files.add(str(dst_file.resolve()))
 
+    # The halfspec sm_120/sm_121 warp-specialized FMHA TU is not (yet) emitted
+    # by fmha_v2/setup.py; it lives tracked under src/ and must be placed in the
+    # generated dir so the _context_attention_kernels_120 target picks it up.
+    # Copy (not move) so the tracked source is preserved, and register it in
+    # generated_files so the cleanup loop below does not delete it.
+    halfspec_src = fmha_v2_dir / "src/halfspec_smoke.cu"
+    if halfspec_src.exists():
+        halfspec_dst = fmha_v2_cu_dir / "halfspec_smoke_sm120.cu"
+        new_content = halfspec_src.read_bytes()
+        old_content = halfspec_dst.read_bytes() if halfspec_dst.exists(
+        ) else None
+        if old_content != new_content:
+            shutil.copyfile(halfspec_src, halfspec_dst)
+        generated_files.add(str(halfspec_dst.resolve()))
+
     # Remove extra files
     for root, _, files in os.walk(fmha_v2_cu_dir):
         for file in files:

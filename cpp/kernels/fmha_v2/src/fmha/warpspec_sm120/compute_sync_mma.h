@@ -42,7 +42,7 @@
 #include <fmha/softmax.h>
 #include <fmha/utils.h>
 #include <fmha/warpspec/circular_buffer.h>
-#include <fused_multihead_attention_kernel.h>  // Single_cta, Block_info_padded
+#include <fused_multihead_attention_kernel.h> // Single_cta, Block_info_padded
 
 namespace fmha
 {
@@ -82,18 +82,22 @@ struct Compute
     {
         STEP_Q = Kernel_traits::STEP_Q
     };
+
     enum
     {
         STEP_KV = Kernel_traits::STEP_KV
     };
+
     enum
     {
         CAUSAL_MASK = Kernel_traits::CAUSAL_MASK
     };
+
     enum
     {
         ENABLE_SKIP_SOFTMAX = Kernel_traits::ENABLE_SKIP_SOFTMAX
     };
+
     enum
     {
         CHECK_NEG_INF = Kernel_traits::SLIDING_WINDOW_ATTENTION || Kernel_traits::CUSTOM_MASK
@@ -109,10 +113,9 @@ struct Compute
         // Block / head / batch indexing -- same as noloop_tiled.h.
         int const bidb = blockIdx.z;
         int const bidh = blockIdx.y;
-        int const q_loop = blockIdx.x;  // 1 CTA per (B, H, Q-tile)
+        int const q_loop = blockIdx.x; // 1 CTA per (B, H, Q-tile)
 
-        fused_multihead_attention::Single_cta<Kernel_traits::VERSION> const binfo(
-            params, bidb, bidh, 0, tidx);
+        fused_multihead_attention::Single_cta<Kernel_traits::VERSION> const binfo(params, bidb, bidh, 0, tidx);
 
         int const q_sequence_start = q_loop * STEP_Q + (binfo.actual_kv_seqlen - binfo.actual_q_seqlen);
         if (binfo.stop_early(q_loop * STEP_Q))
@@ -174,11 +177,21 @@ struct Compute
             ? __logf(params.skip_softmax_threshold_scale_factor / static_cast<float>(binfo.actual_kv_seqlen))
             : 0.0f;
 
-        int const valid_seqlen = CAUSAL_MASK ? min(q_sequence_start + Cta_tile_p::M, binfo.actual_kv_seqlen)
-                                             : binfo.actual_kv_seqlen;
+        int const valid_seqlen
+            = CAUSAL_MASK ? min(q_sequence_start + Cta_tile_p::M, binfo.actual_kv_seqlen) : binfo.actual_kv_seqlen;
         int const kv_loop_start = 0;
         int const kv_loop_end = fmha::div_up(valid_seqlen, int(Cta_tile_p::N)) * int(Cta_tile_p::N);
         int const kv_mask_loop_start = int(q_sequence_start / Cta_tile_p::N) * Cta_tile_p::N;
+
+#ifdef SKIP_SOFTMAX_STAT
+        // Skip-softmax block counters (compiled only in a -DSKIP_SOFTMAX_STAT
+        // build). tile_negligible is per-warp and uniform within a warp, so
+        // every thread keeps an identical local tally; only the elected thread
+        // (tidx == 0) flushes to global below, reporting the elected consumer
+        // warp's rate as the CTA proxy (same convention as noloop_tiled.h).
+        [[maybe_unused]] uint32_t skip_softmax_total = 0;
+        [[maybe_unused]] uint32_t skip_softmax_skipped = 0;
+#endif
 
         // ----- KV loop ------------------------------------------------------
         for (int kv_loop = kv_loop_start; kv_loop < kv_loop_end; kv_loop += Cta_tile_p::N)
@@ -270,6 +283,9 @@ struct Compute
                 // Per-warp skip-softmax vote (this branch's contribution).
                 if constexpr (ENABLE_SKIP_SOFTMAX)
                 {
+#ifdef SKIP_SOFTMAX_STAT
+                    ++skip_softmax_total;
+#endif
                     bool skip = ((global_max[0] - tmp[0]) < skip_softmax_log_threshold);
 #pragma unroll
                     for (int i = 1; i < Softmax::ROWS_PER_THREAD; i++)
@@ -279,6 +295,9 @@ struct Compute
                     tile_negligible = __all_sync(0xffffffffu, skip);
                     if (tile_negligible)
                     {
+#ifdef SKIP_SOFTMAX_STAT
+                        ++skip_softmax_skipped;
+#endif
 #pragma unroll
                         for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
                         {
@@ -338,7 +357,7 @@ struct Compute
 #pragma unroll
                         for (int ki = 0; ki < Mma_tile_v::MMAS_K; ++ki)
                         {
-                            int const p_ki = kvc * Mma_tile_v::MMAS_K + ki;  // global frag_p k-step
+                            int const p_ki = kvc * Mma_tile_v::MMAS_K + ki; // global frag_p k-step
                             smem_v.load(frag_v[ki], ki);
 #pragma unroll
                             for (int ni = 0; ni < Mma_tile_v::VALID_MMAS_N; ++ni)
@@ -358,6 +377,22 @@ struct Compute
                 }
             }
         }
+
+#ifdef SKIP_SOFTMAX_STAT
+        // Flush this CTA's skip tally to the global counters. Only the elected
+        // thread (tidx == 0 of the consumer group) writes, so we record the
+        // first consumer warp's tally as the CTA proxy (noloop_tiled.h does the
+        // same). trtllm.py reads + prints skipped/total per layer when
+        // TRTLLM_PRINT_SKIP_SOFTMAX_STAT=1.
+        if constexpr (ENABLE_SKIP_SOFTMAX)
+        {
+            if (tidx == 0 && params.skip_softmax_total_blocks != nullptr)
+            {
+                atomicAdd(params.skip_softmax_total_blocks, skip_softmax_total);
+                atomicAdd(params.skip_softmax_skipped_blocks, skip_softmax_skipped);
+            }
+        }
+#endif
 
         // ---- Epilogue: normalize acc_o by global_sum, store O ----
         // Ported from noloop_tiled.h, with two halfspec adaptations:
