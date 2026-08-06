@@ -540,7 +540,9 @@ class CUDAGraphRunner:
         graph_output = make_weak_ref(output)
         self.graph_outputs[key] = graph_output
         self.memory_pool = graph.pool()
-        return graph_output
+        # Keep the capture-time storage alive in the caller through the
+        # immediate first replay without retaining one output per graph key.
+        return output
 
     def replay(self, key: KeyType,
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
@@ -1222,7 +1224,9 @@ class EncoderCUDAGraphRunner:
         graph_output = make_weak_ref(output)
         self.graph_outputs[key] = graph_output
         self.memory_pool = graph.pool()
-        return graph_output
+        # Keep the capture-time storage alive in the caller through the
+        # immediate first replay without retaining one output per graph key.
+        return output
 
     def replay(
         self,
