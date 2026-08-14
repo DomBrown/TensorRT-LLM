@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -24,8 +25,11 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
+#include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -37,6 +41,40 @@ using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodTy
 using MoeRunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::computeSelectedTileN;
 
+//! Owns workspace arenas whose addresses are embedded in captured MoE graphs.
+//!
+//! CUDA graph captures on one stream share arenas when capacity permits. A
+//! larger request adds an arena instead of replacing an existing one because
+//! an earlier graph may still reference the old address.
+class CapturedMoeWorkspaceCache
+{
+public:
+    //! Return a stable arena with at least workspaceSize bytes.
+    at::Tensor get(int device, cudaStream_t stream, int64_t workspaceSize)
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto const key = std::make_pair(device, stream);
+        auto& workspaces = mWorkspaces[key];
+        for (auto const& workspace : workspaces)
+        {
+            if (workspace.numel() >= workspaceSize)
+            {
+                return workspace;
+            }
+        }
+
+        auto const options = at::TensorOptions().device(at::Device(at::kCUDA, device)).dtype(at::ScalarType::Char);
+        workspaces.push_back(at::empty({workspaceSize}, options));
+        return workspaces.back();
+    }
+
+private:
+    using Key = std::pair<int, cudaStream_t>;
+
+    std::mutex mMutex;
+    std::map<Key, std::vector<at::Tensor>> mWorkspaces;
+};
+
 at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logits,
     std::optional<at::Tensor> const& routing_bias, at::Tensor const& hidden_states,
     at::Tensor const& hidden_states_scale, at::Tensor const& gemm1_weights, at::Tensor const& gemm1_weights_scale,
@@ -44,8 +82,8 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     int64_t const top_k, std::optional<int64_t> const num_fused_shared_experts, std::optional<int64_t> const n_group,
     std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
     int64_t const local_num_experts, std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
-    int64_t const routing_method_type, MoeRunnerType& moe_runner, int64_t moeConfigIndex,
-    std::optional<at::Tensor> const& topk_weights, std::optional<at::Tensor> const& topk_ids,
+    int64_t const routing_method_type, MoeRunnerType& moe_runner, CapturedMoeWorkspaceCache& workspaceCache,
+    int64_t moeConfigIndex, std::optional<at::Tensor> const& topk_weights, std::optional<at::Tensor> const& topk_ids,
     std::optional<double> const& gemm1_clamp_limit = std::nullopt,
     std::optional<at::Tensor> const& out_tensor = std::nullopt)
 {
@@ -197,15 +235,13 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
         args.has_gemm1_clamp_limit_value = true;
     }
 
-    // allocate workspace for routing kernel
+    // Compute workspace requirements.
     if (routing_logits.has_value() && topk_ids.has_value())
     {
         TORCH_CHECK(routing_logits.value().device() == topk_ids.value().device(),
             "routing_logits and topk_ids must be on the same device");
     }
     auto routing_device = routing_logits.has_value() ? routing_logits.value().device() : topk_ids.value().device();
-    at::Tensor num_tokens_per_expert
-        = at::detail::empty_cuda({num_experts}, at::ScalarType::Int, routing_device, std::nullopt);
     int32_t max_num_padded_tokens
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxPermutedPaddedCount(
             args.num_tokens, total_experts_per_token, num_total_experts, tile_tokens_dim);
@@ -215,12 +251,6 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     int32_t max_num_padded_tokens_gemm2
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
             max_num_padded_tokens, args.hidden_size, btg::dtypeGetNumBits(args.mDtypeOut));
-    at::Tensor total_num_padded_tokens
-        = at::empty({}, at::TensorOptions().device(routing_device).dtype(at::ScalarType::Int));
-    at::Tensor expanded_idx_to_permuted_idx = at::detail::empty_cuda(
-        {args.num_tokens * total_experts_per_token}, at::ScalarType::Int, routing_device, std::nullopt);
-    at::Tensor permuted_idx_to_token_idx
-        = at::detail::empty_cuda({max_num_padded_tokens}, at::ScalarType::Int, routing_device, std::nullopt);
     // expert_weights is the routing kernel's topk-weights output and is consumed by moe_finalize,
     // which requires `dtype == scale_dtype` against gemm2_output. Track args.mDtypeOut so the two
     // buffers stay in lock-step automatically; do NOT tie this to the bias dtype, which is allowed
@@ -238,55 +268,105 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
                 ". Expected Bfloat16/Fp16/Fp32.");
         }
     }();
-    at::Tensor expert_weights = at::detail::empty_cuda(
-        {args.num_tokens, total_experts_per_token}, expert_weights_scalar_type, routing_device, std::nullopt);
-    at::Tensor expert_indexes = at::detail::empty_cuda(
-        {args.num_tokens, total_experts_per_token}, at::ScalarType::Int, routing_device, std::nullopt);
     // Size for both histogram halves [counts | offsets] over the fused expert set
     // (num_experts + num_fused_shared_experts); the large-#tokens offsets kernel indexes
     // up to 2 * num_total_experts. num_tokens_per_expert stays at num_experts (unused by routing).
     int64_t const size_of_expert_count_histogram = std::max(num_total_experts * 2, int64_t(256 * 2));
-    at::Tensor expert_count_histogram
-        = at::detail::empty_cuda({size_of_expert_count_histogram}, at::ScalarType::Int, routing_device, std::nullopt);
-
-    // allocate workspace for activation/gemm/finalize kernels
-    at::Tensor gemm1_output = at::detail::empty_cuda({max_num_padded_tokens_gemm1, 2 * intermediate_size},
-        at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
-    at::Tensor gemm1_output_scale = at::detail::empty_cuda({2 * intermediate_size / 128, max_num_padded_tokens_gemm1},
-        at::ScalarType::Float, routing_device, std::nullopt);
-    at::Tensor activation_output = at::detail::empty_cuda(
-        {max_num_padded_tokens_gemm1, intermediate_size}, at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
-    at::Tensor activation_output_scale = at::detail::empty_cuda(
-        {intermediate_size / 128, max_num_padded_tokens_gemm1}, at::ScalarType::Float, routing_device, std::nullopt);
-    at::Tensor gemm2_output = at::detail::empty_cuda(
-        {max_num_padded_tokens_gemm2, args.hidden_size}, at::ScalarType::BFloat16, routing_device, std::nullopt);
 
     int32_t max_num_ctas = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxNumCtasInBatchDim(
         args.num_tokens, total_experts_per_token, num_total_experts, tile_tokens_dim);
-    at::Tensor cta_idx_xy_to_batch_idx
-        = at::detail::empty_cuda({max_num_ctas}, at::ScalarType::Int, routing_device, std::nullopt);
-    at::Tensor cta_idx_xy_to_mn_limit
-        = at::detail::empty_cuda({max_num_ctas}, at::ScalarType::Int, routing_device, std::nullopt);
-    at::Tensor num_non_exiting_ctas
-        = at::empty({}, at::TensorOptions().device(routing_device).dtype(at::ScalarType::Int));
 
-    // Set the optional pointer to the expert weights and expert ids
-    void* expert_weights_ptr = args.topk_weights ? args.topk_weights : expert_weights.data_ptr();
+    // Allocate or use provided output.
+    at::Tensor output;
+    if (out_tensor.has_value())
+    {
+        TORCH_CHECK(out_tensor->scalar_type() == at::ScalarType::BFloat16, "out_tensor must be bfloat16.");
+        TORCH_CHECK(out_tensor->dim() == 2, "out_tensor must be 2D.");
+        TORCH_CHECK(out_tensor->sizes()[0] == args.num_tokens && out_tensor->sizes()[1] == args.hidden_size,
+            "out_tensor has incorrect shape.");
+        TORCH_CHECK(out_tensor->device() == hidden_states.device(), "out_tensor must be on the same device as inputs.");
+        output = out_tensor.value();
+    }
+    else
+    {
+        output = at::detail::empty_cuda(
+            {args.num_tokens, args.hidden_size}, at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
+    }
+    args.output = output.data_ptr();
+    args.output_scale = nullptr;
 
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::Runner routing_runner(tile_tokens_dim);
     auto const& stream = at::cuda::getCurrentCUDAStream(
         routing_logits.has_value() ? routing_logits.value().get_device() : topk_ids.value().get_device());
+    auto const bmm_workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args, moeConfigIndex);
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    TLLM_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    std::vector<size_t> const workspace_sizes{
+        static_cast<size_t>(num_experts) * sizeof(int32_t),
+        sizeof(int32_t),
+        static_cast<size_t>(args.num_tokens * total_experts_per_token) * sizeof(int32_t),
+        static_cast<size_t>(max_num_padded_tokens) * sizeof(int32_t),
+        static_cast<size_t>(args.num_tokens * total_experts_per_token) * c10::elementSize(expert_weights_scalar_type),
+        static_cast<size_t>(args.num_tokens * total_experts_per_token) * sizeof(int32_t),
+        static_cast<size_t>(size_of_expert_count_histogram) * sizeof(int32_t),
+        static_cast<size_t>(max_num_padded_tokens_gemm1 * 2 * intermediate_size),
+        static_cast<size_t>(2 * intermediate_size / 128 * max_num_padded_tokens_gemm1) * sizeof(float),
+        static_cast<size_t>(max_num_padded_tokens_gemm1 * intermediate_size),
+        static_cast<size_t>(intermediate_size / 128 * max_num_padded_tokens_gemm1) * sizeof(float),
+        static_cast<size_t>(max_num_padded_tokens_gemm2 * args.hidden_size) * sizeof(c10::BFloat16),
+        static_cast<size_t>(max_num_ctas) * sizeof(int32_t),
+        static_cast<size_t>(max_num_ctas) * sizeof(int32_t),
+        sizeof(int32_t),
+        static_cast<size_t>(std::get<0>(bmm_workspace_sizes)),
+        static_cast<size_t>(std::get<1>(bmm_workspace_sizes)),
+    };
+    auto const total_workspace_size
+        = common::calculateTotalWorkspaceSize(workspace_sizes.data(), workspace_sizes.size());
+    at::Tensor workspace_storage;
+    if (capture_status == cudaStreamCaptureStatusNone)
+    {
+        workspace_storage = at::empty({static_cast<int64_t>(total_workspace_size)},
+            at::TensorOptions().device(routing_device).dtype(at::ScalarType::Char));
+    }
+    else
+    {
+        workspace_storage
+            = workspaceCache.get(hidden_states.get_device(), stream, static_cast<int64_t>(total_workspace_size));
+    }
+
+    size_t workspace_offset{0};
+    auto* workspace_base = workspace_storage.data_ptr<int8_t>();
+    auto next_workspace_ptr = [&](size_t index)
+    { return common::nextWorkspacePtr(workspace_base, workspace_offset, workspace_sizes[index]); };
+    auto* num_tokens_per_expert_ptr = reinterpret_cast<int32_t*>(next_workspace_ptr(0));
+    auto* total_num_padded_tokens_ptr = reinterpret_cast<int32_t*>(next_workspace_ptr(1));
+    auto* expanded_idx_to_permuted_idx_ptr = reinterpret_cast<int32_t*>(next_workspace_ptr(2));
+    auto* permuted_idx_to_token_idx_ptr = reinterpret_cast<int32_t*>(next_workspace_ptr(3));
+    void* expert_weights_buffer_ptr = next_workspace_ptr(4);
+    auto* expert_indexes_ptr = reinterpret_cast<int32_t*>(next_workspace_ptr(5));
+    auto* expert_count_histogram_ptr = reinterpret_cast<int32_t*>(next_workspace_ptr(6));
+    void* gemm1_output_ptr = next_workspace_ptr(7);
+    auto* gemm1_output_scale_ptr = reinterpret_cast<float*>(next_workspace_ptr(8));
+    void* activation_output_ptr = next_workspace_ptr(9);
+    auto* activation_output_scale_ptr = reinterpret_cast<float*>(next_workspace_ptr(10));
+    void* gemm2_output_ptr = next_workspace_ptr(11);
+    auto* cta_idx_xy_to_batch_idx_ptr = reinterpret_cast<int32_t*>(next_workspace_ptr(12));
+    auto* cta_idx_xy_to_mn_limit_ptr = reinterpret_cast<int32_t*>(next_workspace_ptr(13));
+    auto* num_non_exiting_ctas_ptr = reinterpret_cast<int32_t*>(next_workspace_ptr(14));
+    void* workspace_fc1_ptr = next_workspace_ptr(15);
+    void* workspace_fc2_ptr = next_workspace_ptr(16);
+
+    // Set the optional pointer to the expert weights and expert ids.
+    void* expert_weights_ptr = args.topk_weights ? args.topk_weights : expert_weights_buffer_ptr;
     auto const dtypeRoutingLogits = routing_logits.has_value()
         ? (routing_logits.value().scalar_type() == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16)
         : btg::Dtype::Bfloat16;
     routing_runner.run(args.routing_logits, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
         args.num_fused_shared_experts, args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts,
-        args.routed_scaling_factor, expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(),
-        total_num_padded_tokens.data_ptr<int>(), expanded_idx_to_permuted_idx.data_ptr<int>(),
-        nullptr /*permuted_idx_to_expanded_idx.data_ptr<int>()*/, permuted_idx_to_token_idx.data_ptr<int>(),
-        expert_weights_ptr, args.topk_ids, num_tokens_per_expert.data_ptr<int>(),
-        cta_idx_xy_to_batch_idx.data_ptr<int>(), cta_idx_xy_to_mn_limit.data_ptr<int>(),
-        num_non_exiting_ctas.data_ptr<int>(), args.mDtypeElt, false, true,
+        args.routed_scaling_factor, expert_indexes_ptr, expert_count_histogram_ptr, total_num_padded_tokens_ptr,
+        expanded_idx_to_permuted_idx_ptr, nullptr /*permuted_idx_to_expanded_idx*/, permuted_idx_to_token_idx_ptr,
+        expert_weights_ptr, args.topk_ids, num_tokens_per_expert_ptr, cta_idx_xy_to_batch_idx_ptr,
+        cta_idx_xy_to_mn_limit_ptr, num_non_exiting_ctas_ptr, args.mDtypeElt, false, true,
         static_cast<RoutingMethodType>(routing_method_type), stream, dtypeRoutingLogits, args.mDtypeBias);
 
     // MoE kernel except routing
@@ -321,59 +401,33 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     TORCH_CHECK(gemm2_weights_scale.sizes()[1] == args.hidden_size / 128, "gemm2_weights_scale has incorrect shape.");
     TORCH_CHECK(gemm2_weights_scale.sizes()[2] == intermediate_size / 128, "gemm2_weights_scale has incorrect shape.");
 
-    // allocate or use provided output
-    at::Tensor output;
-    if (out_tensor.has_value())
-    {
-        TORCH_CHECK(out_tensor->scalar_type() == at::ScalarType::BFloat16, "out_tensor must be bfloat16.");
-        TORCH_CHECK(out_tensor->dim() == 2, "out_tensor must be 2D.");
-        TORCH_CHECK(out_tensor->sizes()[0] == args.num_tokens && out_tensor->sizes()[1] == args.hidden_size,
-            "out_tensor has incorrect shape.");
-        TORCH_CHECK(out_tensor->device() == hidden_states.device(), "out_tensor must be on the same device as inputs.");
-        output = out_tensor.value();
-    }
-    else
-    {
-        output = at::detail::empty_cuda(
-            {args.num_tokens, args.hidden_size}, at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
-    }
-
     // setup workspace
-    workspace.total_num_padded_tokens = total_num_padded_tokens.data_ptr<int>();
+    workspace.total_num_padded_tokens = total_num_padded_tokens_ptr;
     workspace.total_max_padded_tokens = std::max(max_num_padded_tokens_gemm1, max_num_padded_tokens_gemm2);
-    workspace.routing_expert_indexes = expert_indexes.data_ptr<int>();
-    workspace.permuted_idx_size = total_num_padded_tokens.data_ptr<int>();
-    workspace.expanded_idx_to_permuted_idx
-        = expanded_idx_to_permuted_idx.data_ptr<int>(); // Needed by activation/finalize kernels
-    workspace.permuted_idx_to_token_idx = permuted_idx_to_token_idx.data_ptr<int>(); // Needed by permuteGemm1 kernel
-    workspace.expert_weights = expert_weights_ptr;                                   // Consumed by finalize kernel
+    workspace.routing_expert_indexes = expert_indexes_ptr;
+    workspace.permuted_idx_size = total_num_padded_tokens_ptr;
+    workspace.expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx_ptr; // Needed by activation/finalize kernels
+    workspace.permuted_idx_to_token_idx = permuted_idx_to_token_idx_ptr;       // Needed by permuteGemm1 kernel
+    workspace.expert_weights = expert_weights_ptr;                             // Consumed by finalize kernel
 
-    workspace.cta_idx_xy_to_batch_idx = cta_idx_xy_to_batch_idx.data_ptr<int>();
-    workspace.cta_idx_xy_to_mn_limit = cta_idx_xy_to_mn_limit.data_ptr<int>();
-    workspace.num_non_exiting_ctas = num_non_exiting_ctas.data_ptr<int>();
+    workspace.cta_idx_xy_to_batch_idx = cta_idx_xy_to_batch_idx_ptr;
+    workspace.cta_idx_xy_to_mn_limit = cta_idx_xy_to_mn_limit_ptr;
+    workspace.num_non_exiting_ctas = num_non_exiting_ctas_ptr;
 
     // gemm1 intermediate ws
-    workspace.gemm1_output = gemm1_output.data_ptr();
-    workspace.gemm1_output_scale = gemm1_output_scale.data_ptr<float>();
+    workspace.gemm1_output = gemm1_output_ptr;
+    workspace.gemm1_output_scale = gemm1_output_scale_ptr;
     // activation intermediate ws
-    workspace.activation_output = activation_output.data_ptr();
-    workspace.activation_output_scale = activation_output_scale.data_ptr<float>();
+    workspace.activation_output = activation_output_ptr;
+    workspace.activation_output_scale = activation_output_scale_ptr;
     // gemm2 intermediate ws
-    workspace.gemm2_output = gemm2_output.data_ptr();
+    workspace.gemm2_output = gemm2_output_ptr;
     workspace.gemm2_output_scale = nullptr;
-    args.output = output.data_ptr();
-    args.output_scale = nullptr;
 
-    auto workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args, moeConfigIndex);
-    at::Tensor workspace_fc1 = at::detail::empty_cuda(
-        {std::get<0>(workspace_sizes)}, at::ScalarType::Char, hidden_states.device(), std::nullopt);
-    at::Tensor workspace_fc2 = at::detail::empty_cuda(
-        {std::get<1>(workspace_sizes)}, at::ScalarType::Char, hidden_states.device(), std::nullopt);
-    workspace.bmm1_workspace = workspace_fc1.data_ptr();
-    workspace.bmm2_workspace = workspace_fc2.data_ptr();
+    workspace.bmm1_workspace = workspace_fc1_ptr;
+    workspace.bmm2_workspace = workspace_fc2_ptr;
 
-    auto const& moe_stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
-    moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex);
+    moe_runner.run(args, workspace, hidden_states.get_device(), stream, moeConfigIndex);
     return output;
 }
 
@@ -509,7 +563,8 @@ public:
         return run_fp8_block_scale_moe(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
             gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, num_experts, top_k, num_fused_shared_experts,
             n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor,
-            tileN, routing_method_type, *mRunners.at(tileN), config, topk_weights, topk_ids, gemm1_clamp_limit, output);
+            tileN, routing_method_type, *mRunners.at(tileN), mCapturedWorkspaceCache, config, topk_weights, topk_ids,
+            gemm1_clamp_limit, output);
     }
 
 private:
@@ -517,6 +572,7 @@ private:
 
     std::vector<int32_t> const mSupportedTileN;
     std::unordered_map<int32_t, std::unique_ptr<RunnerType>> mRunners;
+    CapturedMoeWorkspaceCache mCapturedWorkspaceCache;
 
     btg::Dtype mDtypeElt{btg::Dtype::E4m3}; // FP8 runner so hard-coded
     bool mUseDeepSeekFp8{true};             // Always true for BlockScaleMoe
