@@ -423,3 +423,61 @@ The complete oracle passed again at KL 0.006259 and 99.541% non-tie
 top-1. Short and long serving continuations passed the near-tie rule
 through concurrency 128. The long cases used ISL 1,024 and 4,096 with
 OSL 128.
+
+The CUTLASS build's serving run at ISL and OSL 1,024 produced 447.3,
+2,031.3, 4,032.0 and 8,272.6 tokens/s at concurrency 1, 8, 32 and 128.
+The GDN cache-hint experiment changed the 128-request recurrent kernel
+from 120.6 to 120.1 µs. Some two-warp variants changed the FP32 state.
+The 4-warp kernel keeps its existing cache hints.
+
+## Standalone arithmetic on long prompts
+
+I recorded six independent natural chat prompts from the standalone
+engine, with two prompts each at ISL 128, 1,024 and 4,096 and OSL 128.
+Scoring sampled every 32nd prompt position and every output position.
+The tiled BF16 gate revision gave mean KL 0.042307 against that
+standalone run, 998/1,010 non-tie top-1 matches, and one disallowed
+greedy difference. The official 32-case oracle still passed.
+
+Tracing the first two layers localized the difference to the prefill
+projection shape. The target now uses the standalone cuBLAS shape for
+the GDN gates and the 256 routed expert logits and computes the shared
+gate separately. Adjacent prompts of the same length can use a single
+strided cuBLAS batch when they are at least 1,024 rows and aligned to
+128. The tested aligned shapes from 1,024 to 4,224 produced bitwise
+identical BF16 values to the separate projections. Shorter prompts
+retain their own shapes.
+
+With eight 1,024-token prompts, batched GDN and router projections
+took 7.4 and 10.6 µs in isolation, versus 42.9 and 47.2 µs for the
+separate launches. The operation test compares the batched results to
+each prompt's individual BF16 projection.
+
+The restored arithmetic matched all 1,096 sampled score distributions
+from the standalone run, with KL 0 and all 1,010 non-tie top-1 matches.
+Five continuations matched exactly. The sixth diverged at a
+0.125-nat near tie. All 32 development items and the 36 focused tests
+also passed.
+
+| ISL | OSL | V2 cuBLAS prefill TTFT (ms) | V2 TPOT (ms) | V2 decode (tokens/s) |
+| ---: | ---: | ---: | ---: |
+| 128 | 1,024 | 10.03 | 1.137 | 879.9 |
+| 1,024 | 1,024 | 19.96 | 1.101 | 908.0 |
+| 4,096 | 1,024 | 45.04 | 1.166 | 857.5 |
+
+For mixed scheduler steps with up to eight decode rows, the attention
+output projection now uses the same MXFP8 kernel as the decode-only
+path for that suffix. The context rows retain their prefill projection.
+A cutoff of 16 also changed the pure 9–16 row path and introduced
+disallowed greedy differences. With the eight-row cutoff, the short
+greedy checks passed at every concurrency from 1 to 128 in the serving
+sweep, and the six long prompts passed at concurrency 1, 8, 32 and 128.
+The concurrency-8 long test passed on a second run.
+
+The mixed-batch version also passed the 32-item development oracle at
+KL 0.006259 and 99.541% non-tie top-1. The standalone comparison used the
+reference top 20 and one bin for remaining probability mass. Its
+1,096 sampled distributions still gave KL 0 and 1,010/1,010 non-tie
+top-1 matches. At ISL 128, 1,024 and 4,096 with OSL 1,024, external
+batch-one TTFT was 10.66, 20.44 and 45.48 ms. Decode throughput was
+880.5, 910.6 and 856.8 tokens/s.

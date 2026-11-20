@@ -157,9 +157,13 @@ def test_dense_projection(cell, certifying) -> None:
     mx = mx_decode.swizzle(scales, columns, width, row_group=128)
     packed = dg_prefill.encode(scales, columns, width, row_group=128)
     weight = DenseWeight(w, scales, mx, packed)
-    actual = dense_projection(x, weight)
-    expected = dense_projection.reference(x, weight)
+    decode_rows = cell.spec.get("decode_rows", 0)
+    actual = dense_projection(x, weight, decode_rows)
+    expected = dense_projection.reference(x, weight, decode_rows)
     assert_within_ulp(actual, expected, element_ulp=2, rms_ulp=0.5)
+    if decode_rows:
+        solo = dense_projection(tuple(t[-decode_rows:] for t in x), weight, decode_rows)
+        torch.testing.assert_close(actual[-decode_rows:], solo, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("cell", routed_experts.CELLS, ids=lambda cell: cell.why)
@@ -315,14 +319,12 @@ def test_rowwise_projection(cell, certifying) -> None:
 def test_context_projection(cell, certifying) -> None:
     _begin()
     certifying(context_projection)
-    rows, columns = (cell.spec[name] for name in ("rows", "columns"))
-    hidden = _rand((rows, 2048), 0.4)
+    length, batch, columns = (cell.spec[name] for name in ("length", "batch", "columns"))
+    hidden = _rand((batch * length, 2048), 0.4)
     weight = _rand((columns, 2048), 0.1)
-    packed = context_projection(hidden, weight)
-    separate = context_projection(hidden[-128:], weight)
-    torch.testing.assert_close(packed[-128:], separate, rtol=0, atol=0)
-    expected = context_projection.reference(hidden, weight)
-    assert_within_ulp(packed, expected, element_ulp=2, rms_ulp=0.5)
+    packed = context_projection(hidden, weight, length)
+    expected = context_projection.reference(hidden, weight, length)
+    torch.testing.assert_close(packed, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("cell", accept_convolution.CELLS, ids=lambda cell: cell.why)

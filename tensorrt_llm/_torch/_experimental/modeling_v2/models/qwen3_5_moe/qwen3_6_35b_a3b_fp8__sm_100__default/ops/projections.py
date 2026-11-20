@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import triton as tr
 
 from .....catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
-from ..kernels import bf16, dg_prefill, fp8, mx_decode, prefill_moe, prefill_tc, tc_decode
+from ..kernels import dg_prefill, fp8, mx_decode, prefill_moe, prefill_tc, tc_decode
 from ..weights import DenseWeight, LayerWeights
 
 Activation = tuple[torch.Tensor, ...]
@@ -41,39 +41,47 @@ class RowwiseProjection(OpWrapper):
 rowwise_projection = RowwiseProjection()
 
 
-class ContextProjection(RowwiseProjection):
-    """Tile long prefill projections with fixed BF16 accumulation order."""
+class ContextProjection(OpWrapper):
+    """Project equal-length prompts as a strided batch with shared weights."""
 
+    ARCHS = frozenset({Arch.SM_100})
     CELLS = (
-        Cell("two long DeltaNet prompt chunks", {"rows": 256, "columns": 64}),
-        Cell("unaligned long router batch", {"rows": 411, "columns": 257}),
+        Cell(
+            "one short prompt preserves its standalone shape",
+            {"length": 128, "batch": 1, "columns": 257},
+        ),
+        Cell("two 1024-row DeltaNet prompts", {"length": 1024, "batch": 2, "columns": 64}),
+        Cell("three 4096-row router prompts", {"length": 4096, "batch": 3, "columns": 256}),
     )
 
     def __call__(
-        self, hidden: torch.Tensor, weight: torch.Tensor, pdl: bool = False
+        self, hidden: torch.Tensor, weight: torch.Tensor, prompt_length: int
     ) -> torch.Tensor:
-        del pdl
-        rows, width = hidden.shape
-        columns = weight.shape[0]
-        tile = 16
-        out = hidden.new_empty((rows, columns))
-        bf16.project[(tr.cdiv(rows, tile), tr.cdiv(columns, tile))](
-            hidden, weight, out, rows, columns, width, tile, tile, 128, num_warps=4
-        )
-        return out
+        count = hidden.shape[0] // prompt_length
+        if count == 1:
+            return F.linear(hidden, weight)
+        inputs = hidden.view(count, prompt_length, hidden.shape[1])
+        weights = weight.T.expand(count, -1, -1)
+        return torch.bmm(inputs, weights).flatten(0, 1)
+
+    def reference(
+        self, hidden: torch.Tensor, weight: torch.Tensor, prompt_length: int
+    ) -> torch.Tensor:
+        """Project each prompt separately with the original BF16 rounding."""
+        return torch.cat([F.linear(rows, weight) for rows in hidden.split(prompt_length)])
 
 
 context_projection = ContextProjection()
 
 
-def _context_spans(starts: tuple[int, ...]) -> list[tuple[int, int, bool]]:
-    """Coalesce neighboring long prompts for one tiled projection."""
+def _context_spans(starts: tuple[int, ...]) -> list[tuple[int, int, int]]:
+    """Group equal-length whole prompts with the same cuBLAS accumulation."""
     spans = []
     for start, end in zip(starts, starts[1:]):
-        tiled = end - start >= 128
-        if tiled and spans and spans[-1][2]:
+        length = end - start
+        if length >= 1024 and length % 128 == 0 and spans and spans[-1][2] == length:
             start, _, _ = spans.pop()
-        spans.append((start, end, tiled))
+        spans.append((start, end, length))
     return spans
 
 
@@ -85,8 +93,8 @@ def packed_delta_gates(
     if not context_rows:
         return rowwise_projection(hidden, weight)
     gates = [
-        context_projection(hidden[a:b], weight) if tiled else F.linear(hidden[a:b], weight)
-        for a, b, tiled in _context_spans(context_starts)
+        context_projection(hidden[a:b], weight, length)
+        for a, b, length in _context_spans(context_starts)
     ]
     if context_rows < hidden.shape[0]:
         gates.append(rowwise_projection(hidden[context_rows:], weight))
@@ -100,16 +108,37 @@ class DenseProjection(OpWrapper):
     CELLS = (
         Cell("MX low-latency GDN output", {"rows": 1, "columns": 2048, "width": 4096}),
         Cell("bundled DeepGEMM for prompt rows", {"rows": 63, "columns": 1024, "width": 2048}),
+        Cell(
+            "mixed prefill and MX decode output projection",
+            {"rows": 128, "columns": 2048, "width": 4096, "decode_rows": 8},
+        ),
     )
     note = "FlashInfer MX GEMM for up to eight rows, bundled DeepGEMM for larger matrices."
 
-    def __call__(self, activation: Activation, weight: DenseWeight) -> torch.Tensor:
-        if activation[0].shape[0] <= 8:
+    def __call__(
+        self, activation: Activation, weight: DenseWeight, decode_rows: int = 0
+    ) -> torch.Tensor:
+        rows = activation[0].shape[0]
+        if rows <= 8:
             return mx_decode.matmul(activation, weight.codes, weight.mx)
+        if 0 < decode_rows <= 8:
+            # Keep the small decode projection's accumulation when the batch
+            # also carries prompt rows on the same scheduler iteration.
+            context_rows = rows - decode_rows
+            decoded = mx_decode.matmul(
+                tuple(t[context_rows:] for t in activation[:2]), weight.codes, weight.mx
+            )
+            if context_rows:
+                context = self(tuple(t[:context_rows] for t in activation[:2]), weight)
+                return torch.cat((context, decoded))
+            return decoded
         return dg_prefill.project(activation, weight.codes, weight.deepgemm)
 
-    def reference(self, activation: Activation, weight: DenseWeight) -> torch.Tensor:
+    def reference(
+        self, activation: Activation, weight: DenseWeight, decode_rows: int = 0
+    ) -> torch.Tensor:
         """Multiply the expanded scaled operands in FP32."""
+        del decode_rows
         codes, scales = activation[:2]
         x = codes.float() * scales.repeat_interleave(128, dim=1)
         w = weight.codes.float() * weight.scales.repeat_interleave(128, 0).repeat_interleave(128, 1)
@@ -253,14 +282,14 @@ def route_experts(
     pdl: bool,
     *,
     decode: bool = False,
-    tiled: bool = False,
+    prompt_length: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
     """Return sorted top-eight per-token expert IDs, weights, and shared gates."""
     rows = hidden.shape[0]
-    split_gate = not (small or decode or tiled) and rows > 8
+    split_gate = not (small or decode) and rows > 8
     weight = router[:256] if split_gate else router
-    if tiled:
-        logits = context_projection(hidden, weight)
+    if prompt_length is not None:
+        logits = context_projection(hidden, weight, prompt_length)
     elif small or decode:
         logits = rowwise_projection(hidden, weight, pdl)
     else:
@@ -317,9 +346,10 @@ def route_packed(
         return route_experts(hidden, router, small, small, decode=True)
     spans = _context_spans(context_starts)
     if len(spans) == 1 and context_rows == hidden.shape[0]:
-        return route_experts(hidden, router, False, False, tiled=spans[0][2])
+        return route_experts(hidden, router, False, False, prompt_length=spans[0][2])
     routing = [
-        route_experts(hidden[a:b], router, False, False, tiled=tiled)[:3] for a, b, tiled in spans
+        route_experts(hidden[a:b], router, False, False, prompt_length=length)[:3]
+        for a, b, length in spans
     ]
     if context_rows < hidden.shape[0]:
         routing.append(route_experts(hidden[context_rows:], router, False, False, decode=True)[:3])

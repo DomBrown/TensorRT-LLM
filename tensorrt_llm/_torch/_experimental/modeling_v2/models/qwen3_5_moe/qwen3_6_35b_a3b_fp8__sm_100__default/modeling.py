@@ -286,7 +286,7 @@ class Qwen36Decoder(DecoderModel):
                     step.context_rows,
                     mx,
                 )
-            attention_output = dense_projection(attended, layer.proj)
+            attention_output = dense_projection(attended, layer.proj, rows - step.context_rows)
             residual, hidden, routed, shared = fp8.add_rms_quant(
                 residual,
                 attention_output,
