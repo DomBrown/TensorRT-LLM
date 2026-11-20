@@ -2899,7 +2899,12 @@ class DecoderInputPreparer:
             ),
         )
         if breakable_prefill and get_per_request_prefill_cuda_graph_flag():
-            graph_available = breakable_eligible
+            graph_available = breakable_eligible and (
+                virtual_num_tokens == total_num_tokens
+                or not getattr(
+                    breakable_runner.layer_model, "prefill_graph_requires_exact_rows", False
+                )
+            )
             if not (breakable_runner.is_capturing or breakable_runner.is_warming_up):
                 # An eager forward must receive the original token count. Warmup forwards run
                 # eagerly, except those that capture the bucket graph's break graphs.

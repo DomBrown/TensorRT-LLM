@@ -161,3 +161,32 @@ revision.
 | 128 | 1,024 | 62.38 | 1.213 | 824.2 |
 | 1,024 | 1,024 | 63.74 | 1.181 | 847.0 |
 | 4,096 | 1,024 | 65.24 | 1.286 | 777.4 |
+
+## Exact-size prefill graphs and draft argmax
+
+The batch-one generator captures the decoder body at powers of two from
+128 to 4,096 tokens with the runtime's breakable prefill CUDA graphs. It
+stages the current recurrent-state slot and KV page table at each replay.
+An executor capability check keeps the original row count for models that
+require an exact graph size. The scorer continues to use eager prefill.
+The draft shortlist also uses a tiled argmax from the reference's
+`kernels.py`, packing BF16 scores and 16-bit vocabulary indices into
+32-bit keys. It writes directly to the runtime's draft-token buffer.
+
+| ISL | OSL | V2 graph TTFT (ms) | V2 graph TPOT (ms) | V2 graph decode (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1,024 | 12.04 | 1.184 | 844.5 |
+| 1,024 | 1,024 | 22.04 | 1.152 | 868.0 |
+| 4,096 | 1,024 | 47.30 | 1.259 | 794.3 |
+
+The graph adapter took 46.69 s to report ready. An Nsight Systems trace
+of the preceding eager adapter showed about 69 ms between the first
+GPU prefill work and the first decode graph, with about 18 ms of prefill
+kernel work. The same trace showed approximately 1.0 ms per decode step
+in the small FP8 routed products and 0.37 ms in recurrent GDN.
+
+For the initial serial serving target, a token-level check retained the
+actual single-request decode top-two scores. All 32 prompts passed the
+near-tie rule at concurrency 8. At concurrency 32, two prompts diverged
+outside the rule at gaps of 0.75 and 0.50 nats. The first mismatch at
+0.50 occurred on the first generated token, implicating packed prefill.

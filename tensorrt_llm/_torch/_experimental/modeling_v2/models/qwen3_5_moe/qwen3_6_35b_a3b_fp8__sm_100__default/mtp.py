@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 from .kernels import fp8
 from .ops.attention import KvPages, full_attention
-from .ops.multi_token import draft_input
+from .ops.multi_token import draft_argmax, draft_input
 from .ops.projections import (
     RoutedWeights,
     dense_projection,
@@ -54,8 +54,7 @@ class DraftShortlist:
         return rows <= 8
 
     def sample(self, hidden: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
-        tokens = F.linear(hidden, self.weight).argmax(-1)
-        return tokens if out is None else out.copy_(tokens)
+        return draft_argmax(F.linear(hidden, self.weight), out)
 
 
 class Qwen36MtpLayer(nn.Module):

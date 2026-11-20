@@ -85,6 +85,15 @@ def route(
         raise NoTarget("the Qwen3.6 target supports beam width one without LoRA or disaggregation")
     if llm_args.attn_backend != "TRTLLM":
         raise NoTarget("the Qwen3.6 target expects TRTLLM scheduler attention metadata")
+    prefill_graph = llm_args.prefill_cuda_graph_backend.value
+    if prefill_graph != "disabled" and (
+        prefill_graph != "breakable"
+        or llm_args.max_batch_size != 1
+        or llm_args.enable_chunked_prefill
+    ):
+        raise NoTarget(
+            "Qwen3.6 prefill graphs require breakable CUDA graphs and unchunked batch one"
+        )
 
     from .qwen3_6_35b_a3b_fp8__sm_100__default.modeling import ModelingV2Qwen36Fp8Sm100
 

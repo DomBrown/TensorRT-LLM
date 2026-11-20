@@ -16,6 +16,7 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.context import is_in_breakable_cuda_graph
 
 from .... import disable_v2_by_default
 from .cache import Qwen36HybridCacheManager, VerifierLayerCache, clear_pending
@@ -42,6 +43,7 @@ from .weights import load_text_weights
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
     from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.speculative.interface import SpecMetadata
 
 
 class VocabularyHead(nn.Linear):
@@ -98,7 +100,7 @@ def make_step(metadata: AttentionMetadata, positions: torch.Tensor, rows: int) -
 class Qwen36Decoder(DecoderModel):
     """Decode packed text tokens using model-local SM100 operations."""
 
-    supports_prefill_cuda_graph = False
+    prefill_graph_requires_exact_rows = True
     mtp_layer_cls = Qwen36MtpLayer
 
     def __init__(self, model_config: ModelConfig) -> None:
@@ -113,6 +115,9 @@ class Qwen36Decoder(DecoderModel):
         self._cache_manager = None
         self._attention_views = {}
         self._state_views = {}
+        self._prefill_pages = {}
+        self._prefill_slot = None
+        self._prefill_fresh = None
 
     def _bind_pools(self, metadata: AttentionMetadata) -> None:
         manager = metadata.kv_cache_manager
@@ -131,6 +136,21 @@ class Qwen36Decoder(DecoderModel):
         self._state_views = state_views
         self._cache_manager = manager
 
+    def stage_prefill(self, metadata: AttentionMetadata) -> None:
+        """Stage mutable page and state addresses before an exact-size graph runs."""
+        self._bind_pools(metadata)
+        state_indices = metadata.mamba_metadata.state_indices[:1]
+        if self._prefill_slot is None:
+            self._prefill_slot = torch.empty_like(state_indices)
+            self._prefill_fresh = torch.zeros((1,), device=state_indices.device, dtype=torch.bool)
+        self._prefill_slot.copy_(state_indices)
+        for pool, _ in self._attention_views.values():
+            if pool not in self._prefill_pages:
+                table = metadata.kv_cache_block_offsets[pool][:1]
+                self._prefill_pages[pool] = torch.empty_like(table)
+        for pool, table in self._prefill_pages.items():
+            table.copy_(metadata.kv_cache_block_offsets[pool][:1])
+
     def _linear_attention(
         self,
         projected: torch.Tensor,
@@ -140,13 +160,19 @@ class Qwen36Decoder(DecoderModel):
         step: Step,
         index: int,
         mx: bool,
+        graph_cu: torch.Tensor | None,
     ) -> tuple[torch.Tensor, ...]:
         cache = self._state_views[index]
         mamba = metadata.mamba_metadata
         contexts = len(step.lengths)
         context_rows = step.context_rows
         weights = GdnWeights(layer.conv, layer.decay, layer.dt)
-        if contexts:
+        if graph_cu is not None:
+            pool = StatePool(cache.conv, cache.temporal, self._prefill_slot, self._prefill_fresh)
+            prefill = context_gdn(
+                projected, ba, weights, pool, step.requests, graph_cu, step.cu_cpu, False
+            )
+        elif contexts:
             pool = StatePool(
                 cache.conv,
                 cache.temporal,
@@ -209,7 +235,14 @@ class Qwen36Decoder(DecoderModel):
         ids = input_ids.flatten()
         rows = ids.shape[0]
         positions = position_ids.reshape(-1, rows)[0]
-        step = make_step(attn_metadata, positions, rows)
+        graph_prefill = is_in_breakable_cuda_graph() and attn_metadata.num_contexts == 1
+        if graph_prefill:
+            requests = torch.zeros(rows, device=positions.device, dtype=torch.int32)
+            step = Step(positions, requests, (rows,), (0,), (0, rows), rows, 0, 0)
+            graph_cu = torch.arange(2, dtype=torch.int64, device=positions.device) * rows
+        else:
+            step = make_step(attn_metadata, positions, rows)
+            graph_cu = None
         small = step.context_rows == 0 and rows <= 8
         mx = rows <= 8
 
@@ -228,11 +261,16 @@ class Qwen36Decoder(DecoderModel):
                 current.wait_stream(self.side_stream)
                 ba.record_stream(current)
                 attended = self._linear_attention(
-                    projected, ba, layer, attn_metadata, step, index, mx
+                    projected, ba, layer, attn_metadata, step, index, mx, graph_cu
                 )
             else:
                 pool, cache = self._attention_views[index]
-                pages = KvPages(cache, attn_metadata.kv_cache_block_offsets[pool])
+                table = (
+                    self._prefill_pages[pool]
+                    if graph_prefill
+                    else attn_metadata.kv_cache_block_offsets[pool]
+                )
+                pages = KvPages(cache, table)
                 attended = full_attention(
                     projected,
                     layer.q_norm,
@@ -350,6 +388,30 @@ class ModelingV2Qwen36Fp8Sm100(SpecDecOneEngineForCausalLM):
         super().post_load_weights()
         if self.spec_worker is not None:
             self.spec_worker.draft_head = DraftShortlist(self.lm_head.weight)
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        return_context_logits: bool = False,
+        spec_metadata: SpecMetadata | None = None,
+        resource_manager=None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if is_in_breakable_cuda_graph() and attn_metadata.num_contexts == 1:
+            self.model.stage_prefill(attn_metadata)
+        return super().forward(
+            attn_metadata,
+            input_ids,
+            position_ids,
+            inputs_embeds,
+            return_context_logits,
+            spec_metadata,
+            resource_manager,
+            **kwargs,
+        )
 
     def infer_max_seq_len(self) -> int:
         """Use the text checkpoint position limit."""

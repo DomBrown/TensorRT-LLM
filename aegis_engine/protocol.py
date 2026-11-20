@@ -52,6 +52,9 @@ def run(
             # The runtime speculative sampler does not return teacher-forced logits.
             gen_config = {
                 **config,
+                "enable_chunked_prefill": False,
+                "prefill_cuda_graph_backend": "breakable",
+                "prefill_capture_num_tokens": [128, 256, 512, 1024, 2048, 4096],
                 "speculative_config": MTPDecodingConfig(max_draft_len=draft_len),
             }
             generator = sessions.enter_context(LLM(str(model_dir), **gen_config))

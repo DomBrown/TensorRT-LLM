@@ -27,6 +27,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35
     gated_delta_step,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35b_a3b_fp8__sm_100__default.ops.multi_token import (  # noqa: E501
+    draft_argmax,
     draft_input,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35b_a3b_fp8__sm_100__default.ops.projections import (  # noqa: E501
@@ -267,3 +268,19 @@ def test_mtp_draft_input(cell, certifying) -> None:
     actual = draft_input(ids, embed, hidden, embedding_norm, hidden_norm)
     expected = draft_input.reference(ids, embed, hidden, embedding_norm, hidden_norm)
     assert_within_ulp(actual, expected, element_ulp=2, rms_ulp=0.5)
+
+
+@pytest.mark.parametrize("cell", draft_argmax.CELLS, ids=lambda cell: cell.why)
+def test_mtp_draft_argmax(cell, certifying) -> None:
+    _begin()
+    certifying(draft_argmax)
+    rows, width = (cell.spec[name] for name in ("rows", "width"))
+    logits = -_rand((rows, width), 0.25).abs() - 1
+    logits[:, 1025] = 0
+    logits[:, -1] = -0.0
+    if rows > 1:
+        logits[1].fill_(float("-inf"))
+        logits[2] -= 1
+    out = torch.empty(rows, device="cuda", dtype=torch.int32)
+    assert draft_argmax(logits, out) is out
+    torch.testing.assert_close(out, draft_argmax.reference(logits).int())
