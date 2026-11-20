@@ -241,3 +241,29 @@ single-wave run. The median decode interval was 16.39 ms compared with
 | 1,024 | 1,024 | 8 | 1,154.3 | 379.16 |
 | 1,024 | 1,024 | 32 | 1,685.3 | 1,943.54 |
 | 1,024 | 1,024 | 128 | 3,514.9 | 20,436.15 |
+
+## Batched long-prompt projections
+
+Contiguous prefill chunks of at least 128 rows share a BF16 tensor-core
+projection. Every row uses the same 128-channel K tiles and FP32
+accumulation order, including when it runs alone. Short prompt chunks
+use the individually shaped projections. The tiled implementation is
+target-local Triton and has independent FP32 operation tests.
+
+The oracle passed again at KL 0.006259 and 99.541% non-tie top-1. The
+short-prompt serving parity tests passed through concurrency 128.
+Six additional natural chat prompts at ISL 1,024 and 4,096 with
+OSL 128 passed the near-tie rule at concurrency 8 and 32.
+
+| ISL | OSL | V2 tiled TTFT (ms) | V2 tiled TPOT (ms) | V2 tiled decode (tokens/s) |
+| ---: | ---: | ---: | ---: |
+| 128 | 1,024 | 12.54 | 1.177 | 849.3 |
+| 1,024 | 1,024 | 23.83 | 1.123 | 890.7 |
+| 4,096 | 1,024 | 52.03 | 1.247 | 801.7 |
+
+| ISL | OSL | Concurrency | V2 tiled output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 1,024 | 1 | 444.6 | 52.88 |
+| 1,024 | 1,024 | 8 | 1,894.3 | 173.12 |
+| 1,024 | 1,024 | 32 | 3,749.2 | 289.24 |
+| 1,024 | 1,024 | 128 | 7,206.9 | 816.77 |

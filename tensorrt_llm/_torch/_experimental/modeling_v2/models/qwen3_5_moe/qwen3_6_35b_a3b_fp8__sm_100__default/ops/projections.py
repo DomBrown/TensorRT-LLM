@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import triton as tr
 
 from .....catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
-from ..kernels import dg_prefill, fp8, mx_decode, prefill_moe, prefill_tc, tc_decode
+from ..kernels import bf16, dg_prefill, fp8, mx_decode, prefill_moe, prefill_tc, tc_decode
 from ..weights import DenseWeight, LayerWeights
 
 Activation = tuple[torch.Tensor, ...]
@@ -41,19 +41,56 @@ class RowwiseProjection(OpWrapper):
 rowwise_projection = RowwiseProjection()
 
 
+class ContextProjection(RowwiseProjection):
+    """Tile long prefill projections with fixed BF16 accumulation order."""
+
+    CELLS = (
+        Cell("two long DeltaNet prompt chunks", {"rows": 256, "columns": 64}),
+        Cell("unaligned long router batch", {"rows": 411, "columns": 257}),
+    )
+
+    def __call__(
+        self, hidden: torch.Tensor, weight: torch.Tensor, pdl: bool = False
+    ) -> torch.Tensor:
+        del pdl
+        rows, width = hidden.shape
+        columns = weight.shape[0]
+        tile = 16
+        out = hidden.new_empty((rows, columns))
+        bf16.project[(tr.cdiv(rows, tile), tr.cdiv(columns, tile))](
+            hidden, weight, out, rows, columns, width, tile, tile, 128, num_warps=4
+        )
+        return out
+
+
+context_projection = ContextProjection()
+
+
+def _context_spans(starts: tuple[int, ...]) -> list[tuple[int, int, bool]]:
+    """Coalesce neighboring long prompts for one tiled projection."""
+    spans = []
+    for start, end in zip(starts, starts[1:]):
+        tiled = end - start >= 128
+        if tiled and spans and spans[-1][2]:
+            start, _, _ = spans.pop()
+        spans.append((start, end, tiled))
+    return spans
+
+
 def packed_delta_gates(
     hidden: torch.Tensor, weight: torch.Tensor, context_starts: tuple[int, ...]
 ) -> torch.Tensor:
-    """Use each prompt's original projection shape and the rowwise decode product."""
+    """Project context spans and the rowwise decode suffix in request order."""
     context_rows = context_starts[-1]
     if not context_rows:
         return rowwise_projection(hidden, weight)
-    if len(context_starts) == 2 and context_rows == hidden.shape[0]:
-        return F.linear(hidden, weight)
-    gates = [F.linear(hidden[a:b], weight) for a, b in zip(context_starts, context_starts[1:])]
+    gates = [
+        context_projection(hidden[a:b], weight) if tiled else F.linear(hidden[a:b], weight)
+        for a, b, tiled in _context_spans(context_starts)
+    ]
     if context_rows < hidden.shape[0]:
         gates.append(rowwise_projection(hidden[context_rows:], weight))
-    return torch.cat(gates)
+    return gates[0] if len(gates) == 1 else torch.cat(gates)
 
 
 class DenseProjection(OpWrapper):
@@ -206,15 +243,24 @@ def shared_expert(activation: Activation, layer: LayerWeights) -> torch.Tensor:
 
 
 def route_experts(
-    hidden: torch.Tensor, router: torch.Tensor, small: bool, pdl: bool, *, decode: bool = False
+    hidden: torch.Tensor,
+    router: torch.Tensor,
+    small: bool,
+    pdl: bool,
+    *,
+    decode: bool = False,
+    tiled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
     """Return sorted top-eight per-token expert IDs, weights, and shared gates."""
     rows = hidden.shape[0]
-    split_gate = not (small or decode) and rows > 8
+    split_gate = not (small or decode or tiled) and rows > 8
     weight = router[:256] if split_gate else router
-    logits = (
-        rowwise_projection(hidden, weight, pdl) if small or decode else F.linear(hidden, weight)
-    )
+    if tiled:
+        logits = context_projection(hidden, weight)
+    elif small or decode:
+        logits = rowwise_projection(hidden, weight, pdl)
+    else:
+        logits = F.linear(hidden, weight)
     ids = hidden.new_empty((rows, 8), dtype=torch.int32)
     probs = hidden.new_empty((rows, 8))
     shared_gate = hidden.new_empty((rows,), dtype=torch.float32)
@@ -265,11 +311,11 @@ def route_packed(
     context_rows = context_starts[-1]
     if not context_rows:
         return route_experts(hidden, router, small, small, decode=True)
-    if len(context_starts) == 2 and context_rows == hidden.shape[0]:
-        return route_experts(hidden, router, False, False)
+    spans = _context_spans(context_starts)
+    if len(spans) == 1 and context_rows == hidden.shape[0]:
+        return route_experts(hidden, router, False, False, tiled=spans[0][2])
     routing = [
-        route_experts(hidden[a:b], router, False, False)[:3]
-        for a, b in zip(context_starts, context_starts[1:])
+        route_experts(hidden[a:b], router, False, False, tiled=tiled)[:3] for a, b, tiled in spans
     ]
     if context_rows < hidden.shape[0]:
         routing.append(route_experts(hidden[context_rows:], router, False, False, decode=True)[:3])

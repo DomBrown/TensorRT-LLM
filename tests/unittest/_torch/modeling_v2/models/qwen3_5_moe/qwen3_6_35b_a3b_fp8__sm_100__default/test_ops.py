@@ -32,6 +32,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35b_a3b_fp8__sm_100__default.ops.projections import (  # noqa: E501
     RoutedWeights,
+    context_projection,
     dense_projection,
     routed_experts,
     rowwise_projection,
@@ -298,4 +299,18 @@ def test_rowwise_projection(cell, certifying) -> None:
     solo = rowwise_projection(hidden[-1:], weight, True)
     torch.testing.assert_close(packed[-1:], solo, rtol=0, atol=0)
     expected = rowwise_projection.reference(hidden, weight)
+    assert_within_ulp(packed, expected, element_ulp=2, rms_ulp=0.5)
+
+
+@pytest.mark.parametrize("cell", context_projection.CELLS, ids=lambda cell: cell.why)
+def test_context_projection(cell, certifying) -> None:
+    _begin()
+    certifying(context_projection)
+    rows, columns = (cell.spec[name] for name in ("rows", "columns"))
+    hidden = _rand((rows, 2048), 0.4)
+    weight = _rand((columns, 2048), 0.1)
+    packed = context_projection(hidden, weight)
+    separate = context_projection(hidden[-128:], weight)
+    torch.testing.assert_close(packed[-128:], separate, rtol=0, atol=0)
+    expected = context_projection.reference(hidden, weight)
     assert_within_ulp(packed, expected, element_ulp=2, rms_ulp=0.5)
