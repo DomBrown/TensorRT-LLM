@@ -8,6 +8,7 @@ import triton.language as tl
 from flashinfer.gemm import group_gemm_fp8_nt_groupwise
 
 from . import fp8 as kernels
+from . import grouped_fp8_runtime
 
 
 @tr.jit
@@ -101,6 +102,10 @@ def grouped_experts(
 
     def project(a, scale, parameter):
         weight, weight_scale = parameter
+        if m <= 1536 and align == 4 and mma_sm == 1 and backend == "trtllm":
+            output = grouped_fp8_runtime.project(a, weight[:256], scale, weight_scale[:256], indptr)
+            if output is not None:
+                return output
         return group_gemm_fp8_nt_groupwise(
             a,
             weight[:256],

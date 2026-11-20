@@ -396,3 +396,30 @@ and stale-claim tests.
 | 1,024 | 1,024 | 8 | 2,029.4 | 126.38 |
 | 1,024 | 1,024 | 32 | 4,030.1 | 302.04 |
 | 1,024 | 1,024 | 128 | 8,273.3 | 771.33 |
+
+## Intermediate-length CUTLASS prefill
+
+The runtime-compiled expert tile comes from the standalone
+`group_cutlass.py`. It uses the installed FlashInfer CUTLASS grouped
+projection with a 64 × 256 × 128 tile for 257 to 1,536 packed rows. The
+standard FlashInfer entry point handles other lengths and installations
+without the matching headers and CUDA compiler. Scratch is owned by the
+calling CUDA stream. A native contribution can move the compiled
+wrapper and tile specialization to the family's `csrc/` tree.
+
+In the rotating-weight operation check, every routed BF16 value
+matched the standard grouped implementation. At 1,024 rows, the grouped
+products took 260.3 µs compared with 318.3 µs. At 1,536 rows they took
+270.6 µs compared with 328.2 µs. At 2,048 rows the standard tile was
+faster. The 35 operation, routing and stale-claim tests passed.
+
+| ISL | OSL | V2 CUTLASS prefill TTFT (ms) | V2 CUTLASS prefill TPOT (ms) | V2 decode (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1,024 | 10.41 | 1.093 | 914.7 |
+| 1,024 | 1,024 | 21.07 | 1.074 | 931.0 |
+| 4,096 | 1,024 | 49.46 | 1.153 | 867.4 |
+
+The complete oracle passed again at KL 0.006259 and 99.541% non-tie
+top-1. Short and long serving continuations passed the near-tie rule
+through concurrency 128. The long cases used ISL 1,024 and 4,096 with
+OSL 128.

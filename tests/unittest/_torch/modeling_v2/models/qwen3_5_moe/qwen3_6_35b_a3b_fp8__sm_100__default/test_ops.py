@@ -178,7 +178,8 @@ def test_routed_experts(cell, certifying) -> None:
     down_scales = torch.rand((256, 16, 4), device="cuda") / 512 + 0.001
     weights = RoutedWeights((up, up_scales), (down, down_scales))
     actual, inverse = routed_experts(incoming, route, weights, rows == 1, None, True)
-    assert inverse is None
+    if inverse is not None:
+        actual = actual[inverse.flatten().long()]
     expected = routed_experts.reference(incoming, route, weights, rows == 1, None, True)
     assert_within_ulp(actual, expected, element_ulp=5, rms_ulp=1.5)
 

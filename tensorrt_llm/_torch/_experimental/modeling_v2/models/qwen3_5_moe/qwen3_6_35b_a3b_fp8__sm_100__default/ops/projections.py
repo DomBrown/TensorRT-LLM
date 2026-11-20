@@ -133,6 +133,7 @@ class RoutedExperts(OpWrapper):
         Cell("small decode routed by device expert IDs", {"rows": 1}),
         Cell("short packed prefill grouped by expert", {"rows": 11}),
         Cell("batched native FP8 products and expert grouping", {"rows": 128}),
+        Cell("medium prefill with grouped 64 by 256 SM100 tiles", {"rows": 384}),
     )
     note = "Standalone TCGen05 expert kernels for short batches and FlashInfer groups for prefill."
 
