@@ -190,3 +190,25 @@ actual single-request decode top-two scores. All 32 prompts passed the
 near-tie rule at concurrency 8. At concurrency 32, two prompts diverged
 outside the rule at gaps of 0.75 and 0.50 nats. The first mismatch at
 0.50 occurred on the first generated token, implicating packed prefill.
+
+## MXFP8 draft vocabulary
+
+The draft-only shortlist now uses a per-32-channel MXFP8 copy of the
+checkpoint's BF16 vocabulary prefix and FlashInfer's CuTe DSL GEMM. The
+target head remains BF16 over all 248,320 tokens. In a rotating-weight
+batch-one CUDA graph microbenchmark, shortlist projection plus argmax
+took 28.9 µs with CuTe DSL, 33.8 µs with FlashInfer's low-latency tactic
+and 47.6 µs with the BF16 head. The CUTLASS tactic took 143.5 µs.
+
+All 32 development cases passed with KL 0.006259 and 99.541% non-tie
+top-1. Captured and eager prefill in the preceding revision also produced
+identical 256-token continuations at nine lengths from 127 to 4,096,
+including exact buckets and adjacent lengths. The SM100 CI test list now
+includes the mirrored operations and an oracle integration test that uses
+the local checkpoint and reference file.
+
+| ISL | OSL | V2 MX draft TTFT (ms) | V2 MX draft TPOT (ms) | V2 MX draft decode (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1,024 | 12.74 | 1.171 | 854.2 |
+| 1,024 | 1,024 | 22.23 | 1.136 | 880.2 |
+| 4,096 | 1,024 | 47.58 | 1.240 | 806.3 |

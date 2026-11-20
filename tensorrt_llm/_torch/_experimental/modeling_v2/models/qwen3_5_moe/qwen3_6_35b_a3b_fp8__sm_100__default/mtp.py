@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from flashinfer import mm_mxfp8, mxfp8_quantize
 
 from .kernels import fp8
 from .ops.attention import KvPages, full_attention
@@ -48,13 +49,16 @@ class DraftShortlist:
     """Propose greedy tokens from a prefix of the shared vocabulary matrix."""
 
     def __init__(self, weight: torch.Tensor) -> None:
-        self.weight = weight[:65536]
+        codes, self.scales = mxfp8_quantize(weight[:65536])
+        self.weight = codes.T
 
     def supports(self, rows: int) -> bool:
         return rows <= 8
 
     def sample(self, hidden: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
-        return draft_argmax(F.linear(hidden, self.weight), out)
+        codes, scales = mxfp8_quantize(hidden)
+        logits = mm_mxfp8(codes, self.weight, scales, self.scales, backend="cute-dsl")
+        return draft_argmax(logits, out)
 
 
 class Qwen36MtpLayer(nn.Module):
