@@ -101,56 +101,48 @@ def decode_conv(
     Slots,
     Initial,
     Y,
-    Windows,
+    Raw,
     X_STRIDE: tl.constexpr,
     H_SLOT: tl.constexpr,
     H_CHANNEL: tl.constexpr,
     H_TAP: tl.constexpr,
     STEPS: tl.constexpr,
     CHECKPOINT: tl.constexpr,
-    WINDOW_REQUEST: tl.constexpr,
-    WINDOW_STEP: tl.constexpr,
+    RAW_REQUEST: tl.constexpr,
+    RAW_STEP: tl.constexpr,
     RESET_NEW: tl.constexpr,
     PDL: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Convolve the entire generation block before replacing its input window."""
+    """Convolve a generation block and keep only its raw input rows for acceptance."""
     request = tl.program_id(0)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     slot = tl.load(Slots + request).to(tl.int64)
     initial = tl.load(Initial + request) if RESET_NEW else True
     history = History + slot * H_SLOT + col * H_CHANNEL
+    a = tl.load(history, initial, 0).to(tl.float32)
+    b = tl.load(history + H_TAP, initial, 0).to(tl.float32)
+    c = tl.load(history + H_TAP * 2, initial, 0).to(tl.float32)
+    wa = tl.load(W + col * 4).to(tl.float32)
+    wb = tl.load(W + col * 4 + 1).to(tl.float32)
+    wc = tl.load(W + col * 4 + 2).to(tl.float32)
+    wd = tl.load(W + col * 4 + 3).to(tl.float32)
     if PDL:
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
     for row in tl.static_range(STEPS):
-        acc = tl.full((BLOCK,), 0.0, tl.float32)
-        for tap in tl.static_range(4):
-            relative = row + tap - 3
-            if relative < 0:
-                x = tl.load(history + (relative + 3) * H_TAP, initial, 0)
-            else:
-                x = tl.load(X + (request * STEPS + relative) * X_STRIDE + col)
-            coeff = tl.load(W + col * 4 + tap)
-            acc += x.to(tl.float32) * coeff.to(tl.float32)
-        y = acc / (1.0 + tl.exp(-acc))
-        tl.store(Y + (request * STEPS + row) * 8192 + col, y)
+        idx = request * STEPS + row
+        d = tl.load(X + idx * X_STRIDE + col).to(tl.float32)
+        value = tl.fma(d, wd, tl.fma(c, wc, tl.fma(b, wb, a * wa)))
+        y = value / (1.0 + tl.exp(-value))
+        tl.store(Y + idx * 8192 + col, y)
         if CHECKPOINT:
-            for tap in tl.static_range(3):
-                relative = row + tap - 2
-                if relative < 0:
-                    x = tl.load(history + (relative + 3) * H_TAP, initial, 0)
-                else:
-                    x = tl.load(X + (request * STEPS + relative) * X_STRIDE + col)
-                tl.store(Windows + request * WINDOW_REQUEST + row * WINDOW_STEP + col * 3 + tap, x)
+            tl.store(Raw + request * RAW_REQUEST + row * RAW_STEP + col, d)
+        a, b, c = b, c, d
     if not CHECKPOINT:
-        for tap in tl.static_range(3):
-            relative = STEPS + tap - 3
-            if relative < 0:
-                x = tl.load(history + (relative + 3) * H_TAP, initial, 0)
-            else:
-                x = tl.load(X + (request * STEPS + relative) * X_STRIDE + col)
-            tl.store(history + tap * H_TAP, x)
+        tl.store(history, a)
+        tl.store(history + H_TAP, b)
+        tl.store(history + H_TAP * 2, c)
 
 
 @tr.jit
@@ -236,3 +228,56 @@ def zero_fresh_states(State, Slots, Initial, STATE_STRIDE: tl.constexpr, TILE: t
         slot = tl.load(Slots + request).to(tl.int64)
         index = tl.program_id(1) * TILE + tl.arange(0, TILE)
         tl.store(State + slot * STATE_STRIDE + index, 0)
+
+
+@tr.jit
+def accept_conv(
+    History,
+    Raw,
+    Source,
+    Destination,
+    Accepted,
+    Dummy,
+    ReplaySlots,
+    Pending,
+    NUM_REQUESTS: tl.constexpr,
+    H_LAYER: tl.constexpr,
+    H_SLOT: tl.constexpr,
+    H_CHANNEL: tl.constexpr,
+    H_TAP: tl.constexpr,
+    R_LAYER: tl.constexpr,
+    R_REQUEST: tl.constexpr,
+    R_STEP: tl.constexpr,
+    P_STRIDE: tl.constexpr,
+    CHANNELS: tl.constexpr,
+    B: tl.constexpr,
+    HAS_DUMMY: tl.constexpr,
+    WRITE_PENDING: tl.constexpr,
+):
+    """Advance each retained convolution window by its accepted raw inputs."""
+    layer_and_request, tile = tl.program_id(0), tl.program_id(1)
+    request = layer_and_request % NUM_REQUESTS
+    layer = (layer_and_request // NUM_REQUESTS).to(tl.int64)
+    if HAS_DUMMY:
+        if tl.load(Dummy + request):
+            return
+    source = tl.load(Source + request).to(tl.int64)
+    destination = tl.load(Destination + request).to(tl.int64)
+    count = tl.load(Accepted + request)
+    col = tile * B + tl.arange(0, B)
+    valid = col < CHANNELS
+    hist = History + layer * H_LAYER + destination * H_SLOT + col * H_CHANNEL
+    raw = Raw + layer * R_LAYER + source * R_REQUEST + col
+
+    # The old tap is always to the right of the tap being overwritten.
+    for tap in tl.static_range(3):
+        index = count + tap - 3
+        if index < 0:
+            value = tl.load(hist + (index + 3) * H_TAP, valid, 0)
+        else:
+            value = tl.load(raw + index * R_STEP, valid, 0)
+        tl.store(hist + tap * H_TAP, value, valid)
+    if WRITE_PENDING:
+        if layer == 0 and tile == 0:
+            slot = tl.load(ReplaySlots + request).to(tl.int64)
+            tl.store(Pending + slot * P_STRIDE, count - 1)

@@ -14,7 +14,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaLayerCache,
     MambaStateLayout,
     ReplayLayout,
-    _promote_mamba_state_triton,
     _stack_state_views,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
@@ -22,46 +21,34 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_man
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
 
+from .ops.linear_attention import ConvAcceptance, accept_convolution
+
 _FACTORS = DataRole("qwen36_fp8_factors")
 _PENDING = DataRole("qwen36_fp8_pending")
 
 
 @dataclass(frozen=True, kw_only=True)
 class VerifierLayerCache(MambaLayerCache):
-    """One recurrent layer's convolution scratch and factored replay history."""
+    """One recurrent layer's raw convolution inputs and factored replay history."""
 
-    windows: torch.Tensor
+    raw_conv: torch.Tensor
     factors: torch.Tensor
     pending: torch.Tensor
 
 
 @tr.jit
-def _set_pending(
-    Pending,
-    Slots,
-    Accepted,
-    Dummy,
-    COUNT: tl.constexpr,
-    PENDING_STRIDE: tl.constexpr,
-    B: tl.constexpr,
-    HAS_ACCEPTANCE: tl.constexpr,
-    HAS_DUMMY: tl.constexpr,
+def _clear_pending(
+    Pending, Slots, COUNT: tl.constexpr, PENDING_STRIDE: tl.constexpr, B: tl.constexpr
 ):
     index = tl.program_id(0) * B + tl.arange(0, B)
-    active = index < COUNT
-    if HAS_DUMMY:
-        active &= ~tl.load(Dummy + index, active, False)
-    slot = tl.load(Slots + index, active, 0)
-    accepted = tl.load(Accepted + index, active, 1) - 1 if HAS_ACCEPTANCE else 0
-    tl.store(Pending + slot * PENDING_STRIDE, accepted, active)
+    slot = tl.load(Slots + index, index < COUNT, 0)
+    tl.store(Pending + slot * PENDING_STRIDE, 0, index < COUNT)
 
 
 def clear_pending(pending: torch.Tensor, slots: torch.Tensor) -> None:
     """Clear accepted factors after a non-speculative generation step."""
     count = slots.shape[0]
-    _set_pending[(tr.cdiv(count, 32),)](
-        pending, slots, slots, slots, count, pending.stride(0), 32, False, False
-    )
+    _clear_pending[(tr.cdiv(count, 32),)](pending, slots, count, pending.stride(0), 32)
 
 
 class FactoredVerifierState:
@@ -104,7 +91,7 @@ class FactoredVerifierState:
         self._conv_states = tuple(conv_states)
         self._stacked_conv = _stack_state_views(conv_states)
         device = conv_states[0].device
-        shape = (len(conv_states), context.max_batch_size, self.width, *context.conv_state_shape)
+        shape = (len(conv_states), context.max_batch_size, self.width, 8192)
         self.intermediate_conv = torch.empty(shape, dtype=context.conv_state_dtype, device=device)
         self.intermediate_indices = torch.arange(
             context.max_batch_size, dtype=torch.int32, device=device
@@ -125,43 +112,37 @@ class FactoredVerifierState:
         return VerifierLayerCache(
             conv=conv,
             temporal=temporal,
-            windows=self.intermediate_conv[layer_offset],
+            raw_conv=self.intermediate_conv[layer_offset],
             factors=self._factors[layer_offset],
             pending=self._pending,
         )
 
     def update(self, batch: MambaAcceptanceBatch) -> None:
-        """Commit the accepted convolution window and the factor replay length."""
+        """Commit the accepted convolution inputs and GDN replay length."""
+        slots = (
+            batch.destination_state_indices
+            if batch.replay_indices is None
+            else batch.replay_indices
+        )
+        conv_batch = ConvAcceptance(
+            batch.source_state_indices,
+            batch.destination_state_indices,
+            batch.num_accepted_tokens,
+            slots,
+            batch.is_dummy_request,
+        )
         if self._stacked_conv is not None:
-            _promote_mamba_state_triton(
-                self._stacked_conv,
-                self.intermediate_conv,
-                batch.source_state_indices,
-                batch.accepted_positions,
-                batch.destination_state_indices,
+            accept_convolution(
+                self._stacked_conv, self.intermediate_conv, conv_batch, self._pending
             )
         else:
             for layer, state in enumerate(self._conv_states):
-                _promote_mamba_state_triton(
+                accept_convolution(
                     state.unsqueeze(0),
                     self.intermediate_conv[layer : layer + 1],
-                    batch.source_state_indices,
-                    batch.accepted_positions,
-                    batch.destination_state_indices,
+                    conv_batch,
+                    self._pending if layer == 0 else None,
                 )
-        has_dummy = batch.is_dummy_request is not None
-        dummy = batch.is_dummy_request if has_dummy else batch.replay_indices
-        _set_pending[(tr.cdiv(batch.num_generations, 32),)](
-            self._pending,
-            batch.replay_indices,
-            batch.num_accepted_tokens,
-            dummy,
-            batch.num_generations,
-            self._pending.stride(0),
-            32,
-            True,
-            has_dummy,
-        )
 
     def shutdown(self) -> None:
         self.intermediate_indices = None

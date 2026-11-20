@@ -31,7 +31,74 @@ class ReplayState(NamedTuple):
     factors: torch.Tensor
     pending: torch.Tensor
     slots: torch.Tensor
-    windows: torch.Tensor
+    raw_conv: torch.Tensor
+
+
+class ConvAcceptance(NamedTuple):
+    source: torch.Tensor
+    destination: torch.Tensor
+    count: torch.Tensor
+    replay_slots: torch.Tensor
+    dummy: torch.Tensor | None
+
+
+class AcceptConvolution(OpWrapper):
+    """Advance the recurrent convolution window by the accepted verifier rows."""
+
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = (
+        Cell("one accepted row through a recycled state slot", {"accepted": (1,)}),
+        Cell("mixed acceptance lengths with one graph dummy", {"accepted": (4, 1, 2)}),
+    )
+
+    def __call__(
+        self,
+        history: torch.Tensor,
+        raw: torch.Tensor,
+        batch: ConvAcceptance,
+        pending: torch.Tensor | None,
+    ) -> None:
+        requests = batch.count.shape[0]
+        channels = history.shape[2]
+        tile = 256
+        gdn.accept_conv[(history.shape[0] * requests, tr.cdiv(channels, tile))](
+            history,
+            raw,
+            batch.source,
+            batch.destination,
+            batch.count,
+            batch.count if batch.dummy is None else batch.dummy,
+            batch.replay_slots,
+            batch.replay_slots if pending is None else pending,
+            requests,
+            *history.stride(),
+            *raw.stride()[:3],
+            0 if pending is None else pending.stride(0),
+            channels,
+            tile,
+            batch.dummy is not None,
+            pending is not None,
+            num_warps=4,
+        )
+
+    def reference(
+        self,
+        history: torch.Tensor,
+        raw: torch.Tensor,
+        batch: ConvAcceptance,
+        pending: torch.Tensor | None,
+    ) -> None:
+        for i, (source, destination, count, replay) in enumerate(zip(*batch[:4], strict=True)):
+            if batch.dummy is not None and batch.dummy[i]:
+                continue
+            old = history[:, destination].transpose(1, 2)
+            update = torch.cat((old, raw[:, source, :count]), dim=1)[:, -3:]
+            history[:, destination].copy_(update.transpose(1, 2))
+            if pending is not None:
+                pending[replay] = count - 1
+
+
+accept_convolution = AcceptConvolution()
 
 
 class GatedDeltaStep(OpWrapper):
@@ -62,7 +129,7 @@ class GatedDeltaStep(OpWrapper):
         rows = projected.shape[0]
         requests = rows // steps
         checkpoint = replay is not None and steps > 1
-        windows = replay.windows if checkpoint else pool.conv
+        raw_conv = replay.raw_conv if checkpoint else pool.conv
         factors = replay.factors if replay is not None else pool.temporal
         pending = replay.pending if replay is not None else pool.slots
         replay_slots = replay.slots if replay is not None else pool.slots
@@ -74,13 +141,13 @@ class GatedDeltaStep(OpWrapper):
             pool.slots,
             pool.has_initial,
             convolved,
-            windows,
+            raw_conv,
             projected.stride(0),
             *pool.conv.stride(),
             steps,
             checkpoint,
-            windows.stride(0),
-            windows.stride(1),
+            raw_conv.stride(0),
+            raw_conv.stride(1),
             reset_new,
             pdl,
             256,
@@ -88,7 +155,8 @@ class GatedDeltaStep(OpWrapper):
             launch_pdl=pdl,
         )
         output = projected.new_empty((rows, 4096))
-        gdn.recurrent[(requests, 32, 8)](
+        tile = 8 if checkpoint and requests == 1 else 16
+        gdn.recurrent[(requests, 32, 128 // tile)](
             convolved,
             ba,
             weights.decay,
@@ -108,7 +176,7 @@ class GatedDeltaStep(OpWrapper):
             factors.stride(1),
             pending.stride(0),
             reset_new,
-            16,
+            tile,
             pdl,
             num_warps=4,
             launch_pdl=pdl,
@@ -183,7 +251,7 @@ def _reference_gdn(
             state = torch.addcmul(state, delta[:, :, None], k[:, None, :])
             outputs.append((state * q[:, None, :]).sum(-1).flatten() / (128**0.5))
             if checkpoint:
-                replay.windows[request, offset].copy_(window[offset + 1 : offset + 4].T)
+                replay.raw_conv[request, offset].copy_(raw[offset])
                 if offset == 0:
                     pool.temporal[slot].copy_(state)
                 else:

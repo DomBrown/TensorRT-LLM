@@ -20,9 +20,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35
     project_and_store,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35b_a3b_fp8__sm_100__default.ops.linear_attention import (  # noqa: E501
+    ConvAcceptance,
     GdnWeights,
     ReplayState,
     StatePool,
+    accept_convolution,
     context_gdn,
     gated_delta_step,
 )
@@ -104,7 +106,7 @@ def test_gated_delta_step(cell, certifying) -> None:
     expected_replay = None
     if steps > 1:
         replay_indices = torch.tensor([1, 3], device="cuda", dtype=torch.int32)
-        scratch = torch.zeros((batch, steps, 8192, 3), device="cuda", dtype=BF16)
+        scratch = torch.zeros((batch, steps, 8192), device="cuda", dtype=BF16)
         factors = torch.zeros((6, steps - 1, 32, 257), device="cuda")
         pending = torch.zeros(6, device="cuda", dtype=torch.int32)
         replay = ReplayState(factors, pending, replay_indices, scratch)
@@ -122,11 +124,17 @@ def test_gated_delta_step(cell, certifying) -> None:
 
     if replay is not None:
         accepted_positions = torch.tensor([2, 1], device="cuda", dtype=torch.int32)
-        for replay_state, state_pool in ((replay, pool), (expected_replay, expected_pool)):
-            replay_state.pending[replay_state.slots] = accepted_positions
-            state_pool.conv[indices] = replay_state.windows[
-                torch.arange(batch, device="cuda"), accepted_positions
-            ]
+        source = torch.arange(batch, device="cuda", dtype=torch.int32)
+        accepted = ConvAcceptance(source, indices, accepted_positions + 1, replay.slots, None)
+        accept_convolution(
+            pool.conv.unsqueeze(0), replay.raw_conv.unsqueeze(0), accepted, replay.pending
+        )
+        accept_convolution.reference(
+            expected_pool.conv.unsqueeze(0),
+            expected_replay.raw_conv.unsqueeze(0),
+            accepted,
+            expected_replay.pending,
+        )
         projected = _rand((batch, 12288), 0.25)
         gates = _rand((batch, 64), 0.5)
         actual = gated_delta_step(projected, gates, weights, pool, 1, False, True, replay)
@@ -314,3 +322,26 @@ def test_context_projection(cell, certifying) -> None:
     torch.testing.assert_close(packed[-128:], separate, rtol=0, atol=0)
     expected = context_projection.reference(hidden, weight)
     assert_within_ulp(packed, expected, element_ulp=2, rms_ulp=0.5)
+
+
+@pytest.mark.parametrize("cell", accept_convolution.CELLS, ids=lambda cell: cell.why)
+def test_accepted_convolution(cell, certifying) -> None:
+    _begin()
+    certifying(accept_convolution)
+    counts = cell.spec["accepted"]
+    n = len(counts)
+    history = _rand((2, 7, 8192, 3))
+    raw = _rand((2, n, 4, 8192))
+    pending = torch.zeros(11, device="cuda", dtype=torch.int32)[1::2]
+    expected_history = history.clone()
+    expected_pending = pending.clone()
+    source = torch.arange(n, device="cuda", dtype=torch.int32).flip(0)
+    destinations = torch.tensor([5, 3, 1][:n], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([4, 1, 3][:n], device="cuda", dtype=torch.int32)
+    dummy = torch.tensor([False, False, True], device="cuda") if n == 3 else None
+    count = torch.tensor(counts, device="cuda", dtype=torch.int32)
+    batch = ConvAcceptance(source, destinations, count, slots, dummy)
+    accept_convolution(history, raw, batch, pending)
+    accept_convolution.reference(expected_history, raw, batch, expected_pending)
+    torch.testing.assert_close(history, expected_history, rtol=0, atol=0)
+    torch.testing.assert_close(pending, expected_pending, rtol=0, atol=0)

@@ -202,7 +202,7 @@ class Qwen36Decoder(DecoderModel):
                     cache.factors,
                     cache.pending,
                     mamba.replay_state_indices[contexts : contexts + step.generation_requests],
-                    cache.windows,
+                    cache.raw_conv,
                 )
             decode = gated_delta_step(
                 projected[context_rows:],

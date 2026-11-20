@@ -146,7 +146,7 @@ class RoutedExperts(OpWrapper):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         rows = route.shape[0]
         if small:
-            split = 4
+            split = 4 if rows == 1 else 2
             partials = tc_decode.matmul(
                 incoming,
                 weights.up,
@@ -155,6 +155,7 @@ class RoutedExperts(OpWrapper):
                 split=split,
                 routing=routing,
                 exact_partials=True,
+                interleave=rows > 1,
             )
             mid = fp8.activation_partials(
                 partials,

@@ -267,3 +267,29 @@ OSL 128 passed the near-tie rule at concurrency 8 and 32.
 | 1,024 | 1,024 | 8 | 1,894.3 | 173.12 |
 | 1,024 | 1,024 | 32 | 3,749.2 | 289.24 |
 | 1,024 | 1,024 | 128 | 7,206.9 | 816.77 |
+
+## Less verifier convolution scratch
+
+The convolution keeps its three prior inputs in registers while it
+walks a verifier block. The per-step scratch stores one raw input per
+row, following the standalone `spec_kernels.py` history design. A
+target-local acceptance kernel advances the runtime's retained window
+and writes the accepted GDN replay count. The previous scratch stored
+three inputs per verifier row. At the serving batch limit of 128 and
+four verifier rows, the new layout removes 480 MiB of scratch.
+
+The batch-one verification GDN uses an eight-channel value tile. In
+the isolated four-row test it took 7.87 µs versus 8.55 µs with a
+16-channel tile. The routed expert up projection uses two interleaved
+K splits when it processes multiple verifier rows. In the rotating
+four-row expert test, up, activation, and down took 24.6 µs versus
+25.7 µs for four splits, with bitwise identical BF16 output.
+
+The full oracle again passed at KL 0.006259 and 99.541% non-tie top-1.
+All 23 SM100 operation cases passed.
+
+| ISL | OSL | V2 verifier TTFT (ms) | V2 verifier TPOT (ms) | V2 verifier decode (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1,024 | 12.52 | 1.115 | 897.2 |
+| 1,024 | 1,024 | 23.44 | 1.064 | 939.7 |
+| 4,096 | 1,024 | 51.89 | 1.186 | 843.3 |
