@@ -224,7 +224,7 @@ class _MsgspecRoute(KvHintsRoute):
     request_type = _MsgspecRequest
 
 
-TIMEOUT_KEEP_ALIVE = 5  # seconds.
+TIMEOUT_KEEP_ALIVE = int(os.environ.get("TLLM_OPENAI_KEEP_ALIVE_TIMEOUT", "5"))
 
 _warned_unresolvable_thinking = False
 
