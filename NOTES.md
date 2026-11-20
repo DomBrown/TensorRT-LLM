@@ -481,3 +481,41 @@ reference top 20 and one bin for remaining probability mass. Its
 top-1 matches. At ISL 128, 1,024 and 4,096 with OSL 1,024, external
 batch-one TTFT was 10.66, 20.44 and 45.48 ms. Decode throughput was
 880.5, 910.6 and 856.8 tokens/s.
+
+## Final serving comparison
+
+I ran the task's `bench_serving.py` with 16 requests minimum and four
+requests per concurrent client. The two modes used the same model,
+runtime configuration and prompt inputs. The V1 YAML changed only
+`modeling_v2` from `require` to `off`. The passage corpus concatenated
+`disagg-serving.md`, `speculative-decoding.md`, `parallel-strategy.md`,
+`quantization.md` and `kvcache.md` from `docs/source/features/` in that
+order.
+
+The actual JSONL engine and single-request server generated identical
+tokens for all 32 development prompts and six additional long prompts.
+The long requests used ISL 1,024 and 4,096 with OSL 128. The repeat server
+checks also passed the near-tie rule at the tested higher concurrency
+levels.
+
+The first combined V2 benchmark lost an idle HTTP connection at the
+concurrency-128 warm-up. A transport test reproduced the disconnect
+after a six-second client event-loop pause with the standard five-second
+idle timeout. With a 30-second timeout the connection stayed open.
+The resumed V2 timing uses a 30-second idle timeout and fresh HTTP
+sessions for the remaining cells. The GPU execution and cache
+configuration are the same across the measurements.
+
+| ISL | OSL | Concurrency | Requests | V1 tokens/s | V2 tokens/s | V2/V1 | V1 median TTFT (ms) | V2 median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 1,024 | 1 | 16 | 301.5 | 446.1 | 1.48× | 67.4 | 57.3 |
+| 1,024 | 1,024 | 2 | 16 | 533.4 | 801.0 | 1.50× | 126.2 | 124.7 |
+| 1,024 | 1,024 | 4 | 16 | 915.6 | 1,359.3 | 1.48× | 125.3 | 127.4 |
+| 1,024 | 1,024 | 8 | 32 | 1,576.5 | 2,026.1 | 1.29× | 140.5 | 136.9 |
+| 1,024 | 1,024 | 16 | 64 | 2,551.8 | 2,302.6 | 0.90× | 206.8 | 228.1 |
+| 1,024 | 1,024 | 32 | 128 | 4,097.7 | 3,731.6 | 0.91× | 211.6 | 201.3 |
+| 1,024 | 1,024 | 64 | 256 | 6,155.5 | 5,968.7 | 0.97× | 220.4 | 203.9 |
+| 1,024 | 1,024 | 128 | 512 | 8,630.0 | 8,364.7 | 0.97× | 237.8 | 211.1 |
+| 4,096 | 1,024 | 1 | 16 | 298.0 | 428.4 | 1.44× | 74.0 | 61.4 |
+| 4,096 | 1,024 | 8 | 32 | 1,454.5 | 1,770.2 | 1.22× | 313.5 | 358.0 |
+| 4,096 | 1,024 | 32 | 128 | 3,359.9 | 3,284.6 | 0.98× | 264.2 | 234.8 |
