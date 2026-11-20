@@ -226,6 +226,7 @@ class Qwen36Decoder(DecoderModel):
         input_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        last_context_only: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """Return the final normalized hidden rows in scheduler order."""
@@ -246,6 +247,7 @@ class Qwen36Decoder(DecoderModel):
         small = step.context_rows == 0 and rows <= 8
         mx = rows <= 8
 
+        context_hidden = None
         residual = self.embed_tokens(ids)
         hidden = fp8.rms(residual, self.layers[0].input_norm)
         quantized = fp8.quant(hidden, True)
@@ -303,6 +305,15 @@ class Qwen36Decoder(DecoderModel):
             routes, probs, shared_gate, grouping = route_packed(
                 hidden, layer.router, step.cu_cpu, small
             )
+            final = index + 1 == self.num_hidden_layers
+            if final and last_context_only:
+                # A single context's earlier rows have already published their
+                # cache state. The sampler only consumes its last hidden row.
+                context_hidden = hidden
+                routed = routed[0][-1:], routed[1][-1:]
+                routes, probs = routes[-1:], probs[-1:]
+                shared_value, shared_gate = shared_value[-1:], shared_gate[-1:]
+                residual = residual[-1:]
             experts, inverse = routed_experts(
                 routed,
                 routes,
@@ -313,7 +324,6 @@ class Qwen36Decoder(DecoderModel):
             )
             current.wait_stream(self.side_stream)
             shared_value.record_stream(current)
-            final = index + 1 == self.num_hidden_layers
             next_norm = self.final_norm if final else self.layers[index + 1].input_norm
             residual, hidden, quantized = fp8.combine_next_norm(
                 experts,
@@ -340,6 +350,11 @@ class Qwen36Decoder(DecoderModel):
                 start : start + step.generation_requests
             ]
             clear_pending(first_cache.pending, slots)
+        if context_hidden is not None:
+            # Breakable graph buckets share an output buffer sized by prompt
+            # rows. This tensor keeps that shape for the runtime's logits gather.
+            context_hidden[-1:].copy_(hidden)
+            return context_hidden
         return hidden
 
 
@@ -402,8 +417,16 @@ class ModelingV2Qwen36Fp8Sm100(SpecDecOneEngineForCausalLM):
         resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
-        if is_in_breakable_cuda_graph() and attn_metadata.num_contexts == 1:
+        graph_prefill = is_in_breakable_cuda_graph() and attn_metadata.num_contexts == 1
+        if graph_prefill:
             self.model.stage_prefill(attn_metadata)
+        last_context_only = (
+            graph_prefill
+            and self.spec_worker is None
+            and not return_context_logits
+            and attn_metadata.num_contexts == 1
+            and attn_metadata.num_seqs == 1
+        )
         return super().forward(
             attn_metadata,
             input_ids,
@@ -412,6 +435,7 @@ class ModelingV2Qwen36Fp8Sm100(SpecDecOneEngineForCausalLM):
             return_context_logits,
             spec_metadata,
             resource_manager,
+            last_context_only=last_context_only,
             **kwargs,
         )
 

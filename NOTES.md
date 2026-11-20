@@ -68,10 +68,10 @@ cached KV. Decode uses runtime CUDA graph replay and the overlap scheduler.
 The port starts from standalone reference commit `4e6990d`.
 
 - `engine.py` supplies checkpoint placement, block ordering and rounding in `weights.py` and `modeling.py`.
-- `kernels.py`, `norm_exact.py` supplies target-local per-128 quantization, RMSNorm, activation/gate and MoE epilogues.
-- `mx_decode.py`, `dg_prefill.py` supplies sM100 MX-scaled dense decode and packed DeepGEMM prefill scales.
-- `tc_decode.py`, `prefill_tc.py`, `prefill_moe.py` supplies native FP8 tensor-core expert products and device-side grouping.
-- `spec_kernels.py`, `kernels.py` supplies compensated grouped attention, causal convolution and FP32 GDN recurrence adapted to scheduler pages and slots.
+- `kernels.py` and `norm_exact.py` supply target-local per-128 quantization, RMSNorm, activation/gate and MoE epilogues.
+- `mx_decode.py`, `dg_prefill.py` supply SM100 MX-scaled dense decode and packed DeepGEMM prefill scales.
+- `tc_decode.py`, `prefill_tc.py` and `prefill_moe.py` supply native FP8 tensor-core expert products and device-side grouping.
+- `spec_kernels.py` and `kernels.py` supply compensated grouped attention, causal convolution and FP32 GDN recurrence adapted to scheduler pages and slots.
 
 The canonical weights stay in E4M3 with their block scales. Dense and
 shared-expert projections also use the reference's E4M3 power-of-two packing
@@ -326,3 +326,73 @@ The fixed split and full prefill settings passed all short prompts at
 concurrency 8, 32 and 128, and all six long-prompt cases at ISL 1,024 and
 4,096 with OSL 128 at concurrency 8 and 32. The long trials saw 3 and 27
 permitted near-tie differences, respectively.
+
+## Serving MTP experiments
+
+Two-query attention paired adjacent verifier positions with the same
+partition boundaries, sharing their K/V loads. The 128-request test at
+context length 1,500 took 169.5 µs versus 284.0 µs for separate queries
+with 16 splits. Every quantized activation and scale matched in the
+kernel test, including pairs crossing scheduler page boundaries and the
+2,048-token tile switch. Reordering the GDN grid for two-row verification
+reduced its isolated 128-request kernel time from 216.5 to 192.3 µs.
+
+The serving schedule used draft lengths 3 through two requests, 2
+through eight, and 1 above eight. It passed the JSONL oracle. At
+concurrency 1, every short and long continuation matched the serial
+server. Packed requests produced disallowed greedy differences at
+concurrency 8 on short prompts and at concurrency 8 and 32 on long
+prompts. A fixed one-token draft also had packed differences. These
+experiments used OSL 64 on 6–35-token prompts and OSL 128 at ISL 1,024
+and 4,096. The launcher used serial target verification for this revision.
+
+| ISL | OSL | Concurrency | Serial (tokens/s) | Scheduled MTP trial (tokens/s) | Fixed one-token MTP trial (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 1,024 | 1 | 447.8 | 858.3 | 713.4 |
+| 1,024 | 1,024 | 8 | 2,034.7 | 2,385.9 | 2,096.7 |
+| 1,024 | 1,024 | 32 | 3,521.7 | 5,013.3 | 5,033.6 |
+| 1,024 | 1,024 | 128 | 7,382.2 | 7,151.7 | 8,047.0 |
+
+FlashInfer's pre-routed fused FP8 MoE took 174.8 µs at 128 rows versus
+183.3 µs for the native path in a rotating-weight kernel test. Its routed
+BF16 outputs had 5.03% relative L2 error against the native block-scaled
+path. The target keeps the native rounding and accumulation order.
+
+## First-token prefill
+
+For a single context in an exact-size breakable graph that only needs a
+sampled token, the final layer
+keeps its full attention, router and paged KV writes. It evaluates the
+routed expert products and final reduction for the last prompt row.
+This follows the last-row routing in the standalone engine's prefill
+path. Breakable graph buckets still publish the original hidden tensor
+shape so the runtime can gather the final row. Teacher-forced scoring
+continues to evaluate every token.
+
+The full oracle passed again with mean KL 0.006259 and 99.541% non-tie
+top-1. One-, 32- and 1,024-token generation calls agreed on their
+common prefixes across nine technical chat prompts.
+
+| ISL | OSL | V2 last-row TTFT (ms) | V2 last-row TPOT (ms) | V2 last-row decode (tokens/s) |
+| ---: | ---: | ---: | ---: |
+| 128 | 1,024 | 10.66 | 1.129 | 885.6 |
+| 1,024 | 1,024 | 22.50 | 1.078 | 927.8 |
+| 4,096 | 1,024 | 49.72 | 1.156 | 864.9 |
+
+## Native expert scheduling at serving batch sizes
+
+The native route tiles issue two K groups per barrier for each expert
+projection. The down projection uses a 128-column tile. At 128 rows,
+the separate rotating-weight tests measured 91.5 µs for gate/up and
+55.0 µs for down, versus 99.3 µs and 74.5 µs. Every tested output matched
+bit for bit. The long serving check covered six prompts and passed the
+near-tie rule at concurrency 1, 8, 32, and 128. The short checks at those
+same concurrency levels also passed, as did all 34 operation, routing,
+and stale-claim tests.
+
+| ISL | OSL | Concurrency | V2 retiled serving (tokens/s) | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 1,024 | 1 | 446.0 | 58.87 |
+| 1,024 | 1,024 | 8 | 2,029.4 | 126.38 |
+| 1,024 | 1,024 | 32 | 4,030.1 | 302.04 |
+| 1,024 | 1,024 | 128 | 8,273.3 | 771.33 |

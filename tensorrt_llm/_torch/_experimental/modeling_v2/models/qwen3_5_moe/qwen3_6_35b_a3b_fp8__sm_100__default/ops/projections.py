@@ -132,6 +132,7 @@ class RoutedExperts(OpWrapper):
     CELLS = (
         Cell("small decode routed by device expert IDs", {"rows": 1}),
         Cell("short packed prefill grouped by expert", {"rows": 11}),
+        Cell("batched native FP8 products and expert grouping", {"rows": 128}),
     )
     note = "Standalone TCGen05 expert kernels for short batches and FlashInfer groups for prefill."
 
@@ -185,12 +186,10 @@ class RoutedExperts(OpWrapper):
             return result, None
         if rows <= 256:
             grouping = fp8.group_routes(route)
-            tile = 64 if rows >= 32 else 128
-            up = prefill_tc.project(incoming, weights.up, grouping, rows, col_tile=tile, group=4)
+            up_tile = 64 if rows <= 16 else 128
+            up = prefill_tc.project(incoming, weights.up, grouping, rows, col_tile=up_tile, group=2)
             mid = fp8.activation(up, False, False)
-            return prefill_tc.project(
-                mid, weights.down, grouping, rows, down=True, col_tile=tile, group=4
-            ), None
+            return prefill_tc.project(mid, weights.down, grouping, rows, down=True, group=2), None
         return prefill_moe.grouped_experts(
             incoming,
             route,
