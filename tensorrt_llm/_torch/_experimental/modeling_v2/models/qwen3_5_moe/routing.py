@@ -80,6 +80,7 @@ def route(
         or spec.speculative_model is not None
         or not 1 <= spec.max_draft_len <= 3
         or spec.use_dynamic_tree
+        or spec.use_relaxed_acceptance_for_thinking
         or spec.draft_lm_head_dtype != "auto"
         or spec.draft_moe_dtype != "auto"
         or getattr(text, "mtp_num_hidden_layers", 0) != 1
@@ -96,6 +97,8 @@ def route(
         raise NoTarget("the Qwen3.6 target supports beam width one without LoRA or disaggregation")
     if llm_args.attn_backend != "TRTLLM":
         raise NoTarget("the Qwen3.6 target expects TRTLLM scheduler attention metadata")
+    if llm_args.torch_compile_config is not None:
+        raise NoTarget("the Qwen3.6 target uses eager kernels and runtime CUDA graphs")
     prefill_graph = llm_args.prefill_cuda_graph_backend.value
     if prefill_graph != "disabled" and (
         prefill_graph != "breakable"

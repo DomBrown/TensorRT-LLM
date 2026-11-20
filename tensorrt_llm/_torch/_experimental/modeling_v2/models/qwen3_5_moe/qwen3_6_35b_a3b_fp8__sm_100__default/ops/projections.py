@@ -183,11 +183,14 @@ class RoutedExperts(OpWrapper):
                 early=pdl,
             )
             return result, None
-        if rows <= 128:
+        if rows <= 256:
             grouping = fp8.group_routes(route)
-            up = prefill_tc.project(incoming, weights.up, grouping, rows, col_tile=128, group=4)
+            tile = 64 if rows >= 32 else 128
+            up = prefill_tc.project(incoming, weights.up, grouping, rows, col_tile=tile, group=4)
             mid = fp8.activation(up, False, False)
-            return prefill_tc.project(mid, weights.down, grouping, rows, down=True, group=4), None
+            return prefill_tc.project(
+                mid, weights.down, grouping, rows, down=True, col_tile=tile, group=4
+            ), None
         return prefill_moe.grouped_experts(
             incoming,
             route,

@@ -99,9 +99,27 @@ def _attention_slice(
         acc = tl.full((16, 256), 0.0, tl.float32)
         for pos in range(start, stop, TILE):
             token = pos + tl.arange(0, TILE)
-            table = request * 2 * TABLE_STRIDE + token // PAGE_SIZE
-            key_page = tl.load(Pages + table, token < stop, 0).to(tl.int64)
-            value_page = tl.load(Pages + table + TABLE_STRIDE, token < stop, 0).to(tl.int64)
+            request_base = Pages + request * 2 * TABLE_STRIDE
+            if PAGE_SIZE % TILE == 0:
+                page = request_base + pos // PAGE_SIZE
+                key_page = tl.broadcast_to(tl.load(page).to(tl.int64), (TILE,))
+                value_page = tl.broadcast_to(tl.load(page + TABLE_STRIDE).to(tl.int64), (TILE,))
+            elif TILE == PAGE_SIZE * 2:
+                page = request_base + pos // PAGE_SIZE
+                second = pos + PAGE_SIZE < stop
+                first_half = tl.arange(0, TILE) < PAGE_SIZE
+                key_page = tl.where(first_half, tl.load(page), tl.load(page + 1, second, -1)).to(
+                    tl.int64
+                )
+                value_page = tl.where(
+                    first_half,
+                    tl.load(page + TABLE_STRIDE),
+                    tl.load(page + TABLE_STRIDE + 1, second, -1),
+                ).to(tl.int64)
+            else:
+                table = request_base + token // PAGE_SIZE
+                key_page = tl.load(table, token < stop, 0).to(tl.int64)
+                value_page = tl.load(table + TABLE_STRIDE, token < stop, 0).to(tl.int64)
             within = (token % PAGE_SIZE * 2 + kv) * 256
             key = tl.load(
                 Cache + (key_page * PAGE_STRIDE + within)[:, None] + channels[None, :],

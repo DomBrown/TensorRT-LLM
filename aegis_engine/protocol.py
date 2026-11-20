@@ -23,8 +23,15 @@ def run(
 
     torch.set_num_threads(min(torch.get_num_threads(), 8))
     config = yaml.safe_load((Path(__file__).parent / "serve.yaml").read_text())
+    config.pop("speculative_config", None)
     config.update(modeling_v2=modeling_v2, max_batch_size=1)
     config["cuda_graph_config"]["batch_sizes"] = [1]
+    if modeling_v2 == "require" and draft_len:
+        config.update(
+            enable_chunked_prefill=False,
+            prefill_cuda_graph_backend="breakable",
+            prefill_capture_num_tokens=[128, 256, 512, 1024, 2048, 4096],
+        )
     page_size = config["kv_cache_config"].get("tokens_per_block", 32)
     config["kv_cache_config"]["max_tokens"] = 2 * config["max_seq_len"] + 2 * page_size
     generation = json.loads((model_dir / "generation_config.json").read_text())
@@ -52,9 +59,6 @@ def run(
             # The runtime speculative sampler does not return teacher-forced logits.
             gen_config = {
                 **config,
-                "enable_chunked_prefill": False,
-                "prefill_cuda_graph_backend": "breakable",
-                "prefill_capture_num_tokens": [128, 256, 512, 1024, 2048, 4096],
                 "speculative_config": MTPDecodingConfig(max_draft_len=draft_len),
             }
             generator = sessions.enter_context(LLM(str(model_dir), **gen_config))
@@ -91,7 +95,8 @@ def run(
                         include_stop_str_in_output=True,
                         detokenize=False,
                     )
-                    result = generator.generate(ids, params, use_tqdm=False)
+                    executor = scorer if count == 1 else generator
+                    result = executor.generate(ids, params, use_tqdm=False)
                     tokens = result.outputs[0].token_ids
                     if ignore_eos and len(tokens) != count:
                         raise RuntimeError(

@@ -129,6 +129,7 @@ class PagedDecodeAttention(OpWrapper):
             "batched decode crossing the long-context tile switch",
             {"lengths": (129, 2051), "page_size": 32},
         ),
+        Cell("packed split-KV decode", {"lengths": (63, 129, 271) * 6, "page_size": 16}),
     )
     note = "The Triton attention and FP8 epilogue preserve BF16 gate and FP32 softmax rounding."
 
@@ -143,7 +144,7 @@ class PagedDecodeAttention(OpWrapper):
         pdl: bool,
     ) -> tuple[torch.Tensor, ...]:
         rows = q.shape[0]
-        splits = 32
+        splits = 16
         part = q.new_empty((rows, 16, splits, 256), dtype=torch.float32)
         lse = q.new_empty((rows, 16, splits), dtype=torch.float32)
         attention.attention_paged[(2, splits, rows)](

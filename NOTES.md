@@ -293,3 +293,36 @@ All 23 SM100 operation cases passed.
 | 128 | 1,024 | 12.52 | 1.115 | 897.2 |
 | 1,024 | 1,024 | 23.44 | 1.064 | 939.7 |
 | 4,096 | 1,024 | 51.89 | 1.186 | 843.3 |
+
+## Scalar page lookups and narrower expert tiles
+
+The split-KV kernel loads one scalar page index for each K/V plane
+when an attention tile spans one page. For a two-page tile it loads
+both indices once. Other page geometries use the general address
+calculation. All decode batch sizes use 16 splits. A batch-size-dependent
+choice of 4 to 16 splits saved work at some sizes but introduced two
+disallowed differences on long-prompt concurrency checks. The serving
+launcher uses full prefill requests to preserve the same accumulation
+order across admission schedules.
+
+The native routed GEMM uses 64-column tiles for 32 to 256 rows. The
+128-row rotating expert test took 185.8 µs with the narrower tiles and
+195.8 µs with 128-column tiles, with identical BF16 output. At 256
+rows it took 209 µs versus 308 µs for the grouped implementation.
+
+The JSONL engine uses its exact prefill graphs for one-token requests,
+which need no draft pass. The contract smoke test covered that fast
+path, recovery from invalid requests, score field combinations,
+duplicate score IDs and stopping on EOS. The 32-case oracle passed
+at KL 0.006259 and 99.541% non-tie top-1.
+
+| ISL | OSL | V2 scalar page TTFT (ms) | V2 scalar page TPOT (ms) | V2 scalar page decode (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1,024 | 12.06 | 1.093 | 915.1 |
+| 1,024 | 1,024 | 22.07 | 1.074 | 930.9 |
+| 4,096 | 1,024 | 49.87 | 1.153 | 867.5 |
+
+The fixed split and full prefill settings passed all short prompts at
+concurrency 8, 32 and 128, and all six long-prompt cases at ISL 1,024 and
+4,096 with OSL 128 at concurrency 8 and 32. The long trials saw 3 and 27
+permitted near-tie differences, respectively.

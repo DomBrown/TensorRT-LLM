@@ -5,7 +5,7 @@ disable_mm_encoder: true
 max_batch_size: 128
 max_num_tokens: 8192
 max_seq_len: 8192
-enable_chunked_prefill: true
+enable_chunked_prefill: false
 cuda_graph_config:
   batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128]
   enable_padding: true

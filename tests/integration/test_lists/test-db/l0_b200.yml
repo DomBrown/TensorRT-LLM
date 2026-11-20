@@ -34,6 +34,7 @@ l0_b200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - unittest/_torch/modeling_v2/models/qwen3_5_moe/test_routing.py
   - unittest/_torch/modeling_v2/models/qwen3_5_moe/qwen3_6_35b_a3b_fp8__sm_100__default/test_ops.py
   - accuracy/modeling_v2/qwen3_5_moe/qwen3_6_35b_a3b_fp8__sm_100__default/test_accuracy.py::test_development_oracle
   - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_100__default_mtp_fused/spec/test_modeling_v2_mtp_step.py
