@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel
@@ -34,7 +33,8 @@ from .ops.linear_attention import (
 from .ops.projections import (
     RoutedWeights,
     dense_projection,
-    route_experts,
+    packed_delta_gates,
+    route_packed,
     routed_experts,
     shared_expert,
 )
@@ -255,7 +255,7 @@ class Qwen36Decoder(DecoderModel):
             if layer.linear:
                 self.side_stream.wait_stream(current)
                 with torch.cuda.stream(self.side_stream):
-                    ba = fp8.bf16_linear(hidden, layer.ba) if small else F.linear(hidden, layer.ba)
+                    ba = packed_delta_gates(hidden, layer.ba, step.cu_cpu)
             projected = dense_projection(quantized, layer.qkv)
             if layer.linear:
                 current.wait_stream(self.side_stream)
@@ -300,7 +300,9 @@ class Qwen36Decoder(DecoderModel):
             self.side_stream.wait_stream(current)
             with torch.cuda.stream(self.side_stream):
                 shared_value = shared_expert(shared, layer)
-            routes, probs, shared_gate, grouping = route_experts(hidden, layer.router, small, small)
+            routes, probs, shared_gate, grouping = route_packed(
+                hidden, layer.router, step.cu_cpu, small
+            )
             experts, inverse = routed_experts(
                 routed,
                 routes,

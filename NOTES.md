@@ -212,3 +212,32 @@ the local checkpoint and reference file.
 | 128 | 1,024 | 12.74 | 1.171 | 854.2 |
 | 1,024 | 1,024 | 22.23 | 1.136 | 880.2 |
 | 4,096 | 1,024 | 47.58 | 1.240 | 806.3 |
+
+## Packed-request greedy parity
+
+A layer trace found batch-size-dependent BF16 projections before the first
+packed prefill divergence. Using a fixed tensor-core accumulation order
+for both prefill and decode gave mean KL 0.005498 with three disallowed
+greedy differences. Using the rowwise FP32 reduction for all prefill
+projections gave mean KL 0.005852 with two disallowed differences.
+
+The passing path keeps each prompt's BF16 projection shape in packed
+prefill and uses the reference's rowwise FP32 reduction in decode. It
+preserves the batch-one oracle result at KL 0.006259 and 99.541% non-tie
+top-1. Against single-request serving, 32 requests at concurrency 8,
+32 at concurrency 32, and 128 at concurrency 128 all passed the
+near-tie rule. The comparisons used the top-two scores from the original
+single-request decode. There were 5, 21, and 84 near-tie differences,
+respectively, across those trials. Prompt lengths ranged from 6 to 35
+tokens, with OSL 64.
+
+Packing each prompt independently increased eager projection launches. At
+concurrency 128, median TTFT increased from 0.68 s to 20.44 s in the
+single-wave run. The median decode interval was 16.39 ms compared with
+15.49 ms in the first V2 revision.
+
+| ISL | OSL | Concurrency | Packed parity revision output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 1,024 | 8 | 1,154.3 | 379.16 |
+| 1,024 | 1,024 | 32 | 1,685.3 | 1,943.54 |
+| 1,024 | 1,024 | 128 | 3,514.9 | 20,436.15 |

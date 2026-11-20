@@ -16,6 +16,46 @@ from ..weights import DenseWeight, LayerWeights
 Activation = tuple[torch.Tensor, ...]
 
 
+class RowwiseProjection(OpWrapper):
+    """Decode BF16 router and DeltaNet gates with the same reduction for each row."""
+
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = (
+        Cell("four verifier rows and 64 DeltaNet gates", {"rows": 4, "columns": 64}),
+        Cell("129 packed rows with a separate shared expert gate", {"rows": 129, "columns": 257}),
+    )
+
+    def __call__(
+        self, hidden: torch.Tensor, weight: torch.Tensor, pdl: bool = False
+    ) -> torch.Tensor:
+        return fp8.bf16_linear(hidden, weight, pdl)
+
+    def reference(
+        self, hidden: torch.Tensor, weight: torch.Tensor, pdl: bool = False
+    ) -> torch.Tensor:
+        del pdl
+        with true_fp32_matmul():
+            return F.linear(hidden.float(), weight.float()).to(hidden.dtype)
+
+
+rowwise_projection = RowwiseProjection()
+
+
+def packed_delta_gates(
+    hidden: torch.Tensor, weight: torch.Tensor, context_starts: tuple[int, ...]
+) -> torch.Tensor:
+    """Use each prompt's original projection shape and the rowwise decode product."""
+    context_rows = context_starts[-1]
+    if not context_rows:
+        return rowwise_projection(hidden, weight)
+    if len(context_starts) == 2 and context_rows == hidden.shape[0]:
+        return F.linear(hidden, weight)
+    gates = [F.linear(hidden[a:b], weight) for a, b in zip(context_starts, context_starts[1:])]
+    if context_rows < hidden.shape[0]:
+        gates.append(rowwise_projection(hidden[context_rows:], weight))
+    return torch.cat(gates)
+
+
 class DenseProjection(OpWrapper):
     """Multiply group-128 activations by a block-128 FP8 projection."""
 
@@ -166,13 +206,15 @@ def shared_expert(activation: Activation, layer: LayerWeights) -> torch.Tensor:
 
 
 def route_experts(
-    hidden: torch.Tensor, router: torch.Tensor, small: bool, pdl: bool
+    hidden: torch.Tensor, router: torch.Tensor, small: bool, pdl: bool, *, decode: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
     """Return sorted top-eight per-token expert IDs, weights, and shared gates."""
     rows = hidden.shape[0]
-    split_gate = not small and rows > 8
+    split_gate = not (small or decode) and rows > 8
     weight = router[:256] if split_gate else router
-    logits = fp8.bf16_linear(hidden, weight, pdl=pdl) if small else F.linear(hidden, weight)
+    logits = (
+        rowwise_projection(hidden, weight, pdl) if small or decode else F.linear(hidden, weight)
+    )
     ids = hidden.new_empty((rows, 8), dtype=torch.int32)
     probs = hidden.new_empty((rows, 8))
     shared_gate = hidden.new_empty((rows,), dtype=torch.float32)
@@ -214,3 +256,22 @@ def route_experts(
             num_warps=4,
         )
     return ids, probs, shared_gate, routing
+
+
+def route_packed(
+    hidden: torch.Tensor, router: torch.Tensor, context_starts: tuple[int, ...], small: bool
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+    """Apply the same routing projections whether a request runs alone or in a batch."""
+    context_rows = context_starts[-1]
+    if not context_rows:
+        return route_experts(hidden, router, small, small, decode=True)
+    if len(context_starts) == 2 and context_rows == hidden.shape[0]:
+        return route_experts(hidden, router, False, False)
+    routing = [
+        route_experts(hidden[a:b], router, False, False)[:3]
+        for a, b in zip(context_starts, context_starts[1:])
+    ]
+    if context_rows < hidden.shape[0]:
+        routing.append(route_experts(hidden[context_rows:], router, False, False, decode=True)[:3])
+    route, probs, gate = (torch.cat(parts) for parts in zip(*routing, strict=True))
+    return route, probs, gate, None

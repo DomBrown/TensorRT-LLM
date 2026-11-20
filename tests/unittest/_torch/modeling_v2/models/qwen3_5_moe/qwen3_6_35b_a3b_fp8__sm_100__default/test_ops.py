@@ -34,6 +34,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35
     RoutedWeights,
     dense_projection,
     routed_experts,
+    rowwise_projection,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35b_a3b_fp8__sm_100__default.weights import (  # noqa: E501
     DenseWeight,
@@ -284,3 +285,17 @@ def test_mtp_draft_argmax(cell, certifying) -> None:
     out = torch.empty(rows, device="cuda", dtype=torch.int32)
     assert draft_argmax(logits, out) is out
     torch.testing.assert_close(out, draft_argmax.reference(logits).int())
+
+
+@pytest.mark.parametrize("cell", rowwise_projection.CELLS, ids=lambda cell: cell.why)
+def test_rowwise_projection(cell, certifying) -> None:
+    _begin()
+    certifying(rowwise_projection)
+    rows, columns = (cell.spec[name] for name in ("rows", "columns"))
+    hidden = _rand((rows, 2048), 0.4)
+    weight = _rand((columns, 2048), 0.1)
+    packed = rowwise_projection(hidden, weight)
+    solo = rowwise_projection(hidden[-1:], weight, True)
+    torch.testing.assert_close(packed[-1:], solo, rtol=0, atol=0)
+    expected = rowwise_projection.reference(hidden, weight)
+    assert_within_ulp(packed, expected, element_ulp=2, rms_ulp=0.5)
