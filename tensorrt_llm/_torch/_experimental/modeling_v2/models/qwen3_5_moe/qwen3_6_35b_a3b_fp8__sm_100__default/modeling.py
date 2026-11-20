@@ -14,13 +14,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import DecoderModel
 
 from .... import disable_v2_by_default
+from .cache import Qwen36HybridCacheManager, VerifierLayerCache, clear_pending
 from .kernels import fp8
+from .mtp import DraftShortlist, Qwen36MtpLayer
 from .ops.attention import KvPages, full_attention
 from .ops.linear_attention import (
     GdnWeights,
+    ReplayState,
     StatePool,
     context_gdn,
     gated_delta_output,
@@ -95,14 +99,17 @@ class Qwen36Decoder(DecoderModel):
     """Decode packed text tokens using model-local SM100 operations."""
 
     supports_prefill_cuda_graph = False
+    mtp_layer_cls = Qwen36MtpLayer
 
     def __init__(self, model_config: ModelConfig) -> None:
         super().__init__(model_config)
         self.embed_tokens = nn.Embedding(248320, 2048, dtype=torch.bfloat16, device="meta")
         self.layers = nn.ModuleList()
+        self.num_hidden_layers = model_config.pretrained_config.num_hidden_layers
         self.register_buffer("final_norm", None)
         self.register_buffer("rope", None)
         self.side_stream = torch.cuda.Stream()
+        self.aux_stream_dict = {"draft": self.side_stream}
         self._cache_manager = None
         self._attention_views = {}
         self._state_views = {}
@@ -113,7 +120,8 @@ class Qwen36Decoder(DecoderModel):
             return
         attention_views = {}
         state_views = {}
-        for index, layer in enumerate(self.layers):
+        for index in range(self.num_hidden_layers):
+            layer = self.layers[index]
             if layer.linear:
                 state_views[index] = manager.mamba_layer_cache(index)
             else:
@@ -162,6 +170,14 @@ class Qwen36Decoder(DecoderModel):
                 mamba.state_indices[contexts : contexts + step.generation_requests],
                 mamba.has_initial_states,
             )
+            replay = None
+            if isinstance(cache, VerifierLayerCache):
+                replay = ReplayState(
+                    cache.factors,
+                    cache.pending,
+                    mamba.replay_state_indices[contexts : contexts + step.generation_requests],
+                    cache.windows,
+                )
             decode = gated_delta_step(
                 projected[context_rows:],
                 ba[context_rows:],
@@ -170,6 +186,7 @@ class Qwen36Decoder(DecoderModel):
                 step.generation_steps,
                 False,
                 mx and not contexts,
+                replay,
             )
         if contexts and step.generation_requests:
             values = torch.cat((prefill, decode))
@@ -200,7 +217,8 @@ class Qwen36Decoder(DecoderModel):
         hidden = fp8.rms(residual, self.layers[0].input_norm)
         quantized = fp8.quant(hidden, True)
         current = torch.cuda.current_stream()
-        for index, layer in enumerate(self.layers):
+        for index in range(self.num_hidden_layers):
+            layer = self.layers[index]
             if layer.linear:
                 self.side_stream.wait_stream(current)
                 with torch.cuda.stream(self.side_stream):
@@ -255,7 +273,7 @@ class Qwen36Decoder(DecoderModel):
             )
             current.wait_stream(self.side_stream)
             shared_value.record_stream(current)
-            final = index + 1 == len(self.layers)
+            final = index + 1 == self.num_hidden_layers
             next_norm = self.final_norm if final else self.layers[index + 1].input_norm
             residual, hidden, quantized = fp8.combine_next_norm(
                 experts,
@@ -275,27 +293,43 @@ class Qwen36Decoder(DecoderModel):
                 None,
                 pdl=small,
             )
+        first_cache = self._state_views[0]
+        if step.generation_steps == 1 and isinstance(first_cache, VerifierLayerCache):
+            start = len(step.lengths)
+            slots = attn_metadata.mamba_metadata.replay_state_indices[
+                start : start + step.generation_requests
+            ]
+            clear_pending(first_cache.pending, slots)
         return hidden
 
 
 @disable_v2_by_default
-class ModelingV2Qwen36Fp8Sm100(DecoderModelForCausalLM):
+class ModelingV2Qwen36Fp8Sm100(SpecDecOneEngineForCausalLM):
     """Text-only Qwen3.6 causal LM using the TensorRT-LLM request executor."""
 
     use_fx_for_pcg_fallback = False
+    hybrid_kv_cache_manager_cls = Qwen36HybridCacheManager
+
+    @classmethod
+    def supports_spec_decode_fast_paths(cls, model_config: ModelConfig) -> bool:
+        return True
 
     def __init__(self, model_config: ModelConfig) -> None:
         self.text_config = model_config.pretrained_config.text_config
         # The runtime resolves GDN state and full-attention geometry from the text config.
         model_config = replace(model_config, pretrained_config=self.text_config)
+        if model_config.spec_config is not None:
+            self.text_config.num_nextn_predict_layers = 1
         super().__init__(
             Qwen36Decoder(model_config),
-            config=model_config,
+            model_config,
             hidden_size=2048,
             vocab_size=248320,
         )
         self.lm_head = VocabularyHead(2048, 248320, bias=False, device="meta", dtype=torch.bfloat16)
-        self.epilogue = [self.lm_head]
+        self.epilogue[0] = self.lm_head
+        if self.draft_model is not None:
+            self.draft_model.lm_head = self.lm_head
 
     def load_weights(self, weights: Mapping[str, torch.Tensor]) -> None:
         """Load text checkpoint tensors directly into the local model."""
@@ -306,6 +340,16 @@ class ModelingV2Qwen36Fp8Sm100(DecoderModelForCausalLM):
             self.text_config.layer_types,
             self.text_config.max_position_embeddings,
         )
+        if self.draft_model is not None:
+            draft = self.draft_model.mtp_layers[0]
+            draft.load_checkpoint(weights, self.model.rope)
+            self.model.layers.append(draft)
+
+    def post_load_weights(self) -> None:
+        """Share the vocabulary weights with the greedy draft shortlist."""
+        super().post_load_weights()
+        if self.spec_worker is not None:
+            self.spec_worker.draft_head = DraftShortlist(self.lm_head.weight)
 
     def infer_max_seq_len(self) -> int:
         """Use the text checkpoint position limit."""

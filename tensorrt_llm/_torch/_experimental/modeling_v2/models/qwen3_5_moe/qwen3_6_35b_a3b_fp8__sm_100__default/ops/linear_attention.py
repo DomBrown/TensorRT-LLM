@@ -27,6 +27,13 @@ class StatePool(NamedTuple):
     has_initial: torch.Tensor
 
 
+class ReplayState(NamedTuple):
+    factors: torch.Tensor
+    pending: torch.Tensor
+    slots: torch.Tensor
+    windows: torch.Tensor
+
+
 class GatedDeltaStep(OpWrapper):
     """Causal depthwise convolution and FP32 GDN recurrence on active slots."""
 
@@ -34,6 +41,10 @@ class GatedDeltaStep(OpWrapper):
     CELLS = (
         Cell("single continuation in a nonzero pool slot", {"pool_slots": (2,), "steps": 1}),
         Cell("batched rows with fresh and continuing slots", {"pool_slots": (4, 1), "steps": 1}),
+        Cell(
+            "batched four-row verification then accepted-prefix replay",
+            {"pool_slots": (2, 5), "steps": 4},
+        ),
     )
     note = "The convolution and recurrence retain the standalone engine's BF16 round points."
 
@@ -46,9 +57,15 @@ class GatedDeltaStep(OpWrapper):
         steps: int,
         reset_new: bool,
         pdl: bool,
+        replay: ReplayState | None = None,
     ) -> torch.Tensor:
         rows = projected.shape[0]
         requests = rows // steps
+        checkpoint = replay is not None and steps > 1
+        windows = replay.windows if checkpoint else pool.conv
+        factors = replay.factors if replay is not None else pool.temporal
+        pending = replay.pending if replay is not None else pool.slots
+        replay_slots = replay.slots if replay is not None else pool.slots
         convolved = projected.new_empty((rows, 8192))
         gdn.decode_conv[(requests, 32)](
             projected,
@@ -57,9 +74,13 @@ class GatedDeltaStep(OpWrapper):
             pool.slots,
             pool.has_initial,
             convolved,
+            windows,
             projected.stride(0),
             *pool.conv.stride(),
             steps,
+            checkpoint,
+            windows.stride(0),
+            windows.stride(1),
             reset_new,
             pdl,
             256,
@@ -76,8 +97,16 @@ class GatedDeltaStep(OpWrapper):
             pool.slots,
             pool.has_initial,
             output,
+            factors,
+            pending,
+            replay_slots,
             pool.temporal.stride(0),
             steps,
+            replay is not None,
+            checkpoint,
+            factors.stride(0),
+            factors.stride(1),
+            pending.stride(0),
             reset_new,
             16,
             pdl,
@@ -95,10 +124,19 @@ class GatedDeltaStep(OpWrapper):
         steps: int,
         reset_new: bool,
         pdl: bool,
+        replay: ReplayState | None = None,
     ) -> torch.Tensor:
         """Calculate the causal convolution and state updates in PyTorch."""
         del pdl
-        return _reference_gdn(projected, ba, weights, pool, (steps,) * len(pool.slots), reset_new)
+        return _reference_gdn(
+            projected,
+            ba,
+            weights,
+            pool,
+            (steps,) * len(pool.slots),
+            reset_new,
+            replay,
+        )
 
 
 def _reference_gdn(
@@ -108,6 +146,7 @@ def _reference_gdn(
     pool: StatePool,
     lengths: tuple[int, ...],
     reset_new: bool,
+    replay: ReplayState | None = None,
 ) -> torch.Tensor:
     outputs = []
     start = 0
@@ -118,6 +157,13 @@ def _reference_gdn(
         if not previous:
             history = torch.zeros_like(history)
             state = torch.zeros_like(state)
+        checkpoint = replay is not None and steps > 1
+        if replay is not None:
+            replay_slot = int(replay.slots[request])
+            length = int(replay.pending[replay_slot])
+            for factor in replay.factors[replay_slot, :length]:
+                key, delta, decay = factor.split((128, 128, 1), dim=-1)
+                state = torch.addcmul(state * decay[:, :, None], delta[:, :, None], key[:, None, :])
         raw = projected[start : start + steps, :8192]
         window = torch.cat((history, raw))
         convolved = F.silu((window.unfold(0, 4, 1).float() * weights.conv.float()).sum(dim=-1)).to(
@@ -136,8 +182,17 @@ def _reference_gdn(
             delta = (v.view(32, 128) - (state * k[:, None, :]).sum(-1)) * beta[:, None]
             state = torch.addcmul(state, delta[:, :, None], k[:, None, :])
             outputs.append((state * q[:, None, :]).sum(-1).flatten() / (128**0.5))
-        pool.conv[slot].copy_(window[-3:].T)
-        pool.temporal[slot].copy_(state)
+            if checkpoint:
+                replay.windows[request, offset].copy_(window[offset + 1 : offset + 4].T)
+                if offset == 0:
+                    pool.temporal[slot].copy_(state)
+                else:
+                    replay.factors[replay_slot, offset - 1].copy_(
+                        torch.cat((k, delta, decay[:, None]), dim=-1)
+                    )
+        if not checkpoint:
+            pool.conv[slot].copy_(window[-3:].T)
+            pool.temporal[slot].copy_(state)
         start += steps
     return torch.stack(outputs).to(projected.dtype)
 

@@ -65,15 +65,24 @@ def route(
         raise NoTarget("the Qwen3.6 target requires KV cache manager V2 with block reuse disabled")
     if cache.mamba_ssm_cache_dtype != "float32":
         raise NoTarget("the Qwen3.6 target requires kv_cache_config.mamba_ssm_cache_dtype=float32")
+    spec = model_config.spec_config
+    if spec is not None and (
+        not spec.spec_dec_mode.is_mtp_eagle_one_model()
+        or spec.speculative_model is not None
+        or not 1 <= spec.max_draft_len <= 3
+        or spec.use_dynamic_tree
+        or spec.draft_lm_head_dtype != "auto"
+        or spec.draft_moe_dtype != "auto"
+    ):
+        raise NoTarget(
+            "the Qwen3.6 target supports only the embedded linear MTP-Eagle head at depth 1–3"
+        )
     if (
-        model_config.spec_config is not None
-        or model_config.lora_config is not None
+        model_config.lora_config is not None
         or llm_args.cache_transceiver_config is not None
         or llm_args.max_beam_width != 1
     ):
-        raise NoTarget(
-            "the Qwen3.6 target supports beam width one without LoRA, drafts or disaggregation"
-        )
+        raise NoTarget("the Qwen3.6 target supports beam width one without LoRA or disaggregation")
     if llm_args.attn_backend != "TRTLLM":
         raise NoTarget("the Qwen3.6 target expects TRTLLM scheduler attention metadata")
 

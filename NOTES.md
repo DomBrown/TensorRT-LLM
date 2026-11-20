@@ -95,3 +95,69 @@ warm-up. The hybrid pool charged recurrent slots to that budget and reduced
 the allocatable sequence length to 5,824. The batch-1 adapter reserves room
 for both kinds of state, and the final CUDA graph captured with the full
 8,192-token limit.
+
+## Standalone reference on this GB200
+
+I ran a temporary copy of `/ref-engine/engine.sh` at `4e6990d`. Its local
+`/refs` tree is unavailable here. The copy points the intermediate CUTLASS
+tile at FlashInfer's installed headers and calls TensorRT-LLM's bundled
+DeepGEMM with the same packed power-of-two scales. Both changes are limited
+to the temporary comparator. It took 49.36 s to report ready with cold local
+kernel caches. The three prompt sets and the timing method match the V1 run.
+
+| ISL | OSL | Reference TTFT (ms) | Reference TPOT (ms) | Reference decode (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1,024 | 9.27 | 1.153 | 867.1 |
+| 1,024 | 1,024 | 17.95 | 1.092 | 915.5 |
+| 4,096 | 1,024 | 42.02 | 1.149 | 870.3 |
+
+### Serial target serving, ISL 1,024 and 4,096, OSL 1,024
+
+The first V2 commit completed the same closed-loop sweep as V1. A frontend
+disconnect interrupted the original run at ISL 4,096 and concurrency 8.
+The two remaining measurements succeeded on retry with the same server.
+
+| ISL | OSL | Concurrency | V1 output tokens/s | V2 output tokens/s | V2 median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 1,024 | 1 | 288.4 | 441.5 | 51.41 |
+| 1,024 | 1,024 | 2 | 530.7 | 780.6 | 100.25 |
+| 1,024 | 1,024 | 4 | 930.8 | 1,306.3 | 139.17 |
+| 1,024 | 1,024 | 8 | 1,591.2 | 1,917.8 | 122.10 |
+| 1,024 | 1,024 | 16 | 2,560.3 | 2,347.4 | 179.37 |
+| 1,024 | 1,024 | 32 | 3,927.8 | 3,785.6 | 258.91 |
+| 1,024 | 1,024 | 64 | 6,137.9 | 5,754.3 | 395.03 |
+| 1,024 | 1,024 | 128 | 8,435.6 | 7,895.3 | 679.43 |
+| 4,096 | 1,024 | 1 | 284.4 | 416.4 | 59.29 |
+| 4,096 | 1,024 | 8 | 1,486.7 | 1,764.6 | 248.36 |
+| 4,096 | 1,024 | 32 | 3,541.3 | 3,248.8 | 685.97 |
+
+## Three-token MTP
+
+The batch-1 adapter uses the runtime's embedded Eagle MTP worker with three
+drafts. The MTP layer shares the checkpoint's token embedding and output
+head. Its FP8 projections and paged attention use the same target operations
+as the trunk. The BF16 draft input fusion comes from the reference's
+`spec_kernels.py`. The greedy draft head searches the first 65,536 IDs, as in
+the standalone engine. The verifier always uses the full vocabulary. The
+adapter uses a second, non-speculative executor for teacher-forced score
+requests because the speculative sampler does not expose that operation.
+
+The hybrid manager allocates FP32 rank-one updates for rejected or accepted
+draft rows. It commits the first row's full GDN state and replays only the
+accepted updates at the next step. It uses the runtime's convolution window
+promotion and slot lifecycle. The shared executor change lets a selected
+Modeling V2 target provide its hybrid manager. All other targets keep the
+existing manager.
+
+The three-draft adapter passed all 32 development cases with mean KL
+**0.006259**, non-tie top-1 **2,171/2,181 (99.541%)**, 23 near ties and zero
+disallowed differences. In the short smoke requests the verifier produced
+2.857 tokens per iteration on average. Engine startup took 45.08 s. The
+serving wrapper continued to use the serial target configuration for this
+revision.
+
+| ISL | OSL | V2 MTP TTFT (ms) | V2 MTP TPOT (ms) | V2 MTP decode (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1,024 | 62.38 | 1.213 | 824.2 |
+| 1,024 | 1,024 | 63.74 | 1.181 | 847.0 |
+| 4,096 | 1,024 | 65.24 | 1.286 | 777.4 |

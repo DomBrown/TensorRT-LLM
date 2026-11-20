@@ -474,6 +474,11 @@ def get_kv_cache_manager_cls(
             return CppMambaHybridCacheManager
 
         _validate_v2_mamba_block_reuse_without_rebalance(kv_cache_config)
+        target_manager = getattr(
+            getattr(model_config, "modeling_v2_target", None),
+            "hybrid_kv_cache_manager_cls", None)
+        if target_manager is not None:
+            return target_manager
         if sparse_attn_algorithm == "qsa":
             return get_sparse_attn_kv_cache_manager(
                 sparse_attn_config, use_kv_cache_manager_v2=True)

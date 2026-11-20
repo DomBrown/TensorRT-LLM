@@ -6,16 +6,20 @@
 import json
 import os
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 from typing import TextIO
 
 
-def run(model_dir: Path, output: TextIO, *, modeling_v2: str = "require") -> None:
+def run(
+    model_dir: Path, output: TextIO, *, modeling_v2: str = "require", draft_len: int = 3
+) -> None:
     """Serve one request at a time on a TensorRT-LLM executor."""
     import torch
     import yaml
 
     from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm.llmapi import MTPDecodingConfig
 
     torch.set_num_threads(min(torch.get_num_threads(), 8))
     config = yaml.safe_load((Path(__file__).parent / "serve.yaml").read_text())
@@ -41,8 +45,16 @@ def run(model_dir: Path, output: TextIO, *, modeling_v2: str = "require") -> Non
         if not ids and not allow_empty:
             raise ValueError("ids must contain at least one token")
 
-    llm = LLM(str(model_dir), **config)
-    try:
+    with ExitStack() as sessions:
+        scorer = sessions.enter_context(LLM(str(model_dir), **config))
+        generator = scorer
+        if modeling_v2 == "require" and draft_len:
+            # The runtime speculative sampler does not return teacher-forced logits.
+            gen_config = {
+                **config,
+                "speculative_config": MTPDecodingConfig(max_draft_len=draft_len),
+            }
+            generator = sessions.enter_context(LLM(str(model_dir), **gen_config))
         send({"ready": True})
         for line in sys.stdin:
             try:
@@ -76,7 +88,7 @@ def run(model_dir: Path, output: TextIO, *, modeling_v2: str = "require") -> Non
                         include_stop_str_in_output=True,
                         detokenize=False,
                     )
-                    result = llm.generate(ids, params, use_tqdm=False)
+                    result = generator.generate(ids, params, use_tqdm=False)
                     tokens = result.outputs[0].token_ids
                     if ignore_eos and len(tokens) != count:
                         raise RuntimeError(
@@ -104,7 +116,7 @@ def run(model_dir: Path, output: TextIO, *, modeling_v2: str = "require") -> Non
                     params = SamplingParams(
                         max_tokens=1, temperature=0, detokenize=False, return_context_logits=True
                     )
-                    result = llm.generate(ids[:-1], params, use_tqdm=False)
+                    result = scorer.generate(ids[:-1], params, use_tqdm=False)
                     logits = result.context_logits
                     if logits is None or logits.shape[0] != positions:
                         raise RuntimeError(
@@ -129,8 +141,6 @@ def run(model_dir: Path, output: TextIO, *, modeling_v2: str = "require") -> Non
                 send(response)
             except (KeyError, ValueError, TypeError, RuntimeError) as exc:
                 send({"error": str(exc)})
-    finally:
-        llm.shutdown()
 
 
 def main() -> None:

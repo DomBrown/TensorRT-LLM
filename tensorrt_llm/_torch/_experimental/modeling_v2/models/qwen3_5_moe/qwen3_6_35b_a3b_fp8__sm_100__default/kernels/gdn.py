@@ -101,11 +101,15 @@ def decode_conv(
     Slots,
     Initial,
     Y,
+    Windows,
     X_STRIDE: tl.constexpr,
     H_SLOT: tl.constexpr,
     H_CHANNEL: tl.constexpr,
     H_TAP: tl.constexpr,
     STEPS: tl.constexpr,
+    CHECKPOINT: tl.constexpr,
+    WINDOW_REQUEST: tl.constexpr,
+    WINDOW_STEP: tl.constexpr,
     RESET_NEW: tl.constexpr,
     PDL: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -131,13 +135,22 @@ def decode_conv(
             acc += x.to(tl.float32) * coeff.to(tl.float32)
         y = acc / (1.0 + tl.exp(-acc))
         tl.store(Y + (request * STEPS + row) * 8192 + col, y)
-    for tap in tl.static_range(3):
-        relative = STEPS + tap - 3
-        if relative < 0:
-            x = tl.load(history + (relative + 3) * H_TAP, initial, 0)
-        else:
-            x = tl.load(X + (request * STEPS + relative) * X_STRIDE + col)
-        tl.store(history + tap * H_TAP, x)
+        if CHECKPOINT:
+            for tap in tl.static_range(3):
+                relative = row + tap - 2
+                if relative < 0:
+                    x = tl.load(history + (relative + 3) * H_TAP, initial, 0)
+                else:
+                    x = tl.load(X + (request * STEPS + relative) * X_STRIDE + col)
+                tl.store(Windows + request * WINDOW_REQUEST + row * WINDOW_STEP + col * 3 + tap, x)
+    if not CHECKPOINT:
+        for tap in tl.static_range(3):
+            relative = STEPS + tap - 3
+            if relative < 0:
+                x = tl.load(history + (relative + 3) * H_TAP, initial, 0)
+            else:
+                x = tl.load(X + (request * STEPS + relative) * X_STRIDE + col)
+            tl.store(history + tap * H_TAP, x)
 
 
 @tr.jit
@@ -150,8 +163,16 @@ def recurrent(
     Slots,
     Initial,
     Y,
+    Factors,
+    Pending,
+    ReplaySlots,
     STATE_STRIDE: tl.constexpr,
     STEPS: tl.constexpr,
+    REPLAY: tl.constexpr,
+    CHECKPOINT: tl.constexpr,
+    FACTOR_SLOT: tl.constexpr,
+    FACTOR_STEP: tl.constexpr,
+    PENDING_STRIDE: tl.constexpr,
     RESET_NEW: tl.constexpr,
     TILE: tl.constexpr,
     PDL: tl.constexpr,
@@ -164,6 +185,16 @@ def recurrent(
     initial = tl.load(Initial + request) if RESET_NEW else True
     ptr = State + slot * STATE_STRIDE + (head * 128 + v[:, None]) * 128 + k[None, :]
     state = tl.load(ptr, initial, 0)
+    if REPLAY:
+        replay_slot = tl.load(ReplaySlots + request).to(tl.int64)
+        factor = Factors + replay_slot * FACTOR_SLOT + head * 257
+        length = tl.load(Pending + replay_slot * PENDING_STRIDE)
+        for row in range(length):
+            update = factor + row * FACTOR_STEP
+            previous_key = tl.load(update + k)
+            previous_delta = tl.load(update + 128 + v)
+            previous_decay = tl.load(update + 256)
+            state = tl.fma(previous_delta[:, None], previous_key[None, :], state * previous_decay)
     if PDL:
         tl.extra.cuda.gdc_wait()
     decay = -tl.exp(tl.load(Decay + head).to(tl.float32))
@@ -185,7 +216,17 @@ def recurrent(
         state = tl.fma(delta[:, None], key[None, :], state)
         output = tl.sum(state * q[None, :], 1)
         tl.store(Y + token * 4096 + head * 128 + v, output)
-    tl.store(ptr, state)
+        if CHECKPOINT:
+            if row == 0:
+                tl.store(ptr, state)
+            else:
+                update = factor + (row - 1) * FACTOR_STEP
+                tl.store(update + 128 + v, delta)
+                if tile == 0:
+                    tl.store(update + k, key)
+                    tl.store(update + 256, g)
+    if not CHECKPOINT:
+        tl.store(ptr, state)
 
 
 @tr.jit

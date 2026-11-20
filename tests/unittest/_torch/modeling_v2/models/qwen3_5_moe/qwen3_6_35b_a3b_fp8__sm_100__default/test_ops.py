@@ -21,9 +21,13 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35b_a3b_fp8__sm_100__default.ops.linear_attention import (  # noqa: E501
     GdnWeights,
+    ReplayState,
     StatePool,
     context_gdn,
     gated_delta_step,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35b_a3b_fp8__sm_100__default.ops.multi_token import (  # noqa: E501
+    draft_input,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35b_a3b_fp8__sm_100__default.ops.projections import (  # noqa: E501
     RoutedWeights,
@@ -93,13 +97,42 @@ def test_gated_delta_step(cell, certifying) -> None:
     initial = torch.tensor([i % 2 == 0 for i in range(batch)], device="cuda")
     pool = StatePool(history, state, indices, initial)
     expected_pool = StatePool(history.clone(), state.clone(), indices, initial)
-    actual = gated_delta_step(projected, gates, weights, pool, steps, True, True)
+    replay = None
+    expected_replay = None
+    if steps > 1:
+        replay_indices = torch.tensor([1, 3], device="cuda", dtype=torch.int32)
+        scratch = torch.zeros((batch, steps, 8192, 3), device="cuda", dtype=BF16)
+        factors = torch.zeros((6, steps - 1, 32, 257), device="cuda")
+        pending = torch.zeros(6, device="cuda", dtype=torch.int32)
+        replay = ReplayState(factors, pending, replay_indices, scratch)
+        expected_replay = ReplayState(
+            factors.clone(), pending.clone(), replay_indices, scratch.clone()
+        )
+
+    actual = gated_delta_step(projected, gates, weights, pool, steps, True, True, replay)
     expected = gated_delta_step.reference(
-        projected, gates, weights, expected_pool, steps, True, True
+        projected, gates, weights, expected_pool, steps, True, True, expected_replay
     )
     assert_within_ulp(actual, expected, element_ulp=2, rms_ulp=0.5)
     torch.testing.assert_close(pool.conv, expected_pool.conv, rtol=0, atol=0)
     torch.testing.assert_close(pool.temporal, expected_pool.temporal, rtol=0.006, atol=2e-5)
+
+    if replay is not None:
+        accepted_positions = torch.tensor([2, 1], device="cuda", dtype=torch.int32)
+        for replay_state, state_pool in ((replay, pool), (expected_replay, expected_pool)):
+            replay_state.pending[replay_state.slots] = accepted_positions
+            state_pool.conv[indices] = replay_state.windows[
+                torch.arange(batch, device="cuda"), accepted_positions
+            ]
+        projected = _rand((batch, 12288), 0.25)
+        gates = _rand((batch, 64), 0.5)
+        actual = gated_delta_step(projected, gates, weights, pool, 1, False, True, replay)
+        expected = gated_delta_step.reference(
+            projected, gates, weights, expected_pool, 1, False, True, expected_replay
+        )
+        assert_within_ulp(actual, expected, element_ulp=2, rms_ulp=0.5)
+        torch.testing.assert_close(pool.conv, expected_pool.conv, rtol=0, atol=0)
+        torch.testing.assert_close(pool.temporal, expected_pool.temporal, rtol=0.006, atol=2e-5)
 
 
 @pytest.mark.parametrize("cell", dense_projection.CELLS, ids=lambda cell: cell.why)
@@ -220,3 +253,17 @@ def test_packed_context_gdn(cell, certifying) -> None:
     torch.testing.assert_close(
         pool.temporal[untouched], ref_pool.temporal[untouched], rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("cell", draft_input.CELLS, ids=lambda cell: cell.why)
+def test_mtp_draft_input(cell, certifying) -> None:
+    _begin()
+    certifying(draft_input)
+    rows = cell.spec["rows"]
+    ids = torch.tensor([3, 2, 7, 3][:rows], device="cuda", dtype=torch.int32)
+    embed = _rand((11, 2048))
+    hidden = _rand((rows, 2048))
+    embedding_norm, hidden_norm = _rand((2048,), 0.05), _rand((2048,), 0.05)
+    actual = draft_input(ids, embed, hidden, embedding_norm, hidden_norm)
+    expected = draft_input.reference(ids, embed, hidden, embedding_norm, hidden_norm)
+    assert_within_ulp(actual, expected, element_ulp=2, rms_ulp=0.5)
