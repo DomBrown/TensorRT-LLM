@@ -3,11 +3,13 @@
 
 """Full attention over TensorRT-LLM KV pages."""
 
+from itertools import accumulate
 from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
 import triton as tr
+from flash_attn import flash_attn_varlen_func
 from torch.nn.attention.bias import causal_lower_right
 
 from .....catalog._op import Arch, Cell, OpWrapper
@@ -264,38 +266,13 @@ def context_attention(
     return output
 
 
-def _batched_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Causal GQA SDPA over [prompts, length, heads, 256] packs of equal-length prompts."""
-    return F.scaled_dot_product_attention(
-        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True, enable_gqa=True
-    ).transpose(1, 2)
-
-
 def _fresh_context_attention(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, lengths: tuple[int, ...]
 ) -> torch.Tensor:
-    """Attend fresh prompts with one batched SDPA per distinct prompt length."""
-    if len(set(lengths)) == 1:
-        n, length = len(lengths), lengths[0]
-        out = _batched_causal(
-            q.view(n, length, 16, 256), k.view(n, length, 2, 256), v.view(n, length, 2, 256)
-        )
-        return out.reshape(q.shape)
-    starts: dict[int, list[int]] = {}
-    begin = 0
-    for length in lengths:
-        starts.setdefault(length, []).append(begin)
-        begin += length
-    output = torch.empty_like(q)
-    for length, group in starts.items():
-        offsets = torch.arange(length, device=q.device)
-        rows = (torch.tensor(group, device=q.device)[:, None] + offsets).flatten()
-        n = len(group)
-        out = _batched_causal(
-            q[rows].view(n, length, 16, 256), k[rows].view(n, length, 2, 256), v[rows].view(n, length, 2, 256)
-        )
-        output[rows] = out.reshape(n * length, 16, 256)
-    return output
+    """Attend every fresh prompt in one causal variable-length launch."""
+    cu = torch.tensor(tuple(accumulate(lengths, initial=0)), dtype=torch.int32, device=q.device)
+    longest = max(lengths)
+    return flash_attn_varlen_func(q, k, v, cu, cu, longest, longest, causal=True)
 
 
 def full_attention(

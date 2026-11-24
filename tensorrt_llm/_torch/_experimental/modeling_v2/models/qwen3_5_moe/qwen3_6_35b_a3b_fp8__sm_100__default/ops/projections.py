@@ -41,64 +41,18 @@ class RowwiseProjection(OpWrapper):
 rowwise_projection = RowwiseProjection()
 
 
-class ContextProjection(OpWrapper):
-    """Project equal-length prompts as a strided batch with shared weights."""
-
-    ARCHS = frozenset({Arch.SM_100})
-    CELLS = (
-        Cell(
-            "one short prompt preserves its standalone shape",
-            {"length": 128, "batch": 1, "columns": 257},
-        ),
-        Cell("two 1024-row DeltaNet prompts", {"length": 1024, "batch": 2, "columns": 64}),
-        Cell("three 4096-row router prompts", {"length": 4096, "batch": 3, "columns": 256}),
-    )
-
-    def __call__(
-        self, hidden: torch.Tensor, weight: torch.Tensor, prompt_length: int
-    ) -> torch.Tensor:
-        count = hidden.shape[0] // prompt_length
-        if count == 1:
-            return F.linear(hidden, weight)
-        inputs = hidden.view(count, prompt_length, hidden.shape[1])
-        weights = weight.T.expand(count, -1, -1)
-        return torch.bmm(inputs, weights).flatten(0, 1)
-
-    def reference(
-        self, hidden: torch.Tensor, weight: torch.Tensor, prompt_length: int
-    ) -> torch.Tensor:
-        """Project each prompt separately with the original BF16 rounding."""
-        return torch.cat([F.linear(rows, weight) for rows in hidden.split(prompt_length)])
-
-
-context_projection = ContextProjection()
-
-
-def _context_spans(starts: tuple[int, ...]) -> list[tuple[int, int, int]]:
-    """Group equal-length whole prompts with the same cuBLAS accumulation."""
-    spans = []
-    for start, end in zip(starts, starts[1:]):
-        length = end - start
-        if length >= 1024 and length % 128 == 0 and spans and spans[-1][2] == length:
-            start, _, _ = spans.pop()
-        spans.append((start, end, length))
-    return spans
-
-
 def packed_delta_gates(
     hidden: torch.Tensor, weight: torch.Tensor, context_starts: tuple[int, ...]
 ) -> torch.Tensor:
-    """Project context spans and the rowwise decode suffix in request order."""
+    """Project all context rows at once and the rowwise decode suffix in request order."""
     context_rows = context_starts[-1]
     if not context_rows:
         return rowwise_projection(hidden, weight)
-    gates = [
-        context_projection(hidden[a:b], weight, length)
-        for a, b, length in _context_spans(context_starts)
-    ]
-    if context_rows < hidden.shape[0]:
-        gates.append(rowwise_projection(hidden[context_rows:], weight))
-    return gates[0] if len(gates) == 1 else torch.cat(gates)
+    if context_rows == hidden.shape[0]:
+        return F.linear(hidden, weight)
+    return torch.cat(
+        (F.linear(hidden[:context_rows], weight), rowwise_projection(hidden[context_rows:], weight))
+    )
 
 
 class DenseProjection(OpWrapper):
@@ -282,15 +236,12 @@ def route_experts(
     pdl: bool,
     *,
     decode: bool = False,
-    prompt_length: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
     """Return sorted top-eight per-token expert IDs, weights, and shared gates."""
     rows = hidden.shape[0]
     split_gate = not (small or decode) and rows > 8
     weight = router[:256] if split_gate else router
-    if prompt_length is not None:
-        logits = context_projection(hidden, weight, prompt_length)
-    elif small or decode:
+    if small or decode:
         logits = rowwise_projection(hidden, weight, pdl)
     else:
         logits = F.linear(hidden, weight)
@@ -340,18 +291,13 @@ def route_experts(
 def route_packed(
     hidden: torch.Tensor, router: torch.Tensor, context_starts: tuple[int, ...], small: bool
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
-    """Apply the same routing projections whether a request runs alone or in a batch."""
+    """Route all context rows at once and the rowwise decode suffix in request order."""
     context_rows = context_starts[-1]
     if not context_rows:
         return route_experts(hidden, router, small, small, decode=True)
-    spans = _context_spans(context_starts)
-    if len(spans) == 1 and context_rows == hidden.shape[0]:
-        return route_experts(hidden, router, False, False, prompt_length=spans[0][2])
-    routing = [
-        route_experts(hidden[a:b], router, False, False, prompt_length=length)[:3]
-        for a, b, length in spans
-    ]
-    if context_rows < hidden.shape[0]:
-        routing.append(route_experts(hidden[context_rows:], router, False, False, decode=True)[:3])
-    route, probs, gate = (torch.cat(parts) for parts in zip(*routing, strict=True))
+    if context_rows == hidden.shape[0]:
+        return route_experts(hidden, router, False, False)
+    context = route_experts(hidden[:context_rows], router, False, False)[:3]
+    decode = route_experts(hidden[context_rows:], router, False, False, decode=True)[:3]
+    route, probs, gate = (torch.cat(parts) for parts in zip(context, decode, strict=True))
     return route, probs, gate, None
