@@ -24,7 +24,7 @@ def qkv_rope_paged(
     TABLE_STRIDE: tl.constexpr,
     PAGE_STRIDE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
-    CONTEXT_ROWS: tl.constexpr,
+    CONTEXT_ROWS,
     PDL: tl.constexpr,
 ):
     """Normalize and rotate Q/K, write paged K/V and keep dense prefill K/V."""
@@ -217,7 +217,7 @@ def gather_paged(
     TABLE_STRIDE: tl.constexpr,
     PAGE_STRIDE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
-    LENGTH: tl.constexpr,
+    LENGTH,
     TILE: tl.constexpr,
 ):
     offset = tl.program_id(0) * TILE + tl.arange(0, TILE)

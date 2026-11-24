@@ -19,7 +19,7 @@ def context_conv(
     Q,
     K,
     V,
-    ROWS: tl.constexpr,
+    ROWS,
     X_STRIDE: tl.constexpr,
     H_SLOT: tl.constexpr,
     H_CHANNEL: tl.constexpr,
