@@ -72,8 +72,6 @@ def route(
         raise NoTarget("the Qwen3.6 target requires BF16 KV pages")
     if cache.use_kv_cache_manager_v2 is False or cache.enable_block_reuse:
         raise NoTarget("the Qwen3.6 target requires KV cache manager V2 with block reuse disabled")
-    if cache.mamba_ssm_cache_dtype != "float32":
-        raise NoTarget("the Qwen3.6 target requires kv_cache_config.mamba_ssm_cache_dtype=float32")
     spec = model_config.spec_config
     if spec is not None and (
         not spec.spec_dec_mode.is_mtp_eagle_one_model()

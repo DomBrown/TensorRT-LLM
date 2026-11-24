@@ -12,4 +12,3 @@ cuda_graph_config:
 kv_cache_config:
   free_gpu_memory_fraction: 0.65
   enable_block_reuse: false
-  mamba_ssm_cache_dtype: float32

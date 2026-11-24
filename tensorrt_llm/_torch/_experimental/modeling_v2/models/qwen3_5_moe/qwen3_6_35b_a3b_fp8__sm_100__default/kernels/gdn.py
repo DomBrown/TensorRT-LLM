@@ -176,7 +176,7 @@ def recurrent(
     slot = tl.load(Slots + request).to(tl.int64)
     initial = tl.load(Initial + request) if RESET_NEW else True
     ptr = State + slot * STATE_STRIDE + (head * 128 + v[:, None]) * 128 + k[None, :]
-    state = tl.load(ptr, initial, 0)
+    state = tl.load(ptr, initial, 0).to(tl.float32)
     if REPLAY:
         replay_slot = tl.load(ReplaySlots + request).to(tl.int64)
         factor = Factors + replay_slot * FACTOR_SLOT + head * 257
@@ -210,7 +210,7 @@ def recurrent(
         tl.store(Y + token * 4096 + head * 128 + v, output)
         if CHECKPOINT:
             if row == 0:
-                tl.store(ptr, state)
+                tl.store(ptr, state.to(State.dtype.element_ty))
             else:
                 update = factor + (row - 1) * FACTOR_STEP
                 tl.store(update + 128 + v, delta)
@@ -218,7 +218,7 @@ def recurrent(
                     tl.store(update + k, key)
                     tl.store(update + 256, g)
     if not CHECKPOINT:
-        tl.store(ptr, state)
+        tl.store(ptr, state.to(State.dtype.element_ty))
 
 
 @tr.jit
