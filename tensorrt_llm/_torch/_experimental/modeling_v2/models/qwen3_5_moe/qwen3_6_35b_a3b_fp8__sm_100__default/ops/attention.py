@@ -225,6 +225,8 @@ def context_attention(
     cached: tuple[int, ...],
 ) -> torch.Tensor:
     """Causal SDPA for fresh prompts and continuation chunks in a mixed step."""
+    if len(lengths) > 1 and not any(cached):
+        return _fresh_context_attention(q, k, v, lengths)
     output = torch.empty_like(q)
     begin = 0
     for request, (length, prefix) in enumerate(zip(lengths, cached)):
@@ -259,6 +261,40 @@ def context_attention(
         )
         output[begin:end].copy_(result.squeeze(0).transpose(0, 1))
         begin = end
+    return output
+
+
+def _batched_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Causal GQA SDPA over [prompts, length, heads, 256] packs of equal-length prompts."""
+    return F.scaled_dot_product_attention(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True, enable_gqa=True
+    ).transpose(1, 2)
+
+
+def _fresh_context_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, lengths: tuple[int, ...]
+) -> torch.Tensor:
+    """Attend fresh prompts with one batched SDPA per distinct prompt length."""
+    if len(set(lengths)) == 1:
+        n, length = len(lengths), lengths[0]
+        out = _batched_causal(
+            q.view(n, length, 16, 256), k.view(n, length, 2, 256), v.view(n, length, 2, 256)
+        )
+        return out.reshape(q.shape)
+    starts: dict[int, list[int]] = {}
+    begin = 0
+    for length in lengths:
+        starts.setdefault(length, []).append(begin)
+        begin += length
+    output = torch.empty_like(q)
+    for length, group in starts.items():
+        offsets = torch.arange(length, device=q.device)
+        rows = (torch.tensor(group, device=q.device)[:, None] + offsets).flatten()
+        n = len(group)
+        out = _batched_causal(
+            q[rows].view(n, length, 16, 256), k[rows].view(n, length, 2, 256), v[rows].view(n, length, 2, 256)
+        )
+        output[rows] = out.reshape(n * length, 16, 256)
     return output
 
 
