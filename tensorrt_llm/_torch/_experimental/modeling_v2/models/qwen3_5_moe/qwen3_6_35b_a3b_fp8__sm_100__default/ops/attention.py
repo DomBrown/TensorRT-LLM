@@ -72,6 +72,11 @@ _CALL_CONSTANTS = dict(
 
 def attention_step(md: TrtllmAttentionMetadata) -> dict:
     """Read the prepared paged-attention buffers once for the whole stack."""
+    offsets = None
+    if md.is_spec_decoding_enabled and md.use_spec_decoding:
+        offsets = md.spec_decoding_position_offsets
+        if offsets is not None and offsets.ndim == 1:
+            offsets = offsets.view(md.max_num_requests, -1)
     return dict(
         sequence_length=md.kv_lens_cuda_runtime,
         host_past_key_value_lengths=md.kv_lens_runtime,
@@ -90,7 +95,7 @@ def attention_step(md: TrtllmAttentionMetadata) -> dict:
         # No sliding window: the full admitted length on every attention layer.
         attention_window_size=md.max_seq_len,
         num_contexts=md.num_contexts,
-        num_ctx_tokens=md.num_ctx_tokens,
+        num_ctx_tokens=md.num_ctx_tokens if md.num_contexts else 0,
         trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
         use_paged_context_fmha=md.use_paged_context_fmha,
         beam_width=md.effective_beam_width,
@@ -102,7 +107,7 @@ def attention_step(md: TrtllmAttentionMetadata) -> dict:
         use_spec_decoding=md.use_spec_decoding,
         is_spec_dec_tree=md.is_spec_dec_tree,
         spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
-        spec_decoding_position_offsets=None,
+        spec_decoding_position_offsets=offsets,
         spec_decoding_packed_mask=md.spec_decoding_packed_mask,
         spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
         spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
@@ -196,7 +201,7 @@ qkv_projection = PrepareQkv()
 
 
 class PagedDecodeAttention(OpWrapper):
-    """Append BF16 KV and compute one causal GQA query per request."""
+    """Append BF16 KV and compute causal GQA for a linear chain per request."""
 
     ARCHS = frozenset({Arch.SM_100})
     CELLS = (
@@ -205,6 +210,10 @@ class PagedDecodeAttention(OpWrapper):
         Cell(
             "coalesced layers and varied history lengths",
             {"positions": (143, 31, 161), "layers": 3},
+        ),
+        Cell(
+            "linear four-token verification chains across a page boundary",
+            {"positions": (30, 31, 32, 33, 112, 113, 114, 115), "query_rows": 4},
         ),
     )
 
@@ -215,8 +224,9 @@ class PagedDecodeAttention(OpWrapper):
         positions: torch.Tensor,
         key_pages: torch.Tensor,
         max_seq_len: int,
+        query_rows: int = 1,
     ) -> torch.Tensor:
-        return paged_decode(qkv, pool, positions, key_pages, max_seq_len)
+        return paged_decode(qkv, pool, positions, key_pages, max_seq_len, query_rows)
 
     def reference(
         self,
@@ -225,6 +235,7 @@ class PagedDecodeAttention(OpWrapper):
         positions: torch.Tensor,
         key_pages: torch.Tensor,
         max_seq_len: int,
+        query_rows: int = 1,
     ) -> torch.Tensor:
         page_size = pool.shape[-2]
         row_stride = pool.stride(0) // pool.stride(1)
@@ -232,7 +243,7 @@ class PagedDecodeAttention(OpWrapper):
         output = torch.empty_like(q)
         for i, position in enumerate(positions.tolist()):
             logical_page, offset = divmod(position, page_size)
-            ids = key_pages[i, : logical_page + 1].long() // row_stride
+            ids = key_pages[i // query_rows, : logical_page + 1].long() // row_stride
             page = int(ids[-1])
             pool[page, 0, :, offset].copy_(k[i].view(2, 256))
             pool[page, 1, :, offset].copy_(v[i].view(2, 256))

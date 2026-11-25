@@ -13,6 +13,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35
     SHORT_CONTEXT,
     causal_convolution,
     gated_delta_rule,
+    verify_conv,
+    verify_gdn,
 )
 
 __extra_import_path__ = ["../../.."]
@@ -87,3 +89,44 @@ def test_gated_delta_rule(cell, certifying):  # noqa: F811
     untouched = sorted(set(range(num_slots)) - set(cell.spec["slots"]))
     assert torch.equal(storage[untouched], reference_storage[untouched])
     assert torch.equal(storage[:, ::2], reference_storage[:, ::2])
+
+
+@pytest.mark.parametrize("cell", verify_conv.CELLS, ids=lambda cell: cell.why)
+def test_verify_convolution(cell, certifying):  # noqa: F811
+    certifying(verify_conv)
+    torch.manual_seed(17)
+    slots = torch.tensor(cell.spec["slots"], device="cuda", dtype=torch.int32)
+    width = cell.spec["width"]
+    raw = torch.randn(slots.numel() * width, 12288, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(8192, 1, 4, device="cuda", dtype=torch.bfloat16)
+    history = torch.randn(8, 3, 8192, 3, device="cuda", dtype=torch.bfloat16)[:, 1]
+    saved = history.clone()
+    staged = torch.zeros(4, 4, 8192, 3, device="cuda", dtype=torch.bfloat16)
+    expected_staged = staged.clone()
+    actual = verify_conv(raw, weights, slots, history, staged, width)
+    with true_fp32_matmul():
+        expected = verify_conv.reference(raw, weights, slots, history, expected_staged, width)
+    assert_within_ulp(actual, expected, element_ulp=2, rms_ulp=0.1)
+    assert torch.equal(history, saved)
+    assert torch.equal(staged, expected_staged)
+
+
+@pytest.mark.parametrize("cell", verify_gdn.CELLS, ids=lambda cell: cell.why)
+def test_verify_gated_delta_rule(cell, certifying):  # noqa: F811
+    certifying(verify_gdn)
+    torch.manual_seed(27)
+    slots = torch.tensor(cell.spec["slots"], device="cuda", dtype=torch.int32)
+    width = cell.spec["width"]
+    rows = width * slots.numel()
+    state = torch.randn(8, 3, 32, 128, 128, device="cuda")[:, 1] * 0.02
+    saved = state.clone()
+    mixed = torch.randn(rows, 8192, device="cuda", dtype=torch.bfloat16)
+    alpha = torch.rand(rows, 32, device="cuda") * 0.3 + 0.7
+    beta = torch.rand(rows, 32, device="cuda")
+    staged = torch.zeros(4, 4, 32, 128, 128, device="cuda")
+    expected_staged = staged.clone()
+    actual = verify_gdn(mixed, alpha, beta, slots, state, staged, width)
+    expected = verify_gdn.reference(mixed, alpha, beta, slots, state, expected_staged, width)
+    assert_within_ulp(actual, expected, element_ulp=1, rms_ulp=0.1)
+    assert torch.equal(state, saved)
+    torch.testing.assert_close(staged, expected_staged, atol=2e-7, rtol=1e-5)

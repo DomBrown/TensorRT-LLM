@@ -11,6 +11,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.routing im
     _TEXT_SHAPE,
     route,
 )
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 
@@ -18,6 +19,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 def deployment():
     text = deepcopy(_TEXT_SHAPE)
     text["layer_types"] = (["linear_attention"] * 3 + ["full_attention"]) * 10
+    text["mtp_num_hidden_layers"] = 1
     text["rope_parameters"] = {"partial_rotary_factor": 0.25, "rope_theta": 10_000_000}
     quantization = {"fmt": "e4m3", "weight_block_size": [128, 128], "activation_scheme": "dynamic"}
     config = SimpleNamespace(
@@ -63,6 +65,7 @@ def test_routes_the_official_fp8_text_geometry(deployment) -> None:
         ("args", "max_beam_width", 2, (10, 0)),
         ("cache", "enable_block_reuse", True, (10, 0)),
         ("cache", "dtype", "fp8", (10, 0)),
+        ("cache", "mamba_ssm_cache_dtype", "bfloat16", (10, 0)),
         ("mapping", "world_size", 2, (10, 0)),
         ("mapping", "world_size", 1, (10, 3)),
     ],
@@ -82,3 +85,21 @@ def test_declines_unsupported_deployment(deployment, part, key, value, capabilit
         setattr(object_to_update, key, value)
     with pytest.raises(NoTarget):
         route(config, args, capability)
+
+
+@pytest.mark.cpu_only
+def test_routes_linear_embedded_mtp(deployment, monkeypatch) -> None:
+    config, args = deployment
+    config.spec_config = MTPDecodingConfig(max_draft_len=3)
+    monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
+    assert route(config, args, (10, 0)).__name__ == "ModelingV2Qwen3635BA3BFp8Sm100Default"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("options", [{"max_draft_len": 4}, {"use_mtp_vanilla": True}])
+def test_declines_unsupported_speculation(deployment, monkeypatch, options) -> None:
+    config, args = deployment
+    config.spec_config = MTPDecodingConfig(**({"max_draft_len": 3} | options))
+    monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
+    with pytest.raises(NoTarget, match="linear embedded MTP"):
+        route(config, args, (10, 0))

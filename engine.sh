@@ -8,4 +8,5 @@ if [[ $# -ne 1 ]]; then
 fi
 export PYTHONPATH="$(dirname -- "$(realpath -- "$0")")${PYTHONPATH:+:$PYTHONPATH}"
 export TLLM_WORKER_USE_SINGLE_PROCESS=1
+export TRTLLM_USE_GDN_REPLAY=0
 exec python3 -u -m aegis_engine "$1"

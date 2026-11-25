@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from tensorrt_llm._torch.utils import is_gdn_replay_enabled
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._router_index import NoTarget, routes
@@ -66,8 +67,21 @@ def route(
         raise NoTarget("Qwen3.6-35B-A3B FP8 requires single-rank TP1")
     if not llm_args.disable_mm_encoder or llm_args.mm_encoder_only:
         raise NoTarget("Qwen3.6-35B-A3B FP8 is text-only. Set disable_mm_encoder=True.")
-    if model_config.spec_config is not None:
-        raise NoTarget("Qwen3.6-35B-A3B FP8 currently serves without speculation")
+    spec = model_config.spec_config
+    if spec is not None and (
+        not spec.spec_dec_mode.is_mtp_eagle_one_model()
+        or spec.max_draft_len not in (1, 2, 3)
+        or text.get("mtp_num_hidden_layers") != 1
+        or spec.use_dynamic_tree
+        or spec.use_rejection_sampling
+        or spec.draft_len_schedule is not None
+        or spec.speculative_model is not None
+        or spec.sa_config is not None
+        or spec.draft_lm_head_dtype != "auto"
+        or spec.draft_moe_dtype != "auto"
+        or is_gdn_replay_enabled()
+    ):
+        raise NoTarget("Qwen3.6-35B-A3B FP8 supports linear embedded MTP with staged GDN state")
     if model_config.lora_config is not None or llm_args.max_beam_width != 1:
         raise NoTarget("Qwen3.6-35B-A3B FP8 requires beam width 1 and no LoRA")
     cache = llm_args.kv_cache_config
@@ -76,7 +90,7 @@ def route(
         or cache.use_kv_cache_manager_v2 is False
         or cache.dtype not in ("auto", "bfloat16")
         or cache.max_attention_window is not None
-        or cache.mamba_ssm_cache_dtype not in ("auto", "float32")
+        or cache.mamba_ssm_cache_dtype != "float32"
         or llm_args.enable_return_routed_experts
     ):
         raise NoTarget("Qwen3.6-35B-A3B FP8 requires BF16 paged KV and FP32 recurrent state")

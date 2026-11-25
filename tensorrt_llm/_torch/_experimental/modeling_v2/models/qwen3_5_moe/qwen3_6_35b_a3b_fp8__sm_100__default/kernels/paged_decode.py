@@ -22,12 +22,15 @@ def _append_decode(
     PAGE_SIZE: tl.constexpr,
     PAGE_STRIDE: tl.constexpr,
     WIDTH: tl.constexpr,
+    QUERY_ROWS: tl.constexpr,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
     d = tl.arange(0, 256)
     position = tl.load(POS + row)
-    page = tl.load(BLOCKS + row * BLOCK_ROW_STRIDE + position // PAGE_SIZE).to(tl.int64)
+    page = tl.load(BLOCKS + (row // QUERY_ROWS) * BLOCK_ROW_STRIDE + position // PAGE_SIZE).to(
+        tl.int64
+    )
     page_offset = page * PAGE_STRIDE
     offset = (head * PAGE_SIZE + position % PAGE_SIZE) * 256 + d
     k = tl.load(QKV + row * WIDTH + 4096 + head * 256 + d)
@@ -51,6 +54,7 @@ def _decode_attention(
     BN: tl.constexpr,
     SPLIT_LEN: tl.constexpr,
     WIDTH: tl.constexpr,
+    QUERY_ROWS: tl.constexpr,
 ):
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -71,9 +75,9 @@ def _decode_attention(
         acc = tl.full((16, 256), 0.0, tl.float32)
         for idx in range(start, tl.minimum(end, start + SPLIT_LEN), BN):
             p = idx + n
-            page = tl.load(BLOCKS + row * BLOCK_ROW_STRIDE + p // PAGE_SIZE, p < end, -1).to(
-                tl.int64
-            )
+            page = tl.load(
+                BLOCKS + (row // QUERY_ROWS) * BLOCK_ROW_STRIDE + p // PAGE_SIZE, p < end, -1
+            ).to(tl.int64)
             address = page * PAGE_STRIDE + (kv_head * PAGE_SIZE + p % PAGE_SIZE) * 256
             live = (p < end) & (page >= 0)
             k = tl.load(POOL + address[None, :] + d[:, None], live[None, :], 0)
@@ -114,12 +118,13 @@ def paged_decode(
     positions: torch.Tensor,
     key_pages: torch.Tensor,
     max_seq_len: int,
+    query_rows: int = 1,
 ) -> torch.Tensor:
     """Append and read packed QKV against paired HND K/V pages."""
     rows, width = qkv.shape
     page_size = pool.shape[-2]
     stride = pool.stride(1)
-    split_length = 128 if rows == 1 else 256
+    split_length = 128 if rows == query_rows else 256
     splits = triton.cdiv(max_seq_len, split_length)
     partial = torch.empty(
         (rows, splits, _Q_HEADS, _HEAD_DIM), device=qkv.device, dtype=torch.float32
@@ -134,6 +139,7 @@ def paged_decode(
         page_size,
         stride,
         width,
+        query_rows,
         num_warps=4,
     )
     _decode_attention[(rows, _KV_HEADS, splits)](
@@ -150,6 +156,7 @@ def paged_decode(
         32,
         split_length,
         width,
+        query_rows,
         num_warps=4,
     )
     out = qkv.new_empty((rows, _Q_HEADS * _HEAD_DIM))

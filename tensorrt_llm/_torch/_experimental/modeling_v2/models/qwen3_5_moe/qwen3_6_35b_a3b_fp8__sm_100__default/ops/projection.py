@@ -90,12 +90,22 @@ class DecodeGates(OpWrapper):
     )
 
     def __call__(
-        self, x: torch.Tensor, weight: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        a_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        query_rows: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return bf16_decode.gates(x, weight, a_log, dt_bias, True, x.shape[0])
+        return bf16_decode.gates(x, weight, a_log, dt_bias, True, x.shape[0] // query_rows)
 
     def reference(
-        self, x: torch.Tensor, weight: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        a_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        query_rows: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         ab = F.linear(x.float(), weight.float()).to(BF16).float()
         a, b = ab.chunk(2, dim=-1)
@@ -136,24 +146,26 @@ class RoutedExperts(OpWrapper):
         fixed_router: bool,
         route_counts: torch.Tensor,
         gemm: PrefillGemm,
+        query_rows: int = 1,
     ) -> ExpertOutputs:
         rows = x.shape[0]
+        batch = rows // query_rows
         wide_prefill = not decode and rows >= 512
         small_prefill = not decode and 64 <= rows < 512
         fast = decode or small_prefill
         tile_rows = (16 if rows >= 256 else fp8_decode.ROUTE_BLOCK) if fast else 64
         schedule = slots = counts = None
-        if decode and rows >= 32:
+        if decode and batch >= 32:
             logits, routes, probabilities, schedule = bf16_decode.router_topk(
-                x, router, rows, True, route_counts, tile_rows
+                x, router, batch, True, route_counts, tile_rows, width=query_rows
             )
-        elif decode and rows == 1:
+        elif decode and batch == 1:
             logits, routes, probabilities = bf16_decode.single_router(x, router, True, True)
         else:
             if fixed_router:
                 logits = bf16_decode.prefill_router(x, router, True)
             elif decode:
-                logits = bf16_decode.router(x, router, rows)
+                logits = bf16_decode.router(x, router, batch)
             else:
                 logits = F.linear(x, router)
             if wide_prefill:
@@ -215,6 +227,7 @@ class RoutedExperts(OpWrapper):
         fixed_router: bool,
         route_counts: torch.Tensor,
         gemm: PrefillGemm,
+        query_rows: int = 1,
     ) -> ExpertOutputs:
         logits = F.linear(x.float(), router.float()).to(BF16)
         sorted_logits, sorted_experts = logits[:, :256].float().sort(descending=True, stable=True)

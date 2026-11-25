@@ -143,3 +143,50 @@ CUTLASS build. The build requires the FlashInfer headers before the TVM FFI
 utilities introduce a global `Tensor` alias. With that order preserved, the
 complete oracle again passed at 0.006169 KL and 99.679% non-tie top-1.
 The server started and returned a greedy completion.
+
+## Split MTP with staged recurrent state
+
+The target loads the embedded checkpoint's MTP layer and shares its BF16
+embedding and vocabulary head with the verifier. The runtime's one-model
+MTP worker rewinds the paged draft cache and promotes the accepted
+convolution history and FP32 Gated DeltaNet state. The staged GDN kernels
+adapt `/ref-engine/speculation.py` to the cache manager's request slots.
+The draft uses the reference engine's 65,536-token common vocabulary and
+the special-token range for batches up to 32. The complete target
+vocabulary verifies every proposal. The CLI uses a second executor for
+teacher-forced scoring because the speculative sampler does not return
+context logits. Both executors load the same FP8 checkpoint.
+
+### Staged MTP batch 1, ISL 128/1024/4096, OSL 1024
+
+The CLI uses three draft tokens and executes the one-token TTFT request
+through the standard sampler. MTP passed all 32 oracle items with mean
+KL 0.006169 and 99.679% non-tie top-1. The 32-token prefixes matched
+the 1024-token requests in all six benchmark cases.
+
+| ISL | OSL | TTFT (ms) | Decode (tokens/s) |
+|---:|---:|---:|---:|
+| 128 | 1024 | 32.19 | 710.9 |
+| 1024 | 1024 | 32.20 | 743.0 |
+| 4096 | 1024 | 54.18 | 726.2 |
+
+### Experimental staged MTP serving, ISL 1024/4096, OSL 1024
+
+The server started with a fixed draft length of three and CUDA graphs up
+to batch 128. At concurrency 1 the dev oracle passed. At concurrency 8,
+32 and 128, the concurrent request runs exposed non-tie differences.
+Staging four full FP32 recurrent checkpoints also reduced throughput at
+large batches. The default server retains the initial configuration.
+The HTTP client disconnected during warm-up at ISL 4096, concurrency 8.
+
+| ISL | OSL | Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+|---:|---:|---:|---:|---:|---:|
+| 1024 | 1024 | 1 | 664.9 | 43.9 | 1.46 |
+| 1024 | 1024 | 2 | 1070.3 | 86.7 | 1.74 |
+| 1024 | 1024 | 4 | 1677.2 | 143.4 | 2.19 |
+| 1024 | 1024 | 8 | 2660.5 | 124.8 | 2.85 |
+| 1024 | 1024 | 16 | 3808.9 | 194.2 | 3.85 |
+| 1024 | 1024 | 32 | 5484.0 | 320.7 | 5.30 |
+| 1024 | 1024 | 64 | 6219.0 | 561.7 | 9.36 |
+| 1024 | 1024 | 128 | 4896.0 | 3677.1 | 22.18 |
+| 4096 | 1024 | 1 | 676.1 | 65.8 | 1.42 |

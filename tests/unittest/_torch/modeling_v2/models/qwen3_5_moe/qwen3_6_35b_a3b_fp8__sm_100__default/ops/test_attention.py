@@ -50,16 +50,20 @@ def test_paged_decode_attention(cell, certifying):  # noqa: F811
     layers = cell.spec.get("layers", 1)
     page_size, width = 32, 16
     rows = len(positions)
+    query_rows = cell.spec.get("query_rows", 1)
+    batch = rows // query_rows
     storage = torch.randn(64, layers, 2, 2, page_size, 256, device="cuda", dtype=torch.bfloat16)
     expected_storage = storage.clone()
-    pages = torch.randperm(64, device="cuda", dtype=torch.int32)[: rows * width].view(rows, width)
+    pages = torch.randperm(64, device="cuda", dtype=torch.int32)[: batch * width].view(batch, width)
     key_pages = pages * (2 * layers)
     positions = torch.tensor(positions, device="cuda", dtype=torch.int32)
     qkv = torch.randn(rows, 5120, device="cuda", dtype=torch.bfloat16)
-    actual = paged_decode_attention(qkv, storage[:, -1], positions, key_pages, width * page_size)
+    actual = paged_decode_attention(
+        qkv, storage[:, -1], positions, key_pages, width * page_size, query_rows
+    )
     with true_fp32_matmul():
         expected = paged_decode_attention.reference(
-            qkv, expected_storage[:, -1], positions, key_pages, width * page_size
+            qkv, expected_storage[:, -1], positions, key_pages, width * page_size, query_rows
         )
     assert_within_ulp(actual, expected, element_ulp=2, rms_ulp=0.85)
     assert torch.equal(storage, expected_storage)

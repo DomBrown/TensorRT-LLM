@@ -20,6 +20,7 @@ def run(
     directory: Path,
     protocol: TextIO,
     modeling_v2: Literal["off", "require"] = "require",
+    draft_len: int = 0,
 ) -> None:
     """Serve token-ID generation and teacher-forced scoring through the LLM API."""
     import torch
@@ -36,21 +37,30 @@ def run(
 
     torch.set_num_threads(1)
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
-    llm = LLM(
-        directory,
-        modeling_v2=modeling_v2,
-        skip_tokenizer_init=True,
-        disable_mm_encoder=True,
-        max_seq_len=8192,
-        max_batch_size=1,
-        max_num_tokens=8192,
-        cuda_graph_config={"batch_sizes": [1]},
-        kv_cache_config={
-            "enable_block_reuse": False,
-            "max_tokens": 16384,
-            **({"mamba_ssm_cache_dtype": "float32"} if modeling_v2 == "require" else {}),
-        },
-    )
+
+    def make_llm(draft_length: int = 0) -> LLM:
+        return LLM(
+            directory,
+            modeling_v2=modeling_v2,
+            skip_tokenizer_init=True,
+            disable_mm_encoder=True,
+            max_seq_len=8192,
+            max_batch_size=1,
+            max_num_tokens=8192,
+            cuda_graph_config={"batch_sizes": [1]},
+            kv_cache_config={
+                "enable_block_reuse": False,
+                "max_tokens": 16384,
+                **({"mamba_ssm_cache_dtype": "float32"} if modeling_v2 == "require" else {}),
+            },
+            speculative_config=(
+                {"decoding_type": "MTP", "max_draft_len": draft_length} if draft_length else None
+            ),
+        )
+
+    # Teacher-forced context logits are returned by the standard sampler.
+    scorer = make_llm()
+    generator = scorer
 
     def reply(result: dict) -> None:
         protocol.write(json.dumps(result, separators=(",", ":"), allow_nan=False) + "\n")
@@ -67,7 +77,8 @@ def run(
             temperature=0,
             detokenize=False,
         )
-        output = llm.generate_async(prompt, params, streaming=False).result()
+        runner = scorer if length == 1 else generator
+        output = runner.generate_async(prompt, params, streaming=False).result()
         return output.outputs[0].token_ids
 
     def score(request: dict, ids: list[int]) -> dict:
@@ -97,7 +108,7 @@ def run(
             detokenize=False,
             return_context_logits=True,
         )
-        output = llm.generate_async(ids[:-1], params, streaming=False).result()
+        output = scorer.generate_async(ids[:-1], params, streaming=False).result()
         logits = output.context_logits
         if logits is None or logits.shape[0] != position_count:
             raise RuntimeError("missing teacher-forced context logits")
@@ -123,7 +134,9 @@ def run(
         return result
 
     try:
-        generate([text_config["bos_token_id"]], 2, True)
+        if draft_len:
+            generator = make_llm(draft_len)
+        generate([text_config["bos_token_id"]], 8, True)
         score({"top_k": 1}, [text_config["bos_token_id"]] * 2)
         reply({"ready": True})
         for line in sys.stdin:
@@ -151,7 +164,9 @@ def run(
             except (ValueError, TypeError, RuntimeError) as error:
                 reply({"error": str(error)})
     finally:
-        llm.shutdown()
+        if generator is not scorer:
+            generator.shutdown()
+        scorer.shutdown()
 
 
 def main() -> None:
@@ -159,7 +174,7 @@ def main() -> None:
         raise SystemExit("usage: engine.sh MODEL_DIRECTORY")
     with os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1) as protocol:
         os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
-        run(Path(sys.argv[1]), protocol)
+        run(Path(sys.argv[1]), protocol, draft_len=3)
 
 
 if __name__ == "__main__":

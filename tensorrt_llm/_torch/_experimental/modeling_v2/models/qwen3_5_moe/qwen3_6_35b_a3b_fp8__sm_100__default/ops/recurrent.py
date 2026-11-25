@@ -16,6 +16,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from ..kernels import gdn_decode, prefill_gdn
 from ..kernels.convolution import convolution
 from ..kernels.kernels import gdn_recurrent
+from ..kernels.verify_gdn import verify_convolution, verify_recurrent
 
 _CONV_WIDTH = 8192
 _QK_WIDTH = 2048
@@ -194,3 +195,95 @@ class GatedDeltaRule(OpWrapper):
 
 causal_convolution = CausalConvolution()
 gated_delta_rule = GatedDeltaRule()
+
+_VERIFY_CELLS = (
+    Cell("two candidates at one nonzero slot", {"slots": (3,), "width": 2}),
+    Cell("four candidates with noncontiguous state slots", {"slots": (5, 1, 4), "width": 4}),
+)
+
+
+class VerifyConvolution(OpWrapper):
+    """Save the convolution window for every possible accepted prefix."""
+
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = _VERIFY_CELLS
+
+    def __call__(
+        self,
+        raw: torch.Tensor,
+        weights: torch.Tensor,
+        slots: torch.Tensor,
+        history: torch.Tensor,
+        staged: torch.Tensor,
+        width: int,
+    ) -> torch.Tensor:
+        return verify_convolution(raw, weights, slots, history, staged, width)
+
+    def reference(
+        self,
+        raw: torch.Tensor,
+        weights: torch.Tensor,
+        slots: torch.Tensor,
+        history: torch.Tensor,
+        staged: torch.Tensor,
+        width: int,
+    ) -> torch.Tensor:
+        outputs = []
+        for request, slot in enumerate(slots.tolist()):
+            projected = raw[request * width : (request + 1) * width, :_CONV_WIDTH].T
+            carry = torch.cat((history[slot], projected), dim=-1)
+            out = F.conv1d(carry[None].float(), weights.float(), groups=_CONV_WIDTH)
+            outputs.append(F.silu(out[0].T).to(raw.dtype))
+            staged[request, :width].copy_(carry[:, 1:].unfold(-1, 3, 1).transpose(0, 1))
+        return torch.cat(outputs)
+
+
+class VerifyGatedDeltaRule(OpWrapper):
+    """Evaluate linear draft chains and save a temporal checkpoint per prefix."""
+
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = _VERIFY_CELLS
+
+    def __call__(
+        self,
+        mixed: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        slots: torch.Tensor,
+        state: torch.Tensor,
+        staged: torch.Tensor,
+        width: int,
+    ) -> torch.Tensor:
+        return verify_recurrent(mixed, alpha, beta, slots, state, staged, width)
+
+    def reference(
+        self,
+        mixed: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        slots: torch.Tensor,
+        state: torch.Tensor,
+        staged: torch.Tensor,
+        width: int,
+    ) -> torch.Tensor:
+        carry = state[slots].clone()
+        dense_slots = torch.arange(slots.numel(), device=slots.device)
+        result = torch.empty((mixed.shape[0], _VALUE_WIDTH), dtype=mixed.dtype, device=mixed.device)
+        for rank in range(width):
+            result[rank::width] = gated_delta_rule.reference(
+                mixed[rank::width],
+                alpha[rank::width],
+                beta[rank::width],
+                carry,
+                dense_slots,
+                None,
+                None,
+                None,
+                (),
+            )
+            staged[: slots.numel(), rank].copy_(carry)
+        return result
+
+
+verify_conv = VerifyConvolution()
+verify_gdn = VerifyGatedDeltaRule()
