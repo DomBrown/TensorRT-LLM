@@ -903,3 +903,27 @@ three distinct prompt/position pairs and a maximum margin of 0.625 nats.
 | 32 | 32 | 10 | 22 | 0 | 0 |
 | 64 | 64 | 24 | 40 | 0 | 3 |
 | 128 | 128 | 22 | 106 | 0 | 8 |
+
+### Fixed-split follow-ups, ISL 1024, OSL 1024
+
+Streaming every eight tokens with an early first response measured
+782.7, 7570.1, and 14242.9 tokens/s at C1, C32, and C128. Median C1
+TTFT moved from 46.35 to 40.4 ms in this four-wave run. Median C32
+TTFT rose from 145.37 to 160.3 ms. The shipped profile keeps the
+default cadence used for the matched sweep.
+
+Allowing client I/O during GPU waits measured 782.1, 7586.8, and
+14198.3 tokens/s at C1, C32, and C128. Median TTFT was 42.4, 124.9,
+and 181.5 ms. The throughput movement was small across the three
+concurrencies in this four-wave run.
+
+In isolation, processing two independent 128-key splits in each CUDA
+block gave bitwise-identical FP8 output and scales. With 1,024 keys and
+four candidate rows, C32 took 58.24 instead of 59.25 µs, and C128 took
+216.65 instead of 193.43 µs. The target keeps one split per block.
+
+The final batch-1 replay trial used four draft tokens and passed the
+full development oracle and CLI protocol checks. At ISL 128, 1024,
+and 4096 with OSL 1024, its two-prompt decode medians were 811.6,
+854.7, and 829.3 tokens/s. The CLI keeps staged recurrence, which
+was faster at each of these lengths.
