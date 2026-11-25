@@ -163,6 +163,7 @@ class _Decoder(DecoderModel):
         self.sine: torch.Tensor
         self.gemm: PrefillGemm
         self.route_counts: torch.Tensor
+        self.gate_stream: torch.cuda.Stream
         self._attention_pools: WeakKeyDictionary = WeakKeyDictionary()
 
     def initialize_runtime_buffers(self, device: torch.device) -> None:
@@ -175,6 +176,7 @@ class _Decoder(DecoderModel):
         self.sine = phase.sin()
         self.gemm = PrefillGemm(device)
         self.route_counts = torch.zeros(257, dtype=torch.int32, device=device)
+        self.gate_stream = torch.cuda.Stream(device)
 
     def _attention_pool(self, cache: object, index: int) -> tuple[torch.Tensor, int]:
         """Take a zero-copy HND view of the executor's paged KV pool."""
@@ -235,9 +237,11 @@ class _Decoder(DecoderModel):
         cache: object,
         index: int,
         replay_slots: torch.Tensor | None,
+        pending_gates: tuple[torch.cuda.Stream, tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> torch.Tensor:
         ab_weight, conv_weight, a_log, dt_bias, _ = weights
-        alpha, beta = decode_gates(x, ab_weight, a_log, dt_bias)
+        if pending_gates is None:
+            gates = decode_gates(x, ab_weight, a_log, dt_bias)
         buffers = (
             cache.mamba_layer_cache(index) if query_rows > 1 or replay_slots is not None else None
         )
@@ -247,6 +251,13 @@ class _Decoder(DecoderModel):
             )
         else:
             mixed = causal_convolution(projection, conv_weight, conv, slots, None, None, None)
+        if pending_gates is not None:
+            stream, gates = pending_gates
+            current = torch.cuda.current_stream()
+            current.wait_stream(stream)
+            for gate in gates:
+                gate.record_stream(current)
+        alpha, beta = gates
         if replay_slots is not None:
             return replay_gdn(
                 mixed,
@@ -283,6 +294,13 @@ class _Decoder(DecoderModel):
         mn_major: bool,
         query_rows: int,
     ) -> torch.Tensor:
+        pending_gates = None
+        if layer.linear_attention and decode and x.shape[0] <= 8:
+            # The two projections read the same normalized rows independently.
+            ab_weight, _, a_log, dt_bias, _ = layer.attention_params
+            self.gate_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.gate_stream):
+                pending_gates = (self.gate_stream, decode_gates(x, ab_weight, a_log, dt_bias))
         projection = fp8_projection(quantized, layer.input_projection, decode, self.gemm)
         cache = md.kv_cache_manager
         if layer.linear_attention:
@@ -303,6 +321,7 @@ class _Decoder(DecoderModel):
                     cache,
                     index,
                     recurrent.replay_slots,
+                    pending_gates,
                 )
             else:
                 if len(recurrent.contexts) == 1:
@@ -360,10 +379,22 @@ class _Decoder(DecoderModel):
                 if ctx_rows < qkv.shape[0]:
                     pool, pool_id = self._attention_pool(cache, index)
                     pages = md.kv_cache_block_offsets[pool_id, ctx_count : md.num_seqs, 0]
+                    if not ctx_rows:
+                        gated = paged_decode_attention(
+                            qkv,
+                            pool,
+                            position,
+                            pages,
+                            md.max_seq_len,
+                            query_rows,
+                            projection=projection,
+                            mn_major=mn_major,
+                        )
+                        return fp8_projection(gated, layer.output_projection, decode, self.gemm)
                     gen_core = paged_decode_attention(
                         qkv[ctx_rows:], pool, position[ctx_rows:], pages, md.max_seq_len, query_rows
                     )
-                    core = torch.cat((core, gen_core)) if ctx_rows else gen_core
+                    core = torch.cat((core, gen_core))
             gated = gated_output_quantize(core, projection, None, mn_major=mn_major)
         return fp8_projection(gated, layer.output_projection, decode, self.gemm)
 

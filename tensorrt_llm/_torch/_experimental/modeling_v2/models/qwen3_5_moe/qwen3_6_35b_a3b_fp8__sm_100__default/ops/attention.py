@@ -16,6 +16,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
 
 from ..kernels.kernels import prepare_qkv
 from ..kernels.paged_decode import paged_decode
+from .epilogue import gated_output_quantize
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
@@ -238,6 +239,14 @@ class PagedDecodeAttention(OpWrapper):
             "linear four-token verification chains across a page boundary",
             {"positions": (30, 31, 32, 33, 112, 113, 114, 115), "query_rows": 4},
         ),
+        Cell(
+            "merge, gate and quantize a four-token chain",
+            {"positions": (286, 287, 288, 289), "query_rows": 4, "quantize": True},
+        ),
+        Cell(
+            "merge and quantize into column-major scales",
+            {"positions": (143, 31, 161), "layers": 3, "quantize": True, "mn_major": True},
+        ),
     )
 
     def __call__(
@@ -248,8 +257,20 @@ class PagedDecodeAttention(OpWrapper):
         key_pages: torch.Tensor,
         max_seq_len: int,
         query_rows: int = 1,
-    ) -> torch.Tensor:
-        return paged_decode(qkv, pool, positions, key_pages, max_seq_len, query_rows)
+        *,
+        projection: torch.Tensor | None = None,
+        mn_major: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return paged_decode(
+            qkv,
+            pool,
+            positions,
+            key_pages,
+            max_seq_len,
+            query_rows,
+            projection=projection,
+            mn_major=mn_major,
+        )
 
     def reference(
         self,
@@ -259,7 +280,10 @@ class PagedDecodeAttention(OpWrapper):
         key_pages: torch.Tensor,
         max_seq_len: int,
         query_rows: int = 1,
-    ) -> torch.Tensor:
+        *,
+        projection: torch.Tensor | None = None,
+        mn_major: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         page_size = pool.shape[-2]
         row_stride = pool.stride(0) // pool.stride(1)
         q, k, v = qkv.split((4096, 512, 512), dim=-1)
@@ -276,6 +300,8 @@ class PagedDecodeAttention(OpWrapper):
             query = q[i].view(2, 8, 256).float()
             probs = ((query @ key.transpose(-1, -2)) / 16.0).softmax(dim=-1)
             output[i].copy_((probs @ value).flatten())
+        if projection is not None:
+            return gated_output_quantize.reference(output, projection, None, mn_major=mn_major)
         return output
 
 

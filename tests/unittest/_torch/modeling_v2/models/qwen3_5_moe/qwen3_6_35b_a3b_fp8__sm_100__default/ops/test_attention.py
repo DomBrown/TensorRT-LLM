@@ -9,6 +9,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35
     paged_decode_attention,
     qkv_projection,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35b_a3b_fp8__sm_100__default.ops.epilogue import (  # noqa: E501
+    gated_output_quantize,
+)
 
 __extra_import_path__ = ["../../.."]
 from _validating import assert_within_ulp, certifying  # noqa: E402,F401
@@ -58,12 +61,34 @@ def test_paged_decode_attention(cell, certifying):  # noqa: F811
     key_pages = pages * (2 * layers)
     positions = torch.tensor(positions, device="cuda", dtype=torch.int32)
     qkv = torch.randn(rows, 5120, device="cuda", dtype=torch.bfloat16)
-    actual = paged_decode_attention(
-        qkv, storage[:, -1], positions, key_pages, width * page_size, query_rows
-    )
+    args = qkv, storage[:, -1], positions, key_pages, width * page_size, query_rows
+    projection = None
+    if cell.spec.get("quantize", False):
+        projection = torch.randn(rows, 9216, device="cuda", dtype=torch.bfloat16)
+    mn_major = cell.spec.get("mn_major", False)
+    actual = paged_decode_attention(*args, projection=projection, mn_major=mn_major)
     with true_fp32_matmul():
         expected = paged_decode_attention.reference(
-            qkv, expected_storage[:, -1], positions, key_pages, width * page_size, query_rows
+            qkv,
+            expected_storage[:, -1],
+            positions,
+            key_pages,
+            width * page_size,
+            query_rows,
+            projection=projection,
+            mn_major=mn_major,
         )
-    assert_within_ulp(actual, expected, element_ulp=2, rms_ulp=0.85)
     assert torch.equal(storage, expected_storage)
+    if projection is None:
+        assert_within_ulp(actual, expected, element_ulp=2, rms_ulp=0.85)
+    else:
+        quant, scales = actual
+        ref_quant, ref_scales = expected
+        out = quant.float().view(rows, 32, 128) * scales[..., None]
+        ref = ref_quant.float().view(rows, 32, 128) * ref_scales[..., None]
+        assert_within_ulp(out, ref, element_ulp=2, rms_ulp=0.3, ulp=1 / 14 + 1e-7)
+        old_core = paged_decode_attention(*args)
+        old_quant, old_scales = gated_output_quantize(old_core, projection, None, mn_major=mn_major)
+        assert scales.stride() == old_scales.stride()
+        assert torch.equal(quant.view(torch.uint8), old_quant.view(torch.uint8))
+        assert torch.equal(scales, old_scales)

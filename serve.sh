@@ -10,5 +10,5 @@ root="$(dirname -- "$(realpath -- "$0")")"
 export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
 export TLLM_WORKER_USE_SINGLE_PROCESS=1
 export TRTLLM_USE_GDN_REPLAY="${TRTLLM_USE_GDN_REPLAY:-1}"
-exec trtllm-serve "$1" --config "$root/aegis_engine/serve.yaml" --port "${3:-8000}" \
+exec python3 -m aegis_engine.serve "$1" --config "$root/aegis_engine/serve.yaml" --port "${3:-8000}" \
     --num_serve_frontends 1 --served_model_name qwen3.6-35b-a3b-fp8

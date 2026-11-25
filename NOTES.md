@@ -381,3 +381,39 @@ logits showed two remaining differences with a margin of exactly
 | 1024 | 1024 | OpenAI serving | 1 | 772.2 | 46.4 |
 | 1024 | 1024 | OpenAI serving | 32 | 7536.1 | 381.7 |
 | 1024 | 1024 | OpenAI serving | 128 | 14722.3 | 1012.2 |
+
+## Decode gate overlap and paged attention epilogue
+
+Small decode batches run the BF16 Gated DeltaNet gate projection on a
+second CUDA stream while the attention input projection and convolution
+run on the execution stream. The recurrence waits for both. The paged
+attention epilogue combines split softmax results, applies the output
+gate, and emits block-FP8 activations in one launch. It follows the
+reference engine's split attention and quantization, including the
+intermediate BF16 rounding. The operation cells compare its FP8 values,
+scales, and KV writes against the two-pass implementation.
+
+The HTTP launcher now uses the CLI's BF16 matmul reduction policy in its
+single serving process. The CLI passed all 32 oracle items with KL
+0.006457 and 99.587% non-tie top-1, and all 72 focused tests passed.
+The server passed the external oracle at C1, C8, C32 and C128.
+Against cached CLI logits, C1, C8 and C32 met the strict tie rule.
+At C128, four copies of one prompt still first diverged at a margin
+of exactly 0.5 nats.
+
+### Gate overlap and attention fusion, ISL 128/1024/4096, OSL 1024
+
+| ISL | OSL | Path | Concurrency | Tokens/s | Median TTFT (ms) |
+|---:|---:|---|---:|---:|---:|
+| 128 | 1024 | CLI decode | 1 | 760.6 | 31.58 |
+| 1024 | 1024 | CLI decode | 1 | 794.2 | 33.88 |
+| 4096 | 1024 | CLI decode | 1 | 774.8 | 55.99 |
+| 1024 | 1024 | OpenAI serving | 1 | 788.3 | 50.12 |
+| 1024 | 1024 | OpenAI serving | 32 | 7570.9 | 377.04 |
+| 1024 | 1024 | OpenAI serving | 128 | 14736.0 | 1016.05 |
+
+An isolated 512-row expert test put the padded FlashInfer block-FP8
+MoE at 282 µs versus 172 µs for the target kernels, with 5.1% relative
+RMS output error. The TMA panel layout kept exact BF16 outputs, but
+both expert projections ran slower at 384 and 512 rows. TMA loading
+of the FP32 recurrent checkpoint also ran slower at batch 128.
