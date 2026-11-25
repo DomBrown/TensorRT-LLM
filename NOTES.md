@@ -113,3 +113,33 @@ V2 serving configuration reached 4,480 tokens/s at concurrency 32 and
 9,625 at 128. The standalone reference's published targets are 7,788
 and 16,324 tokens/s at comparable static batch sizes. These V2 baseline
 measurements have no MTP.
+
+## Independent standalone reference run
+
+I copied `/ref-engine` at `6780d5e` to `/tmp` for its JIT cache. The original
+environment's FlashAttention 4 and QuACK versions were incompatible with the
+installed CuTe DSL. The copied launcher ran with FlashAttention 4.0.0b41 and
+QuACK 0.6.5 in a subprocess-specific import path, with the engine sources
+unchanged. The dev oracle passed all 32 items with mean top-20 KL 0.006443
+and 99.679% non-tie top-1 agreement. Both static batch sizes also passed
+the oracle's greedy checks.
+
+### Standalone batches, ISL 128/1024/4096, OSL 1024
+
+Medians across two runs per point, using the same prompts and timing method
+as the V1 and V2 API measurements. Static batch throughput sums all output
+tokens across the batch.
+
+| ISL | OSL | Static batch | TTFT (ms) | Decode (tokens/s) |
+|---:|---:|---:|---:|---:|
+| 128 | 1024 | 1 | 8.29 | 765.9 |
+| 1024 | 1024 | 1 | 18.10 | 858.0 |
+| 4096 | 1024 | 1 | 46.65 | 792.1 |
+| 1024 | 1024 | 32 | — | 8652.4 |
+| 1024 | 1024 | 128 | — | 17427.5 |
+
+The initial target was also rerun from an isolated checkout with a cold
+CUTLASS build. The build requires the FlashInfer headers before the TVM FFI
+utilities introduce a global `Tensor` alias. With that order preserved, the
+complete oracle again passed at 0.006169 KL and 99.679% non-tie top-1.
+The server started and returned a greedy completion.

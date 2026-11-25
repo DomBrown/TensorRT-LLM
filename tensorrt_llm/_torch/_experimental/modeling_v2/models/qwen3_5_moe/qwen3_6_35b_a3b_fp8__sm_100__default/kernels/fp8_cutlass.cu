@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "tvm_ffi_utils.h"
+// Include CUTLASS before the FFI utilities expose Tensor in the global namespace.
+// clang-format off
 #include <flashinfer/gemm/gemm_groupwise_sm100.cuh>
 #include <flashinfer/gemm/group_gemm_fp8_groupwise_sm100.cuh>
+#include "tvm_ffi_utils.h"
+// clang-format on
 
 using E4M3 = cutlass::float_e4m3_t;
 using BF16 = cutlass::bfloat16_t;
