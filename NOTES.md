@@ -190,3 +190,60 @@ The HTTP client disconnected during warm-up at ISL 4096, concurrency 8.
 | 1024 | 1024 | 64 | 6219.0 | 561.7 | 9.36 |
 | 1024 | 1024 | 128 | 4896.0 | 3677.1 | 22.18 |
 | 4096 | 1024 | 1 | 676.1 | 65.8 | 1.42 |
+
+## FP32 replay for concurrent verification
+
+The replay kernel adapts the paired FP32 updates in
+`/ref-engine/gdn_decode.py`. It retains accepted keys, decays, and
+innovations between full recurrent checkpoints. The target's cache
+manager declares the FP32 buffers in the runtime's request-private
+replay region and reuses its slot allocation, convolution promotion,
+and acceptance bookkeeping. The executor has one optional class
+selection hook for this cache policy. Modeling V1 and V2 targets
+without that policy keep their existing cache manager selection.
+
+An isolated rollout covered partial acceptance, slot rollover, and a
+seed-only step. Its BF16 outputs matched staged verification bitwise.
+Paired CUDA graph microbenchmarks reduced per-layer verify time
+from 130 to 51 µs at batch 32 with four verification rows per request,
+and from 387 to 201 µs at batch 128 with three rows per request.
+
+### MTP replay batch 1, ISL 128/1024/4096, OSL 1024
+
+The replay experiment passed all 32 dev items at 0.006169 KL and
+99.679% non-tie top-1. The CLI retains staged state for batch 1
+based on these measurements.
+
+| ISL | OSL | TTFT (ms) | Decode (tokens/s) |
+|---:|---:|---:|---:|
+| 128 | 1024 | 35.56 | 702.6 |
+| 1024 | 1024 | 34.76 | 734.8 |
+| 4096 | 1024 | 54.53 | 718.4 |
+
+### Experimental MTP replay serving, ISL 1024, OSL 1024
+
+The replay experiment kept the staged server's fixed draft length of
+three and its cache capacity, graph shapes, and scheduler settings.
+The concurrent oracle produced the same greedy results as staged
+verification, including the non-tie deviations. Prefill traces showed
+some numerical differences before the first draft.
+
+| ISL | OSL | Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+|---:|---:|---:|---:|---:|---:|
+| 1024 | 1024 | 1 | 742.6 | 42.9 | 1.31 |
+| 1024 | 1024 | 8 | 2889.3 | 132.1 | 2.60 |
+| 1024 | 1024 | 32 | 7437.7 | 313.3 | 3.83 |
+| 1024 | 1024 | 128 | 11972.7 | 1500.3 | 8.79 |
+
+### Replay cache and draft-length trial, ISL 1024, OSL 1024
+
+Two draft tokens, a 524,288-token KV budget, and a 2,048-token average
+sequence length were tested together. Kernel JIT occurred during the run,
+so the timing does not isolate either the budget or the draft width.
+The concurrent oracle still had the same first divergences. The
+four-row verifier remains the faster measured configuration.
+
+| ISL | OSL | Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+|---:|---:|---:|---:|---:|---:|
+| 1024 | 1024 | 32 | 6587.4 | 327.4 | 4.39 |
+| 1024 | 1024 | 128 | 7462.4 | 2957.6 | 13.96 |

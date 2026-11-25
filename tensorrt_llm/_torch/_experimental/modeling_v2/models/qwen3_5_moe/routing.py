@@ -5,7 +5,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from tensorrt_llm._torch.utils import is_gdn_replay_enabled
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._router_index import NoTarget, routes
@@ -79,21 +78,26 @@ def route(
         or spec.sa_config is not None
         or spec.draft_lm_head_dtype != "auto"
         or spec.draft_moe_dtype != "auto"
-        or is_gdn_replay_enabled()
     ):
-        raise NoTarget("Qwen3.6-35B-A3B FP8 supports linear embedded MTP with staged GDN state")
+        raise NoTarget(
+            "Qwen3.6-35B-A3B FP8 supports linear embedded MTP with up to three draft tokens"
+        )
     if model_config.lora_config is not None or llm_args.max_beam_width != 1:
         raise NoTarget("Qwen3.6-35B-A3B FP8 requires beam width 1 and no LoRA")
     cache = llm_args.kv_cache_config
     if (
         cache.enable_block_reuse
+        or getattr(cache, "enable_kv_pool_rebalance", False)
         or cache.use_kv_cache_manager_v2 is False
         or cache.dtype not in ("auto", "bfloat16")
+        or model_config.quant_config.kv_cache_quant_algo is not None
         or cache.max_attention_window is not None
         or cache.mamba_ssm_cache_dtype != "float32"
         or llm_args.enable_return_routed_experts
     ):
         raise NoTarget("Qwen3.6-35B-A3B FP8 requires BF16 paged KV and FP32 recurrent state")
+    if getattr(llm_args, "cache_transceiver_config", None) is not None:
+        raise NoTarget("Qwen3.6-35B-A3B FP8 requires an aggregated executor")
     if llm_args.attn_backend != "TRTLLM":
         raise NoTarget("Qwen3.6-35B-A3B FP8 requires TRTLLM attention metadata")
 

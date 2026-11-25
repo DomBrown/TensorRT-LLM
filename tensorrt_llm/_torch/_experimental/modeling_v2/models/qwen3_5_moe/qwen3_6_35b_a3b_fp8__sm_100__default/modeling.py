@@ -19,6 +19,7 @@ from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_
 from tensorrt_llm._torch.speculative.utils import get_spec_worker
 
 from .... import disable_v2_by_default
+from .cache_manager import Qwen36HybridCacheManager
 from .kernels.prefill_gemm import PrefillGemm
 from .ops.attention import attention_step, gqa, paged_decode_attention, qkv_projection
 from .ops.epilogue import gated_output_quantize, gdn_gates, residual_norm_quantize
@@ -27,6 +28,7 @@ from .ops.recurrent import (
     SHORT_CONTEXT,
     causal_convolution,
     gated_delta_rule,
+    replay_gdn,
     verify_conv,
     verify_gdn,
 )
@@ -43,6 +45,7 @@ if TYPE_CHECKING:
 class _LinearStep(NamedTuple):
     context_rows: int
     slots: torch.Tensor
+    replay_slots: torch.Tensor | None
     offsets: torch.Tensor | None
     row_map: torch.Tensor | None
     initial: torch.Tensor | None
@@ -54,8 +57,11 @@ def _linear_step(md: TrtllmAttentionMetadata) -> _LinearStep:
     metadata = md.mamba_metadata
     num_ctx = md.num_contexts
     slots = metadata.state_indices[: md.num_seqs]
+    replay_slots = None
+    if md.kv_cache_manager.get_replay_state_update_metadata() is not None:
+        replay_slots = metadata.replay_state_indices[num_ctx : md.num_seqs]
     if num_ctx == 0:
-        return _LinearStep(0, slots, None, None, None, None, ())
+        return _LinearStep(0, slots, replay_slots, None, None, None, None, ())
     lengths = tuple(md.seq_lens[:num_ctx].tolist())
     initial = metadata.has_initial_states[:num_ctx]
     # FlashInfer reads -1 as a zero state. Destination slots always belong to the request.
@@ -63,6 +69,7 @@ def _linear_step(md: TrtllmAttentionMetadata) -> _LinearStep:
     return _LinearStep(
         md.num_ctx_tokens,
         slots,
+        replay_slots,
         metadata.query_start_loc[: num_ctx + 1],
         metadata.seq_idx.reshape(-1),
         initial,
@@ -168,18 +175,39 @@ class _Decoder(DecoderModel):
         query_rows: int,
         cache: object,
         index: int,
+        replay_slots: torch.Tensor | None,
     ) -> torch.Tensor:
         ab_weight, conv_weight, a_log, dt_bias, _ = weights
         alpha, beta = decode_gates(x, ab_weight, a_log, dt_bias, query_rows)
+        buffers = (
+            cache.mamba_layer_cache(index) if query_rows > 1 or replay_slots is not None else None
+        )
         if query_rows > 1:
-            buffers = cache.mamba_layer_cache(index)
             mixed = verify_conv(
                 projection, conv_weight, slots, conv, buffers.intermediate_conv_window, query_rows
             )
+        else:
+            mixed = causal_convolution(projection, conv_weight, conv, slots, None, None, None)
+        if replay_slots is not None:
+            return replay_gdn(
+                mixed,
+                alpha,
+                beta,
+                state,
+                slots,
+                replay_slots,
+                buffers.old_B,
+                buffers.old_x,
+                buffers.old_dt,
+                buffers.prev_num_accepted_tokens,
+                buffers.cache_buf_idx,
+                query_rows,
+                cache.spec_config.tokens_per_gen_step,
+            )
+        if query_rows > 1:
             return verify_gdn(
                 mixed, alpha, beta, slots, state, buffers.intermediate_ssm, query_rows
             )
-        mixed = causal_convolution(projection, conv_weight, conv, slots, None, None, None)
         return gated_delta_rule(mixed, alpha, beta, state, slots, None, None, None, ())
 
     def _mix(
@@ -216,6 +244,7 @@ class _Decoder(DecoderModel):
                     query_rows,
                     cache,
                     index,
+                    recurrent.replay_slots,
                 )
             else:
                 core = self._prefill_gdn(
@@ -239,6 +268,7 @@ class _Decoder(DecoderModel):
                         query_rows,
                         cache,
                         index,
+                        recurrent.replay_slots,
                     )
                     core = torch.cat((core, decode_core))
             gated = gated_output_quantize(core, projection, norm, mn_major=mn_major)
@@ -317,6 +347,11 @@ class _Decoder(DecoderModel):
                 permutation=permutation,
                 mn_major=mn_major,
             )
+        if query_rows == 1 and generation_count and recurrent.replay_slots is not None:
+            # No acceptance update follows a step that committed its only input.
+            replay = attn_metadata.kv_cache_manager.get_replay_state_update_metadata()
+            replay.prev_num_accepted_tokens.index_fill_(0, recurrent.replay_slots, 0)
+            replay.cache_buf_idx.index_fill_(0, recurrent.replay_slots, 0)
         return hidden
 
 
@@ -464,6 +499,7 @@ class ModelingV2Qwen3635BA3BFp8Sm100Default(DecoderModelForCausalLM):
     """Text-only FP8 target, with recurrent and paged cache state owned by TRT-LLM."""
 
     moe_impls_honored = frozenset()
+    kv_cache_manager_cls = Qwen36HybridCacheManager
 
     def __init__(self, model_config: ModelConfig) -> None:
         outer = model_config.pretrained_config

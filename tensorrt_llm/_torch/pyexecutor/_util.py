@@ -1117,6 +1117,14 @@ class KvCacheCreator:
             cache_transceiver_config=self._cache_transceiver_config)
         cls = self._validate_or_fallback_kv_cache_manager_v2(
             cls, model_config, kv_cache_config)
+        model_cls = getattr(self._model_engine.model, "kv_cache_manager_cls",
+                            None)
+        if model_cls is not None:
+            if not issubclass(model_cls, cls):
+                raise UnsupportedError(
+                    f"{model_cls.__name__} requires a compatible KV cache "
+                    f"manager, but the runtime selected {cls.__name__}.")
+            cls = model_cls
         if is_hybrid_linear(model_config.pretrained_config):
             logger.info_once(
                 f"Selected hybrid KV cache manager: {cls.__name__}",

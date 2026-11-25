@@ -13,6 +13,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35
     SHORT_CONTEXT,
     causal_convolution,
     gated_delta_rule,
+    replay_gdn,
     verify_conv,
     verify_gdn,
 )
@@ -130,3 +131,56 @@ def test_verify_gated_delta_rule(cell, certifying):  # noqa: F811
     assert_within_ulp(actual, expected, element_ulp=1, rms_ulp=0.1)
     assert torch.equal(state, saved)
     torch.testing.assert_close(staged, expected_staged, atol=2e-7, rtol=1e-5)
+
+
+@pytest.mark.parametrize("cell", replay_gdn.CELLS, ids=lambda cell: cell.why)
+def test_replay_gated_delta_rule(cell, certifying):  # noqa: F811
+    certifying(replay_gdn)
+    torch.manual_seed(51)
+    slots = torch.tensor(cell.spec["slots"], device="cuda", dtype=torch.int32)
+    count = slots.numel()
+    replay_slots = 6 - slots
+    history = 8
+    spec_width = 4
+    state = torch.randn(8, 2, 32, 128, 128, device="cuda") * 0.03
+    keys = torch.zeros(8, 2, history, 16, 128, device="cuda")
+    innovations = torch.zeros(8, 2, history, 32, 128, device="cuda")
+    decays = torch.zeros(8, 2, 32, history, device="cuda")
+    meta = torch.zeros(8, 4, device="cuda", dtype=torch.int32)
+    accepted, bank = meta[:, 0], meta[:, 1]
+    actual_buffers = (state[:, 1], keys, innovations, decays)
+    expected_buffers = tuple(t.clone() for t in actual_buffers)
+    for step, width in enumerate(cell.spec["widths"]):
+        rows = width * count
+        mixed = torch.randn(rows, 8192, device="cuda", dtype=torch.bfloat16)
+        alpha = torch.rand(rows, 32, device="cuda") * 0.3 + 0.7
+        beta = torch.rand(rows, 32, device="cuda")
+        new_count = 1 + (torch.arange(count, device="cuda", dtype=torch.int32) + step) % width
+        args = (accepted, bank, width, spec_width)
+        actual = replay_gdn(
+            mixed,
+            alpha,
+            beta,
+            actual_buffers[0],
+            slots,
+            replay_slots,
+            *actual_buffers[1:],
+            *args,
+        )
+        expected = replay_gdn.reference(
+            mixed,
+            alpha,
+            beta,
+            expected_buffers[0],
+            slots,
+            replay_slots,
+            *expected_buffers[1:],
+            *args,
+        )
+        assert_within_ulp(actual, expected, element_ulp=1, rms_ulp=0.15)
+        for got, want in zip(actual_buffers, expected_buffers, strict=True):
+            torch.testing.assert_close(got, want, atol=3e-7, rtol=2e-5)
+        before = accepted[replay_slots]
+        flushed = before + spec_width > history
+        accepted[replay_slots] = torch.where(flushed, new_count, before + new_count)
+        bank[replay_slots] = torch.where(flushed, 1 - bank[replay_slots], bank[replay_slots])

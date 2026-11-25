@@ -287,3 +287,108 @@ class VerifyGatedDeltaRule(OpWrapper):
 
 verify_conv = VerifyConvolution()
 verify_gdn = VerifyGatedDeltaRule()
+
+
+class ReplayGatedDeltaRule(OpWrapper):
+    """Verify a linear draft and store request-private FP32 updates for replay."""
+
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = (
+        Cell(
+            "full and seed-only steps with an accepted prefix", {"slots": (3,), "widths": (4, 4, 1)}
+        ),
+        Cell(
+            "prefix accumulation and checkpoint rollover on independent slots",
+            {"slots": (5, 1, 4), "widths": (4, 2, 4, 3, 4, 1)},
+        ),
+    )
+
+    def __call__(
+        self,
+        mixed: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        state: torch.Tensor,
+        slots: torch.Tensor,
+        replay_slots: torch.Tensor,
+        keys: torch.Tensor,
+        innovations: torch.Tensor,
+        decays: torch.Tensor,
+        accepted: torch.Tensor,
+        bank: torch.Tensor,
+        width: int,
+        spec_width: int,
+    ) -> torch.Tensor:
+        return gdn_decode.replay(
+            mixed,
+            alpha,
+            beta,
+            state,
+            slots,
+            replay_slots,
+            keys,
+            innovations,
+            decays,
+            accepted,
+            bank,
+            width,
+            spec_width,
+        )
+
+    def reference(
+        self,
+        mixed: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        state: torch.Tensor,
+        slots: torch.Tensor,
+        replay_slots: torch.Tensor,
+        keys: torch.Tensor,
+        innovations: torch.Tensor,
+        decays: torch.Tensor,
+        accepted: torch.Tensor,
+        bank: torch.Tensor,
+        width: int,
+        spec_width: int,
+    ) -> torch.Tensor:
+        query, key, values = (t.float() for t in _split_qkv(mixed))
+        query = query / (query.square().sum(-1, keepdim=True) + 1e-6).sqrt() * (128**-0.5)
+        key = key / (key.square().sum(-1, keepdim=True) + 1e-6).sqrt()
+        query = query.repeat_interleave(2, dim=1)
+        output = torch.empty_like(values, dtype=mixed.dtype)
+        for request, (state_slot, replay_slot) in enumerate(
+            zip(slots.tolist(), replay_slots.tolist(), strict=True)
+        ):
+            carry = state[state_slot].clone()
+            count = int(accepted[replay_slot])
+            old_bank = int(bank[replay_slot])
+            for rank in range(count):
+                decay = decays[replay_slot, old_bank, :, rank]
+                cached_key = keys[replay_slot, old_bank, rank].repeat_interleave(2, dim=0)
+                innovation = innovations[replay_slot, old_bank, rank]
+                carry.mul_(decay[:, None, None])
+                carry.addcmul_(innovation[:, :, None], cached_key[:, None, :])
+            flush = count + spec_width > keys.shape[2]
+            write_start = 0 if flush else count
+            write_bank = 1 - old_bank if flush else old_bank
+            if flush and width > 1:
+                state[state_slot].copy_(carry)
+            for rank in range(width):
+                row = request * width + rank
+                repeated_key = key[row].repeat_interleave(2, dim=0)
+                carry.mul_(alpha[row, :, None, None])
+                innovation = values[row] - (carry * repeated_key[:, None, :]).sum(-1)
+                innovation *= beta[row, :, None]
+                carry.addcmul_(innovation[:, :, None], repeated_key[:, None, :])
+                output[row].copy_((carry * query[row, :, None, :]).sum(-1))
+                if width > 1:
+                    position = write_start + rank
+                    keys[replay_slot, write_bank, position].copy_(key[row])
+                    innovations[replay_slot, write_bank, position].copy_(innovation)
+                    decays[replay_slot, write_bank, :, position].copy_(alpha[row])
+            if width == 1:
+                state[state_slot].copy_(carry)
+        return output.view(-1, _VALUE_WIDTH)
+
+
+replay_gdn = ReplayGatedDeltaRule()
