@@ -534,3 +534,34 @@ configuration completed warmup and passed the HTTP oracle at concurrency
 | 128 | 1024 | 11.29 | 759.6 |
 | 1024 | 1024 | 21.91 | 794.0 |
 | 4096 | 1024 | 55.23 | 774.3 |
+
+## Shape-stable mixed prefill
+
+The mixed-step gate, router, and expert-packing kernels take the row count
+and packed capacity as runtime values. A change in the number of admitted
+tokens now reuses the same Triton kernel with the same reductions and
+scale layouts. The operation suite covers a partial gate tile and an
+expert pack with 513 rows, including padding for the shared expert.
+
+The serving configuration batches replacements while decode continues.
+The scheduler can wait up to 16 iterations when a mixed step contains
+fewer than 4,096 scheduled tokens. It can admit contexts immediately when
+no requests are decoding. The four-wave runs used the same prompts at
+each concurrency across configurations.
+
+### Closed-loop admission trials, ISL 1024, OSL 1024
+
+| Kernel rows | Admission wait | C32 tokens/s | C32 p99 TTFT (ms) | C128 tokens/s |
+|---|---|---:|---:|---:|
+| Specialized | Immediate | 4986.7 | 2490 | Incomplete |
+| Runtime | Immediate | 6931.1 | 381 | 13420.4 |
+| Runtime | 8 iterations, 2048 tokens | 7566.0 | 381 | 14445.2 |
+| Runtime | 16 iterations, 4096 tokens | 7675.1 | 379 | 14802.8 |
+
+The checked-in launchers passed the CLI contract, all 32 oracle items,
+and the HTTP oracle at C1, C8, C32, C64, and C128. The operation suite
+passed 77 tests. Repeating the external four-wave run through `serve.sh`
+measured 740.2, 7700.1, and 14888.6 tokens/s at C1, C32, and C128,
+respectively. Batch-1 CLI decode was 748.7, 782.6, and 764.4 tokens/s
+at ISL 128, 1024, and 4096 with OSL 1024, about 1.3–1.5% below the
+row-specialized kernels in the preceding two-prompt runs.

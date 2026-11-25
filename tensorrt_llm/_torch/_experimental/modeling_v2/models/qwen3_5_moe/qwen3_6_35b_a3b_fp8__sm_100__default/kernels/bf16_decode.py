@@ -15,12 +15,12 @@ from . import kernels as ops
 from .kernels import _gdn_gate_values
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _bf16_part(
     X,
     W,
     P,
-    M: tl.constexpr,
+    M,
     N: tl.constexpr,
     K: tl.constexpr,
     MT: tl.constexpr,
@@ -52,10 +52,8 @@ def _bf16_part(
     )
 
 
-@triton.jit
-def _gate_finish(
-    P, PARAM, DT, ALPHA, BETA, M: tl.constexpr, ST: tl.constexpr, ROUND_BETA: tl.constexpr
-):
+@triton.jit(do_not_specialize=["M"])
+def _gate_finish(P, PARAM, DT, ALPHA, BETA, M, ST: tl.constexpr, ROUND_BETA: tl.constexpr):
     row = tl.program_id(0)
     h = tl.arange(0, 32)
     a = tl.full((32,), 0.0, tl.float32)
@@ -95,7 +93,7 @@ def gates(x, w, a_log, dt, round_beta):
     return alpha, beta
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _router_topk(
     P,
     Y,
@@ -104,7 +102,7 @@ def _router_topk(
     ROWS,
     COUNTS,
     ACTIVE,
-    M: tl.constexpr,
+    M,
     ST: tl.constexpr,
     WIDTH: tl.constexpr,
     RETIRE: tl.constexpr,
@@ -150,8 +148,8 @@ def _router_topk(
             tl.store(ROWS + 256 * M + row, row * 9 + 8)
 
 
-@triton.jit
-def _router_tma_parts(X, W, P, M: tl.constexpr):
+@triton.jit(do_not_specialize=["M"])
+def _router_tma_parts(X, W, P, M):
     start_x = tl.program_id(0) * 32
     start_w = tl.program_id(1) * 32
     part = tl.program_id(2)

@@ -31,10 +31,8 @@ def _mn_major_scales(scales):
     return scales.transpose(-1, -2).contiguous().float()
 
 
-@triton.jit
-def _pack_expert_rows(
-    A, S, ROUTES, SORTED, START, EXTENT, PACK, PS, PERM, CAP: tl.constexpr, K: tl.constexpr
-):
+@triton.jit(do_not_specialize=["CAP"])
+def _pack_expert_rows(A, S, ROUTES, SORTED, START, EXTENT, PACK, PS, PERM, CAP, K: tl.constexpr):
     sorted_index = tl.program_id(0)
     pair = tl.load(SORTED + sorted_index).to(tl.int32)
     expert = tl.load(ROUTES + pair)
@@ -50,8 +48,8 @@ def _pack_expert_rows(
     tl.store(PERM + pair, destination)
 
 
-@triton.jit
-def _scan_expert_counts(COUNTS, EXTENT, ROWS: tl.constexpr):
+@triton.jit(do_not_specialize=["ROWS"])
+def _scan_expert_counts(COUNTS, EXTENT, ROWS):
     e = tl.arange(0, 512)
     count = tl.load(COUNTS + e, e < 256, 0)
     count = tl.where(e == 256, ROWS, count)
@@ -60,10 +58,8 @@ def _scan_expert_counts(COUNTS, EXTENT, ROWS: tl.constexpr):
     tl.store(EXTENT + 1 + e, tl.cumsum(padded, 0), e < 257)
 
 
-@triton.jit
-def _pack_scattered_rows(
-    A, S, ROUTES, SLOTS, EXTENT, PACK, PS, PERM, CAP: tl.constexpr, K: tl.constexpr
-):
+@triton.jit(do_not_specialize=["CAP"])
+def _pack_scattered_rows(A, S, ROUTES, SLOTS, EXTENT, PACK, PS, PERM, CAP, K: tl.constexpr):
     row = tl.program_id(0)
     i = tl.arange(0, K)
     g = tl.arange(0, K // 128)
@@ -78,10 +74,8 @@ def _pack_scattered_rows(
         tl.store(PERM + slot, dst)
 
 
-@triton.jit
-def _clear_expert_padding(
-    PACK, PS, COUNTS, EXTENT, CAP: tl.constexpr, ROWS: tl.constexpr, K: tl.constexpr
-):
+@triton.jit(do_not_specialize=["CAP", "ROWS"])
+def _clear_expert_padding(PACK, PS, COUNTS, EXTENT, CAP, ROWS, K: tl.constexpr):
     expert = tl.program_id(0)
     count = tl.where(expert == 256, ROWS, tl.load(COUNTS + expert, expert < 256, 0))
     padding = (4 - count % 4) % 4

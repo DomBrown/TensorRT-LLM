@@ -88,6 +88,7 @@ class DecodeGates(OpWrapper):
         Cell("batched BF16 gate projection", {"rows": 32}),
         Cell("wide partitioned gate projection", {"rows": 128}),
         Cell("same reduction for packed short contexts", {"rows": 39}),
+        Cell("mixed batch with a partial decode tile", {"rows": 193}),
     )
 
     def __call__(
@@ -138,7 +139,7 @@ class RoutedExperts(OpWrapper):
         ),
         Cell(
             "wide packed prefill and compact expert scatter",
-            {"rows": 512, "decode": False},
+            {"rows": 513, "decode": False},
         ),
     )
     note = "Composes the reference engine's stable top-k, expert schedule, W8A8 GEMMs and SwiGLU."
