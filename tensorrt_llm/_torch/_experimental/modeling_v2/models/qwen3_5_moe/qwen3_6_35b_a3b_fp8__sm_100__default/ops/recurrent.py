@@ -1,0 +1,196 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Slot-indexed convolution and recurrence for the Qwen Gated DeltaNet block."""
+
+from __future__ import annotations
+
+import itertools
+
+import torch
+from flashinfer.gdn_prefill import chunk_gated_delta_rule
+from torch.nn import functional as F
+
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from ..kernels import gdn_decode, prefill_gdn
+from ..kernels.convolution import convolution
+from ..kernels.kernels import gdn_recurrent
+
+_CONV_WIDTH = 8192
+_QK_WIDTH = 2048
+_VALUE_WIDTH = 4096
+SHORT_CONTEXT = 96
+ProjectionRows = torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+
+def _context_ranges(
+    rows: int, offsets: torch.Tensor | None, initial: torch.Tensor | None
+) -> tuple[list[int], list[bool]]:
+    if offsets is None:
+        return list(range(rows + 1)), [True] * rows
+    return offsets.tolist(), initial.tolist()
+
+
+def _split_qkv(mixed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    rows = mixed.shape[0]
+    q, k, v = mixed.split((_QK_WIDTH, _QK_WIDTH, _VALUE_WIDTH), dim=-1)
+    return q.reshape(rows, 16, 128), k.reshape(rows, 16, 128), v.reshape(rows, 32, 128)
+
+
+class CausalConvolution(OpWrapper):
+    """Apply the four-tap depthwise SiLU convolution and update the last three inputs."""
+
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = (
+        Cell("one-token decode, nonzero state slot", {"lengths": (), "slots": (3,)}),
+        Cell("batched decode with noncontiguous slots", {"lengths": (), "slots": (4, 1, 5)}),
+        Cell(
+            "packed fresh context and a one-token continuation",
+            {"lengths": (5, 1), "slots": (3, 1), "initial": (False, True)},
+        ),
+        Cell(
+            "chunked recurrence uses contiguous Q, K and V",
+            {"lengths": (101, 6), "slots": (0, 2), "initial": (True, False), "split": True},
+        ),
+    )
+
+    def __call__(
+        self,
+        raw: torch.Tensor,
+        weights: torch.Tensor,
+        history: torch.Tensor,
+        slots: torch.Tensor,
+        offsets: torch.Tensor | None,
+        row_map: torch.Tensor | None,
+        initial: torch.Tensor | None,
+        split: bool = False,
+    ) -> ProjectionRows:
+        return convolution(raw, weights, history, slots, offsets, row_map, initial, split)
+
+    def reference(
+        self,
+        raw: torch.Tensor,
+        weights: torch.Tensor,
+        history: torch.Tensor,
+        slots: torch.Tensor,
+        offsets: torch.Tensor | None,
+        row_map: torch.Tensor | None,
+        initial: torch.Tensor | None,
+        split: bool = False,
+    ) -> ProjectionRows:
+        starts, read_history = _context_ranges(raw.shape[0], offsets, initial)
+        outputs = []
+        for index, slot in enumerate(slots.tolist()):
+            prefix = history[slot] if read_history[index] else torch.zeros_like(history[slot])
+            src = raw[starts[index] : starts[index + 1], :_CONV_WIDTH].T
+            source = torch.cat((prefix, src), dim=-1)
+            out = F.conv1d(source[None].float(), weights.float(), groups=_CONV_WIDTH)
+            outputs.append(F.silu(out[0].T).to(raw.dtype))
+            history[slot].copy_(source[:, -3:])
+        mixed = torch.cat(outputs)
+        return _split_qkv(mixed) if split else mixed
+
+
+class GatedDeltaRule(OpWrapper):
+    """GDN over indexed [slots, 32, 128, 128] FP32 states in V-major order."""
+
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = (
+        Cell("decode single row", {"lengths": (), "slots": (3,)}),
+        Cell("decode at batch 32", {"lengths": (), "slots": tuple(range(32, 0, -1))}),
+        Cell(
+            "short prefill across fresh and carried states",
+            {"lengths": (7, 3), "slots": (1, 4), "initial": (False, True)},
+        ),
+        Cell(
+            "time-tiled prefill",
+            {"lengths": (23, 12), "slots": (3, 1), "initial": (False, True)},
+        ),
+        Cell(
+            "chunked FlashInfer prefill with indexed input and output",
+            {"lengths": (129, 31), "slots": (4, 1), "initial": (False, True)},
+        ),
+    )
+    note = "Uses the reference engine's sequential and time-tiled recurrence and FlashInfer SM100 prefill."
+
+    def __call__(
+        self,
+        mixed: ProjectionRows,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        state: torch.Tensor,
+        slots: torch.Tensor,
+        offsets: torch.Tensor | None,
+        initial: torch.Tensor | None,
+        read_slots: torch.Tensor | None,
+        lengths: tuple[int, ...],
+    ) -> torch.Tensor:
+        if not lengths:
+            if mixed.shape[0] > 1:
+                return gdn_decode.recurrent(mixed, alpha, beta, state, slots)
+            return gdn_recurrent(mixed, alpha, beta, state, slots)
+        max_length = max(lengths)
+        if max_length > SHORT_CONTEXT:
+            q, k, v = mixed
+            result, _ = chunk_gated_delta_rule(
+                q,
+                k,
+                v,
+                alpha,
+                beta,
+                initial_state=state if read_slots is not None else None,
+                output_final_state=True,
+                cu_seqlens=offsets,
+                use_qk_l2norm_in_kernel=True,
+                output_state=state,
+                state_indices=slots if read_slots is None else read_slots,
+                output_state_indices=None if read_slots is None else slots,
+                max_seqlen=max_length,
+                cu_seqlens_cpu=list(itertools.accumulate(lengths, initial=0)),
+                backend="flashinfer",
+                use_cp=False,
+            )
+            return result.view(-1, _VALUE_WIDTH)
+        if max_length >= 16:
+            return prefill_gdn.recurrent(mixed, alpha, beta, state, offsets, slots, initial)
+        return gdn_recurrent(mixed, alpha, beta, state, slots, offsets, initial)
+
+    def reference(
+        self,
+        mixed: ProjectionRows,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        state: torch.Tensor,
+        slots: torch.Tensor,
+        offsets: torch.Tensor | None,
+        initial: torch.Tensor | None,
+        read_slots: torch.Tensor | None,
+        lengths: tuple[int, ...],
+    ) -> torch.Tensor:
+        q, k, v = _split_qkv(mixed) if isinstance(mixed, torch.Tensor) else mixed
+        q_norm = q.float() * (q.float().square().sum(dim=-1, keepdim=True) + 1e-6).rsqrt()
+        k_norm = k.float() * (k.float().square().sum(dim=-1, keepdim=True) + 1e-6).rsqrt()
+        if lengths:
+            q_norm = q_norm.to(q.dtype).float()
+            k_norm = k_norm.to(k.dtype).float()
+        query = q_norm.repeat_interleave(2, dim=1) * (128**-0.5)
+        key = k_norm.repeat_interleave(2, dim=1)
+        starts, read_history = _context_ranges(v.shape[0], offsets, initial)
+        out = torch.empty_like(v)
+        for index, slot in enumerate(slots.tolist()):
+            carry = state[slot].float().clone()
+            if not read_history[index]:
+                carry.zero_()
+            for row in range(starts[index], starts[index + 1]):
+                carry *= alpha[row, :, None, None]
+                innovation = v[row].float() - (carry * key[row, :, None, :]).sum(-1)
+                innovation *= beta[row, :, None]
+                carry.addcmul_(innovation[:, :, None], key[row, :, None, :])
+                out[row].copy_((carry * query[row, :, None, :]).sum(-1))
+            state[slot].copy_(carry)
+        return out.view(-1, _VALUE_WIDTH)
+
+
+causal_convolution = CausalConvolution()
+gated_delta_rule = GatedDeltaRule()
