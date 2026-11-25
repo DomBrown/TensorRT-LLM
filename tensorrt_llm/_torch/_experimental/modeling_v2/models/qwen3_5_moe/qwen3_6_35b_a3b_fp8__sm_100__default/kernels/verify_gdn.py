@@ -26,6 +26,7 @@ def _verify_conv(
     STAGE_CHANNEL: tl.constexpr,
     STAGE_TIME: tl.constexpr,
     TILE: tl.constexpr,
+    STAGE_RAW: tl.constexpr,
 ):
     request = tl.program_id(0)
     channel = tl.program_id(1) * TILE + tl.arange(0, TILE)
@@ -48,10 +49,69 @@ def _verify_conv(
         value = tl.fma(x3, w3, value)
         tl.store(MIXED + row * 8192 + channel, value * tl.sigmoid(value))
         target = staged + rank * STAGE_TOKEN
-        tl.store(target, x1)
-        tl.store(target + STAGE_TIME, x2)
-        tl.store(target + 2 * STAGE_TIME, x3)
+        if STAGE_RAW:
+            tl.store(target, x3)
+        else:
+            tl.store(target, x1)
+            tl.store(target + STAGE_TIME, x2)
+            tl.store(target + 2 * STAGE_TIME, x3)
         x0, x1, x2 = x1, x2, x3
+
+
+@triton.jit
+def _promote_replay_conv(
+    CONV,
+    STAGED,
+    SOURCE,
+    DESTINATION,
+    ACCEPTED,
+    DUMMY,
+    REPLAY_SLOTS,
+    PENDING,
+    BANK,
+    CONV_LAYER: tl.constexpr,
+    CONV_SLOT: tl.constexpr,
+    CONV_CHANNEL: tl.constexpr,
+    CONV_TAP: tl.constexpr,
+    STAGE_LAYER: tl.constexpr,
+    STAGE_SLOT: tl.constexpr,
+    STAGE_ROW: tl.constexpr,
+    META_STRIDE: tl.constexpr,
+    WIDTH: tl.constexpr,
+    HISTORY: tl.constexpr,
+    ADVANCE: tl.constexpr,
+    HAS_DUMMY: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    layer = tl.program_id(0)
+    request = tl.program_id(1)
+    tile = tl.program_id(2)
+    if HAS_DUMMY:
+        if tl.load(DUMMY + request):
+            return
+    accepted = tl.load(ACCEPTED + request)
+    if accepted <= 0:
+        return
+    source = tl.load(SOURCE + request).to(tl.int64)
+    destination = tl.load(DESTINATION + request).to(tl.int64)
+    channel = tile * TILE + tl.arange(0, TILE)
+    raw = STAGED + layer * STAGE_LAYER + source * STAGE_SLOT + channel
+    window = CONV + layer * CONV_LAYER + destination * CONV_SLOT + channel * CONV_CHANNEL
+    # Copy forward so a retained tap always reads a later entry in the old window.
+    for tap in tl.static_range(3):
+        index = accepted + tap
+        if index < 3:
+            value = tl.load(window + index * CONV_TAP)
+        else:
+            value = tl.load(raw + (index - 3) * STAGE_ROW)
+        tl.store(window + tap * CONV_TAP, value)
+    if ADVANCE and layer == 0 and tile == 0:
+        slot = tl.load(REPLAY_SLOTS + request).to(tl.int64) * META_STRIDE
+        pending = tl.load(PENDING + slot)
+        bank = tl.load(BANK + slot)
+        flushed = pending + WIDTH > HISTORY
+        tl.store(PENDING + slot, tl.where(flushed, accepted - 1, pending + accepted))
+        tl.store(BANK + slot, tl.where(flushed, 1 - bank, bank))
 
 
 @triton.jit
@@ -101,8 +161,10 @@ def verify_convolution(
     staged_conv: torch.Tensor,
     width: int,
 ) -> torch.Tensor:
-    """Write each width-token chain's rolling BF16 windows to candidate rows."""
+    """Convolve each chain and stage the raw inputs or rolling windows."""
     mixed = projection.new_empty((projection.shape[0], 8192))
+    stage_raw = staged_conv.ndim == 3
+    stage_strides = (*staged_conv.stride(), 0) if stage_raw else staged_conv.stride()
     _verify_conv[(slots.numel(), 32)](
         projection,
         weight,
@@ -113,11 +175,50 @@ def verify_convolution(
         width,
         projection.stride(0),
         *conv.stride(),
-        *staged_conv.stride(),
+        *stage_strides,
         256,
+        stage_raw,
         num_warps=4,
     )
     return mixed
+
+
+def promote_replay_convolution(
+    conv: torch.Tensor,
+    staged: torch.Tensor,
+    source: torch.Tensor,
+    destination: torch.Tensor,
+    accepted: torch.Tensor,
+    dummy: torch.Tensor | None,
+    replay_slots: torch.Tensor,
+    pending: torch.Tensor,
+    bank: torch.Tensor,
+    width: int,
+    history: int,
+    advance: bool = True,
+) -> None:
+    """Reconstruct the accepted convolution windows and advance FP32 replay."""
+    tile = 1024
+    _promote_replay_conv[(conv.shape[0], source.numel(), conv.shape[-2] // tile)](
+        conv,
+        staged,
+        source,
+        destination,
+        accepted,
+        dummy,
+        replay_slots,
+        pending,
+        bank,
+        *conv.stride(),
+        *staged.stride()[:-1],
+        pending.stride(0),
+        width,
+        history,
+        advance,
+        dummy is not None,
+        tile,
+        num_warps=4,
+    )
 
 
 def verify_recurrent(

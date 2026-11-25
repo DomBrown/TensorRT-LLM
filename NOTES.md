@@ -417,3 +417,53 @@ MoE at 282 µs versus 172 µs for the target kernels, with 5.1% relative
 RMS output error. The TMA panel layout kept exact BF16 outputs, but
 both expert projections ran slower at 384 and 512 rows. TMA loading
 of the FP32 recurrent checkpoint also ran slower at batch 128.
+
+## Matched Modeling V1 and V2 serving
+
+The V1 server used `modeling_v2: off` with the same BF16 matmul policy,
+three-token MTP, 32,768-token scheduler budget, FP32 recurrent-state
+setting, paged KV budget, and graph sizes as the fused-epilogue V2
+build. Both used the same prompts and the one-wave benchmark. V1
+finished its native warm-up before measurements.
+
+### Matched MTP serving, ISL 1024, OSL 1024
+
+| ISL | OSL | Concurrency | V1 tokens/s | V2 tokens/s | V1 median TTFT (ms) | V2 median TTFT (ms) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 1024 | 32 | 6190.3 | 7570.9 | 420.93 | 377.04 |
+| 1024 | 1024 | 128 | 12196.3 | 14736.0 | 1071.63 | 1016.05 |
+
+## Compact convolution staging and GDN acceptance
+
+The replay path stages one BF16 input per candidate. A fused acceptance
+kernel reconstructs the three-tap window of the accepted prefix using
+the old window and the raw staged rows. It also advances the replay
+count and bank for the executor's request slots. Full FP32 checkpoints
+include the always-consumed seed when they are written. The following
+step replays the accepted tail in the same FP32 order. The staged
+checkpoint path continues to work with the same cache manager interface.
+The convolution and accepted-window reconstruction adapt
+`/ref-engine/speculation.py`. The seed checkpoint and FP32 replay
+follow `/ref-engine/gdn_decode.py`, using the runtime's separate
+state and replay slot indices.
+
+The reference implementation's alternating checkpoint trial reached
+14,995 tokens/s at C128 but 7,186 at C32, at ISL 1024 and OSL 1024.
+The adopted policy uses pending record count to decide when to write a
+checkpoint. A 65,536-token scheduler budget measured 7,554 and 14,774
+tokens/s at C32 and C128, with 1,206 ms median TTFT at C128. The serving
+configuration keeps 32,768 tokens per step.
+
+The CLI passed all 32 development cases with mean KL 0.006457 and
+99.587% non-tie top-1 agreement. All 75 focused tests passed. The
+actual server passed the external oracle at C1, C8, C32 and C128.
+The cached CLI comparison still observed one distinct first divergence
+at exactly 0.5 nats at C128.
+
+### Compact replay serving, ISL 1024, OSL 1024
+
+| ISL | OSL | Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+|---:|---:|---:|---:|---:|---:|
+| 1024 | 1024 | 1 | 794.2 | 49.86 | 1.21 |
+| 1024 | 1024 | 32 | 7645.7 | 381.71 | 3.60 |
+| 1024 | 1024 | 128 | 15023.1 | 1008.64 | 7.11 |

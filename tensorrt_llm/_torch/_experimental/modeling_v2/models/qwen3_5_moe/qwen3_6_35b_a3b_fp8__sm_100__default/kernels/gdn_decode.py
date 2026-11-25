@@ -159,8 +159,6 @@ def _gdn_replay(
         state = _pair_fma(innovation[:, None], key[None, :], _pair_product(state, decay))
 
     flush = (accepted + SPEC_WIDTH) > HISTORY
-    if not DIRECT_COMMIT and flush:
-        gl.store(state_ptr, state, cache_modifier=".cs")
     write_bank = gl.where(flush, 1 - bank, bank)
     write_pos = gl.where(flush, 0, accepted)
     for rank in gl.static_range(WIDTH):
@@ -175,12 +173,17 @@ def _gdn_replay(
         state = _pair_fma(innovation[:, None], key[None, :], state)
         gl.store(OUT + row * 4096 + h * 128 + v, _replay_sum(state * q[None, :], TILE, layout))
         if not DIRECT_COMMIT:
-            record = write_bank * HISTORY + write_pos + rank
-            gl.store(innovation_ptr + record * 4096, innovation)
-            if t == 0:
-                gl.store(decay_ptr + write_bank * 32 * HISTORY + write_pos + rank, decay)
-                if h % 2 == 0:
-                    gl.store(key_ptr + record * 2048, key)
+            # The verifier always consumes the seed, even if it rejects every draft.
+            if rank == 0 and flush:
+                gl.store(state_ptr, state, cache_modifier=".cs")
+            else:
+                write_rank = write_pos + rank - flush.to(gl.int32)
+                record = write_bank * HISTORY + write_rank
+                gl.store(innovation_ptr + record * 4096, innovation)
+                if t == 0:
+                    gl.store(decay_ptr + write_bank * 32 * HISTORY + write_rank, decay)
+                    if h % 2 == 0:
+                        gl.store(key_ptr + record * 2048, key)
     if DIRECT_COMMIT:
         gl.store(state_ptr, state, cache_modifier=".cs")
 

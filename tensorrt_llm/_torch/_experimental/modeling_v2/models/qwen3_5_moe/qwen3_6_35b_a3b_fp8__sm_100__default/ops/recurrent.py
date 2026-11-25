@@ -16,7 +16,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from ..kernels import gdn_decode, prefill_gdn
 from ..kernels.convolution import convolution
 from ..kernels.kernels import gdn_recurrent
-from ..kernels.verify_gdn import verify_convolution, verify_recurrent
+from ..kernels.verify_gdn import promote_replay_convolution, verify_convolution, verify_recurrent
 
 _CONV_WIDTH = 8192
 _QK_WIDTH = 2048
@@ -201,10 +201,16 @@ _VERIFY_CELLS = (
 
 
 class VerifyConvolution(OpWrapper):
-    """Save the convolution window for every possible accepted prefix."""
+    """Convolve draft rows and stage the inputs needed for acceptance."""
 
     ARCHS = frozenset({Arch.SM_100})
-    CELLS = _VERIFY_CELLS
+    CELLS = (
+        *_VERIFY_CELLS,
+        Cell(
+            "compact replay inputs for a four-token draft chain",
+            {"slots": (5, 1, 4), "width": 4, "raw_only": True},
+        ),
+    )
 
     def __call__(
         self,
@@ -232,7 +238,10 @@ class VerifyConvolution(OpWrapper):
             carry = torch.cat((history[slot], projected), dim=-1)
             out = F.conv1d(carry[None].float(), weights.float(), groups=_CONV_WIDTH)
             outputs.append(F.silu(out[0].T).to(raw.dtype))
-            staged[request, :width].copy_(carry[:, 1:].unfold(-1, 3, 1).transpose(0, 1))
+            saved = (
+                projected.T if staged.ndim == 3 else carry[:, 1:].unfold(-1, 3, 1).transpose(0, 1)
+            )
+            staged[request, :width].copy_(saved)
         return torch.cat(outputs)
 
 
@@ -285,6 +294,92 @@ class VerifyGatedDeltaRule(OpWrapper):
 
 verify_conv = VerifyConvolution()
 verify_gdn = VerifyGatedDeltaRule()
+
+
+class PromoteReplayConvolution(OpWrapper):
+    """Commit the accepted convolution history and replay count for each live request."""
+
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = (
+        Cell(
+            "multiple layers, remapped slots, skipped dummy and zero acceptance",
+            {"layers": 3, "accepted": (1, 4, 2, 0, 3), "advance": True},
+        ),
+        Cell(
+            "independent layer promotion without a second replay advance",
+            {"layers": 1, "accepted": (3, 1, 4, 2, 1), "advance": False},
+        ),
+    )
+
+    def __call__(
+        self,
+        conv: torch.Tensor,
+        staged: torch.Tensor,
+        source: torch.Tensor,
+        destination: torch.Tensor,
+        accepted: torch.Tensor,
+        dummy: torch.Tensor | None,
+        replay_slots: torch.Tensor,
+        pending: torch.Tensor,
+        bank: torch.Tensor,
+        width: int,
+        history: int,
+        advance: bool = True,
+    ) -> None:
+        promote_replay_convolution(
+            conv,
+            staged,
+            source,
+            destination,
+            accepted,
+            dummy,
+            replay_slots,
+            pending,
+            bank,
+            width,
+            history,
+            advance,
+        )
+
+    def reference(
+        self,
+        conv: torch.Tensor,
+        staged: torch.Tensor,
+        source: torch.Tensor,
+        destination: torch.Tensor,
+        accepted: torch.Tensor,
+        dummy: torch.Tensor | None,
+        replay_slots: torch.Tensor,
+        pending: torch.Tensor,
+        bank: torch.Tensor,
+        width: int,
+        history: int,
+        advance: bool = True,
+    ) -> None:
+        dummy_requests = [False] * source.numel() if dummy is None else dummy.tolist()
+        for src, dst, count, slot, skip in zip(
+            source.tolist(),
+            destination.tolist(),
+            accepted.tolist(),
+            replay_slots.tolist(),
+            dummy_requests,
+            strict=True,
+        ):
+            if skip or count == 0:
+                continue
+            window = conv[:, dst]
+            prefix = staged[:, src, :count].transpose(-1, -2)
+            window.copy_(torch.cat((window, prefix), dim=-1)[..., -3:])
+            if advance:
+                prev = int(pending[slot])
+                if prev + width > history:
+                    pending[slot] = count - 1
+                    bank[slot] = 1 - bank[slot]
+                else:
+                    pending[slot] = prev + count
+
+
+promote_replay_conv = PromoteReplayConvolution()
 
 
 class ReplayGatedDeltaRule(OpWrapper):
@@ -369,8 +464,6 @@ class ReplayGatedDeltaRule(OpWrapper):
             flush = count + spec_width > keys.shape[2]
             write_start = 0 if flush else count
             write_bank = 1 - old_bank if flush else old_bank
-            if flush and width > 1:
-                state[state_slot].copy_(carry)
             for rank in range(width):
                 row = request * width + rank
                 repeated_key = key[row].repeat_interleave(2, dim=0)
@@ -380,10 +473,13 @@ class ReplayGatedDeltaRule(OpWrapper):
                 carry.addcmul_(innovation[:, :, None], repeated_key[:, None, :])
                 output[row].copy_((carry * query[row, :, None, :]).sum(-1))
                 if width > 1:
-                    position = write_start + rank
-                    keys[replay_slot, write_bank, position].copy_(key[row])
-                    innovations[replay_slot, write_bank, position].copy_(innovation)
-                    decays[replay_slot, write_bank, :, position].copy_(alpha[row])
+                    if rank == 0 and flush:
+                        state[state_slot].copy_(carry)
+                    else:
+                        position = write_start + rank - int(flush)
+                        keys[replay_slot, write_bank, position].copy_(key[row])
+                        innovations[replay_slot, write_bank, position].copy_(innovation)
+                        decays[replay_slot, write_bank, :, position].copy_(alpha[row])
             if width == 1:
                 state[state_slot].copy_(carry)
         return output.view(-1, _VALUE_WIDTH)

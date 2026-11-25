@@ -18,6 +18,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35
     SHORT_CONTEXT,
     causal_convolution,
     gated_delta_rule,
+    promote_replay_conv,
     replay_gdn,
     verify_conv,
     verify_gdn,
@@ -191,7 +192,8 @@ def test_verify_convolution(cell, certifying):  # noqa: F811
     weights = torch.randn(8192, 1, 4, device="cuda", dtype=torch.bfloat16)
     history = torch.randn(8, 3, 8192, 3, device="cuda", dtype=torch.bfloat16)[:, 1]
     saved = history.clone()
-    staged = torch.zeros(4, 4, 8192, 3, device="cuda", dtype=torch.bfloat16)
+    staged_shape = (4, 4, 8192) if cell.spec.get("raw_only", False) else (4, 4, 8192, 3)
+    staged = torch.zeros(staged_shape, device="cuda", dtype=torch.bfloat16)
     expected_staged = staged.clone()
     actual = verify_conv(raw, weights, slots, history, staged, width)
     with true_fp32_matmul():
@@ -220,6 +222,31 @@ def test_verify_gated_delta_rule(cell, certifying):  # noqa: F811
     assert_within_ulp(actual, expected, element_ulp=1, rms_ulp=0.1)
     assert torch.equal(state, saved)
     torch.testing.assert_close(staged, expected_staged, atol=2e-7, rtol=1e-5)
+
+
+@pytest.mark.parametrize("cell", promote_replay_conv.CELLS, ids=lambda cell: cell.why)
+def test_promote_replay_convolution(cell, certifying):  # noqa: F811
+    certifying(promote_replay_conv)
+    torch.manual_seed(41)
+    layers = cell.spec["layers"]
+    window = torch.randn(layers, 8, 3, 8192, device="cuda", dtype=torch.bfloat16).transpose(-1, -2)
+    staged = torch.randn(layers, 8, 4, 8192, device="cuda", dtype=torch.bfloat16)
+    expected = window.clone()
+    src = torch.tensor([4, 0, 5, 2, 6], device="cuda", dtype=torch.int32)
+    dst = torch.tensor([6, 1, 4, 0, 3], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([2, 5, 6, 0, 4], device="cuda", dtype=torch.int32)
+    accepted = torch.tensor(cell.spec["accepted"], device="cuda", dtype=torch.int32)
+    dummy = torch.tensor([False, False, False, False, True], device="cuda")
+    meta = torch.zeros(8, 4, device="cuda", dtype=torch.int32)
+    meta[slots, 0] = torch.tensor([2, 6, 1, 7, 5], device="cuda", dtype=torch.int32)
+    meta[slots, 1] = 1
+    expected_meta = meta.clone()
+    args = (staged, src, dst, accepted, dummy, slots)
+    cfg = (4, 8, cell.spec["advance"])
+    promote_replay_conv(window, *args, meta[:, 0], meta[:, 1], *cfg)
+    promote_replay_conv.reference(expected, *args, expected_meta[:, 0], expected_meta[:, 1], *cfg)
+    assert torch.equal(window, expected)
+    assert torch.equal(meta, expected_meta)
 
 
 @pytest.mark.parametrize("cell", replay_gdn.CELLS, ids=lambda cell: cell.why)
@@ -271,5 +298,9 @@ def test_replay_gated_delta_rule(cell, certifying):  # noqa: F811
             torch.testing.assert_close(got, want, atol=3e-7, rtol=2e-5)
         before = accepted[replay_slots]
         flushed = before + spec_width > history
-        accepted[replay_slots] = torch.where(flushed, new_count, before + new_count)
-        bank[replay_slots] = torch.where(flushed, 1 - bank[replay_slots], bank[replay_slots])
+        if width == 1:
+            accepted[replay_slots] = 0
+            bank[replay_slots] = 0
+        else:
+            accepted[replay_slots] = torch.where(flushed, new_count - 1, before + new_count)
+            bank[replay_slots] = torch.where(flushed, 1 - bank[replay_slots], bank[replay_slots])

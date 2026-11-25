@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -17,15 +19,30 @@ from tensorrt_llm._torch.modules.fla.cache_manager import (
 )
 from tensorrt_llm._torch.utils import is_gdn_replay_enabled
 
-# Keep a few accepted prefixes between full FP32 state checkpoints.
-_HISTORY = 8
+from .ops.recurrent import promote_replay_conv
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
+        MambaAcceptanceBatch,
+        MambaStateLayout,
+    )
 
 
 class _Fp32GdnReplayState(GDNReplayState):
     def __init__(self, width: int) -> None:
         super().__init__(width)
-        self.replay_history_size = _HISTORY
+        self.replay_history_size = 2 * width
         self.fused_verify = True
+
+    def bind(
+        self,
+        context: MambaStateLayout,
+        ssm_states: list[torch.Tensor],
+        conv_states: list[torch.Tensor],
+    ) -> None:
+        # Candidate storage holds one raw input per rank. The bound windows keep all three taps.
+        scratch = replace(context, conv_state_shape=context.conv_state_shape[:1])
+        super().bind(scratch, ssm_states, conv_states)
 
     def replay_layout(self, context, layer_id):
         layout = super().replay_layout(context, layer_id)
@@ -36,6 +53,35 @@ class _Fp32GdnReplayState(GDNReplayState):
 
     def _bind_state_addressing(self, context) -> None:
         """The verifier folds replay records and writes the checkpoints in-layer."""
+
+    def update(self, batch: MambaAcceptanceBatch) -> None:
+        metadata = self.get_replay_metadata()
+        staged = self.intermediate_conv
+        if metadata is None or staged is None:
+            raise RuntimeError("Qwen replay buffers are not bound")
+        replay_slots = (
+            batch.destination_state_indices
+            if batch.replay_indices is None
+            else batch.replay_indices
+        )
+        args = (
+            batch.source_state_indices,
+            batch.destination_state_indices,
+            batch.num_accepted_tokens,
+            batch.is_dummy_request,
+            replay_slots,
+            metadata.prev_num_accepted_tokens,
+            metadata.cache_buf_idx,
+            metadata.replay_step_width,
+            metadata.replay_history_size,
+        )
+        if self._stacked_conv is not None:
+            promote_replay_conv(self._stacked_conv, staged, *args)
+        else:
+            for index, window in enumerate(self._conv_states):
+                promote_replay_conv(
+                    window.unsqueeze(0), staged[index : index + 1], *args, advance=index == 0
+                )
 
 
 class Qwen36HybridCacheManager(Qwen35HybridCacheManager):
