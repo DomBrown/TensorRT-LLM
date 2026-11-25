@@ -41,6 +41,7 @@ def run(
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 
     def make_llm(draft_length: int = 0) -> LLM:
+        prefill_graph = modeling_v2 == "require" and draft_length == 0
         return LLM(
             directory,
             modeling_v2=modeling_v2,
@@ -50,6 +51,8 @@ def run(
             max_batch_size=1,
             max_num_tokens=8192,
             cuda_graph_config={"batch_sizes": [1]},
+            prefill_cuda_graph_backend="breakable" if prefill_graph else "disabled",
+            prefill_capture_num_tokens=[128, 256, 512, 1024, 2048] if prefill_graph else None,
             kv_cache_config={
                 "enable_block_reuse": False,
                 "max_tokens": 16384,

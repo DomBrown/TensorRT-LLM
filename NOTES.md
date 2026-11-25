@@ -506,3 +506,31 @@ The focused operation suite passed 76 tests.
 | 1024 | 1024 | 1 | 795.3 | 48.59 | 1.21 |
 | 1024 | 1024 | 32 | 7640.4 | 383.05 | 3.60 |
 | 1024 | 1024 | 128 | 14822.6 | 1037.74 | 7.16 |
+
+## Exact-length prefill graphs
+
+The CLI's standard-sampling executor captures fresh single-request
+contexts at 128, 256, 512, 1,024 and 2,048 tokens. The target copies
+the live token IDs, positions, physical page indices and recurrent
+metadata into address-stable buffers before each replay. This resolves
+the memory error in the earlier two-executor trial. The runtime's
+decoder input preparer consults the target's shape check before padding.
+Other lengths, mixed batches, and contexts with carried state use eager
+prefill. The scorer still takes the eager path when it returns context
+logits. The MTP executor uses the same decode graphs.
+
+The six benchmark first tokens matched the corresponding greedy
+continuations. All 32 oracle items and the CLI protocol checks passed.
+The shared decoder graph and routing CPU tests passed 594 tests and
+14 subtests, with 76 skipped. The first serving launch hit a CUDA illegal
+instruction during the native hybrid warmup. A fresh launch of the same
+configuration completed warmup and passed the HTTP oracle at concurrency
+1, 8, 32, 64, and 128.
+
+### Exact-length prefill graph, ISL 128/1024/4096, OSL 1024
+
+| ISL | OSL | Median TTFT (ms) | Decode (tokens/s) |
+|---:|---:|---:|---:|
+| 128 | 1024 | 11.29 | 759.6 |
+| 1024 | 1024 | 21.91 | 794.0 |
+| 4096 | 1024 | 55.23 | 774.3 |

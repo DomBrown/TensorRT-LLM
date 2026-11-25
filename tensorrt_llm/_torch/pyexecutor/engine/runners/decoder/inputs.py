@@ -677,6 +677,14 @@ class DecoderInputPreparer:
             # Pad only to a bucket that replays; any other batch runs eagerly
             # at its real token count. Every TP rank captures the same buckets.
             prefill_cuda_graph_num_tokens = breakable_runner.captured_num_tokens
+        if allow_prefill_cuda_graph and breakable_runner is not None:
+            accepts_prefill_graph = getattr(
+                breakable_runner.layer_model, "accepts_prefill_graph", None
+            )
+            if accepts_prefill_graph is not None:
+                allow_prefill_cuda_graph = accepts_prefill_graph(
+                    attn_metadata, num_tokens, prefill_cuda_graph_num_tokens
+                )
         return pad_input_tokens(
             attn_metadata,
             num_tokens,

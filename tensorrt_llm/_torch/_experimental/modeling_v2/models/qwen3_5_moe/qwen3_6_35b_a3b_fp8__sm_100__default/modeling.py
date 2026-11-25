@@ -16,6 +16,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.speculative.greedy_argmax import greedy_argmax
 from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
@@ -138,6 +139,52 @@ def _linear_step(md: TrtllmAttentionMetadata) -> _LinearStep:
     return _LinearStep(md.num_ctx_tokens, slots, replay_slots, _partition_context(context))
 
 
+class _PrefillGraphStep(NamedTuple):
+    input_ids: torch.Tensor
+    position_ids: torch.Tensor
+    recurrent: _LinearStep
+    attention: dict
+
+
+class _PrefillGraphBuffers:
+    """Address-stable operands refreshed before each exact-length prefill replay."""
+
+    def __init__(self) -> None:
+        self.tensors: dict[str, torch.Tensor] = {}
+
+    def _update(self, name: str, source: torch.Tensor) -> torch.Tensor:
+        target = self.tensors.get(name)
+        if target is None:
+            target = source.clone()
+            self.tensors[name] = target
+        else:
+            target.copy_(source)
+        return target
+
+    def prepare(
+        self, md: TrtllmAttentionMetadata, input_ids: torch.Tensor, position_ids: torch.Tensor
+    ) -> _PrefillGraphStep:
+        step = _linear_step(md)
+        (group,) = step.contexts
+        static_group = group._replace(
+            slots=self._update("state_slots", group.slots),
+            offsets=self._update("query_offsets", group.offsets),
+            row_map=self._update("query_requests", group.row_map),
+            initial=self._update("initial_state", group.initial),
+        )
+        recurrent = _LinearStep(step.context_rows, static_group.slots, None, (static_group,))
+        attention = context_attention_step(md)
+        for field, value in attention.items():
+            if field != "workspace" and isinstance(value, torch.Tensor) and value.is_cuda:
+                attention[field] = self._update("attention." + field, value)
+        return _PrefillGraphStep(
+            self._update("input_ids", input_ids),
+            self._update("position_ids", position_ids),
+            recurrent,
+            attention,
+        )
+
+
 def _small_bf16(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     # Keep the reduction shape independent of the number of rows in the small decode path.
     rows = x.shape[0]
@@ -147,10 +194,10 @@ def _small_bf16(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 class _Decoder(DecoderModel):
-    supports_prefill_cuda_graph = False
-
     def __init__(self, model_config: ModelConfig) -> None:
         super().__init__(model_config)
+        self.supports_prefill_cuda_graph = model_config.spec_config is None
+        self._prefill_graph_buffers: dict[int, _PrefillGraphBuffers] = {}
         text = model_config.pretrained_config
         self.layer_types = tuple(text.layer_types)
         self.hidden_size = text.hidden_size
@@ -177,6 +224,31 @@ class _Decoder(DecoderModel):
         self.gemm = PrefillGemm(device)
         self.route_counts = torch.zeros(257, dtype=torch.int32, device=device)
         self.gate_stream = torch.cuda.Stream(device)
+
+    @staticmethod
+    def _single_fresh_context(md: TrtllmAttentionMetadata, rows: int) -> bool:
+        return (
+            md.num_contexts == md.num_seqs == 1
+            and md.num_ctx_tokens == rows
+            and not md.mamba_metadata.use_initial_states
+        )
+
+    def accepts_prefill_graph(
+        self, md: TrtllmAttentionMetadata, rows: int, buckets: list[int] | None
+    ) -> bool:
+        # Each captured recurrence specializes the length and request boundaries.
+        return bool(buckets and rows in buckets and self._single_fresh_context(md, rows))
+
+    def prepare_prefill_graph(
+        self, md: TrtllmAttentionMetadata, input_ids: torch.Tensor, position_ids: torch.Tensor
+    ) -> _PrefillGraphStep | None:
+        rows = input_ids.numel()
+        if not self._single_fresh_context(md, rows):
+            return None
+        buffers = self._prefill_graph_buffers.get(rows)
+        if buffers is None:
+            buffers = self._prefill_graph_buffers[rows] = _PrefillGraphBuffers()
+        return buffers.prepare(md, input_ids, position_ids)
 
     def _attention_pool(self, cache: object, index: int) -> tuple[torch.Tensor, int]:
         """Take a zero-copy HND view of the executor's paged KV pool."""
@@ -409,15 +481,19 @@ class _Decoder(DecoderModel):
         attn_metadata: TrtllmAttentionMetadata,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
+        prefill_graph: _PrefillGraphStep | None = None,
     ) -> torch.Tensor:
         rows = input_ids.numel()
+        if prefill_graph is None:
+            recurrent = _linear_step(attn_metadata)
+            attention = (
+                attention_step(attn_metadata)
+                if uses_native_decode(attn_metadata)
+                else context_attention_step(attn_metadata)
+            )
+        else:
+            input_ids, position_ids, recurrent, attention = prefill_graph
         position = position_ids.view(-1, rows)[0]
-        recurrent = _linear_step(attn_metadata)
-        attention = (
-            attention_step(attn_metadata)
-            if uses_native_decode(attn_metadata)
-            else context_attention_step(attn_metadata)
-        )
         decode = attn_metadata.num_contexts == 0
         generation_count = attn_metadata.num_seqs - attn_metadata.num_contexts
         query_rows = (rows - recurrent.context_rows) // generation_count if generation_count else 1
@@ -689,7 +765,10 @@ class ModelingV2Qwen3635BA3BFp8Sm100Default(DecoderModelForCausalLM):
         **kwargs: object,
     ) -> torch.Tensor | dict:
         """Evaluate packed context and generation rows in scheduler order."""
-        hidden = self.model(attn_metadata, input_ids, position_ids)
+        prefill_graph = None
+        if self.model.supports_prefill_cuda_graph and is_in_breakable_cuda_graph():
+            prefill_graph = self.model.prepare_prefill_graph(attn_metadata, input_ids, position_ids)
+        hidden = self.model(attn_metadata, input_ids, position_ids, prefill_graph)
         if self.spec_worker is not None:
             selected = hidden[spec_metadata.gather_ids]
             logits = _small_bf16(selected, self.lm_head.weight)
