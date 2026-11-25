@@ -861,3 +861,45 @@ requests at C1, C8, C32, C64, and C128.
 The medians above use the two prompts shared with the standalone run.
 Across all three prompts per length, the medians were 822.4, 794.1, and
 842.3 tokens/s in the same order.
+
+### Checked-in fixed-split serving, ISL 1024/4096, OSL 1024
+
+The full run through `serve.sh` used the same server settings and input
+checksums as the matched V1 baseline. The earlier four-wave admission
+trials at ISL 1024 and OSL 1024 gave 7611.2 and 14838.2 tokens/s at C32
+and C128 with a 24-iteration wait, and 7633.0 and 14888.1 with a
+32-iteration wait. Median TTFT increased on both. The shipped profile
+keeps the 16-iteration admission setting.
+
+| ISL | OSL | Concurrency | V1 tokens/s | V2 tokens/s | Speedup | V1 median TTFT (ms) | V2 median TTFT (ms) |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 1024 | 1 | 556.6 | 780.1 | 1.40× | 93.02 | 46.35 |
+| 1024 | 1024 | 2 | 891.1 | 1220.7 | 1.37× | 195.13 | 115.87 |
+| 1024 | 1024 | 4 | 1559.2 | 1830.7 | 1.17× | 201.04 | 144.73 |
+| 1024 | 1024 | 8 | 2495.9 | 2950.8 | 1.18× | 209.47 | 135.66 |
+| 1024 | 1024 | 16 | 4065.4 | 4463.4 | 1.10× | 228.96 | 145.39 |
+| 1024 | 1024 | 32 | 5922.8 | 7625.3 | 1.29× | 206.97 | 145.37 |
+| 1024 | 1024 | 64 | 8700.6 | 10952.4 | 1.26× | 216.38 | 152.81 |
+| 1024 | 1024 | 128 | 11490.7 | 13905.4 | 1.21× | 275.32 | 188.25 |
+| 4096 | 1024 | 1 | 537.5 | 744.0 | 1.38× | 88.42 | 66.59 |
+| 4096 | 1024 | 8 | 2401.8 | 2705.2 | 1.13× | 118.21 | 76.51 |
+| 4096 | 1024 | 32 | 4732.5 | 5838.1 | 1.23× | 209.73 | 126.46 |
+
+### Fixed-split direct parity, ISL 128/1024/4096, OSL 1024
+
+The final `engine.sh` generated the same 24 batch-1 continuations as
+the run instrumented for incremental decode logits. The final
+`serve.sh` repeated the longer test over 272 requests. Every first
+difference was below 0.5 nats under the recorded BF16 decode logits
+and under the FP32 recomputation of their top two values. The CLI's
+separate teacher-forced score still gave margins at or above the
+cutoff on 11 requests across C64 and C128. Those 11 requests involved
+three distinct prompt/position pairs and a maximum margin of 0.625 nats.
+
+| Concurrency | Requests | Exact sequences | Incremental near-ties | Incremental cutoff misses | Teacher-forced cutoff misses |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 24 | 24 | 0 | 0 | 0 |
+| 8 | 24 | 23 | 1 | 0 | 0 |
+| 32 | 32 | 10 | 22 | 0 | 0 |
+| 64 | 64 | 24 | 40 | 0 | 3 |
+| 128 | 128 | 22 | 106 | 0 | 8 |
