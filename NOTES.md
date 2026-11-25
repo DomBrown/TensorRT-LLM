@@ -247,3 +247,43 @@ four-row verifier remains the faster measured configuration.
 |---:|---:|---:|---:|---:|---:|
 | 1024 | 1024 | 32 | 6587.4 | 327.4 | 4.39 |
 | 1024 | 1024 | 128 | 7462.4 | 2957.6 | 13.96 |
+
+## Packed prefill and grouped paged attention experiments
+
+Layer tracing isolated early packing-dependent differences in short-context
+GDN. A difference below one millionth in a recurrent output could move a
+value across an FP8 rounding boundary and grow through later layers. The
+short prefill trial uses a common BF16 gate projection reduction across
+packings and the same time-tiled recurrence at every short length. An
+operation test checks bitwise packing parity for both the recurrent output
+and state. The batch-1 oracle passed with KL 0.006457 and 99.587% non-tie
+top-1 agreement.
+
+The grouped paged tiles come from `/ref-engine/verify_attention.py`. They
+share each loaded K/V tile across the query positions of a request and use
+the executor's BF16 page table. With grouped tiles at all batch sizes, the
+external oracle passed through concurrency 32. Concurrency 128 had
+non-fragile divergences. A hybrid dispatch uses the catalog's full-width
+paged attention above 32 generation requests and grouped tiles up to 32.
+It passed the external checks at 1, 8 and 32. At 128 the only external
+first differences were at one fragile position, repeated four times.
+Direct comparison against the CLI also observed first differences with
+teacher-forced margins of at least 0.5 at the larger concurrencies.
+
+### Attention experiments, ISL 1024, OSL 1024
+
+| Attention | ISL | OSL | Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+|---|---:|---:|---:|---:|---:|---:|
+| Grouped paged | 1024 | 1024 | 32 | 7188.8 | 320.6 | 3.90 |
+| Grouped paged | 1024 | 1024 | 128 | 12031.3 | 1199.1 | 8.81 |
+| Hybrid paged | 1024 | 1024 | 32 | 7228.6 | 307.1 | 3.88 |
+| Hybrid paged | 1024 | 1024 | 128 | 12944.2 | 1113.8 | 8.32 |
+
+### Replay decode profile, ISL 1024, OSL 256
+
+Nsight Systems captured 24 steady batch-128 speculative steps. The
+transposed expert projections occupied 36.6% of kernel time, GDN
+replay occupied 27.7%, and dense FP8 projections occupied 9.3%.
+The recurrent update took approximately 202 µs per layer. Reordering
+GDN CTAs to process adjacent tiles of one state first lost time in
+isolated tests with strided recurrent slots.

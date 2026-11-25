@@ -153,9 +153,7 @@ class GatedDeltaRule(OpWrapper):
                 use_cp=False,
             )
             return result.view(-1, _VALUE_WIDTH)
-        if max_length >= 16:
-            return prefill_gdn.recurrent(mixed, alpha, beta, state, offsets, slots, initial)
-        return gdn_recurrent(mixed, alpha, beta, state, slots, offsets, initial)
+        return prefill_gdn.recurrent(mixed, alpha, beta, state, offsets, slots, initial)
 
     def reference(
         self,

@@ -51,49 +51,59 @@ def _decode_attention(
     PAGE_SIZE: tl.constexpr,
     PAGE_STRIDE: tl.constexpr,
     SPLITS: tl.constexpr,
-    BN: tl.constexpr,
     SPLIT_LEN: tl.constexpr,
     WIDTH: tl.constexpr,
     QUERY_ROWS: tl.constexpr,
+    GROUP_ROWS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    first_row = tl.program_id(0) * GROUP_ROWS
+    sequence = first_row // QUERY_ROWS
     kv_head = tl.program_id(1)
     split = tl.program_id(2)
-    end = tl.load(POS + row) + 1
     start = split * SPLIT_LEN
-    d = tl.arange(0, 256)
-    m = tl.arange(0, 16)
-    n = tl.arange(0, BN)
-    if start < end:
-        q = tl.load(
-            QKV + row * WIDTH + (kv_head * 8 + m[:, None]) * 256 + d[None, :],
-            m[:, None] < 8,
-            0,
+    last_end = tl.load(POS + first_row + GROUP_ROWS - 1) + 1
+    if start >= last_end:
+        return
+    channel = tl.arange(0, 256)
+    lane = tl.arange(0, BLOCK_M)
+    rank = lane // 8
+    head = kv_head * 8 + lane % 8
+    row = first_row + rank
+    end = tl.load(POS + row, rank < GROUP_ROWS, 0) + 1
+    valid = (rank < GROUP_ROWS) & (start < end)
+    q = tl.load(
+        QKV + row[:, None] * WIDTH + head[:, None] * 256 + channel[None, :],
+        valid[:, None],
+        0,
+    )
+    highest = tl.full((BLOCK_M,), -float("inf"), tl.float32)
+    denom = tl.full((BLOCK_M,), 0.0, tl.float32)
+    acc = tl.full((BLOCK_M, 256), 0.0, tl.float32)
+    for key_start in range(start, tl.minimum(last_end, start + SPLIT_LEN), 32):
+        position = key_start + tl.arange(0, 32)
+        page = tl.load(
+            BLOCKS + sequence * BLOCK_ROW_STRIDE + position // PAGE_SIZE,
+            position < last_end,
+            -1,
+        ).to(tl.int64)
+        address = page * PAGE_STRIDE + (kv_head * PAGE_SIZE + position % PAGE_SIZE) * 256
+        live = (position < last_end) & (page >= 0)
+        key = tl.load(POOL + address[None, :] + channel[:, None], live[None, :], 0)
+        value = tl.load(POOL + address[:, None] + PAGE_STRIDE + channel[None, :], live[:, None], 0)
+        scores = tl.dot(q, key) * 0.09016844005556021  # log2(e) / sqrt(256)
+        scores = tl.where(
+            valid[:, None] & (position[None, :] < end[:, None]), scores, -float("inf")
         )
-        high = tl.full((16,), -float("inf"), tl.float32)
-        den = tl.full((16,), 0.0, tl.float32)
-        acc = tl.full((16, 256), 0.0, tl.float32)
-        for idx in range(start, tl.minimum(end, start + SPLIT_LEN), BN):
-            p = idx + n
-            page = tl.load(
-                BLOCKS + (row // QUERY_ROWS) * BLOCK_ROW_STRIDE + p // PAGE_SIZE, p < end, -1
-            ).to(tl.int64)
-            address = page * PAGE_STRIDE + (kv_head * PAGE_SIZE + p % PAGE_SIZE) * 256
-            live = (p < end) & (page >= 0)
-            k = tl.load(POOL + address[None, :] + d[:, None], live[None, :], 0)
-            v = tl.load(POOL + address[:, None] + PAGE_STRIDE + d[None, :], live[:, None], 0)
-            score = tl.dot(q, k) * 0.09016844005556021  # log2(e) / sqrt(256)
-            score = tl.where(p[None, :] < end, score, -float("inf"))
-            hi = tl.maximum(high, tl.max(score, 1))
-            prior = tl.exp2(high - hi)
-            probability = tl.exp2(score - hi[:, None])
-            den = den * prior + tl.sum(probability, 1)
-            acc = tl.dot(probability.to(v.dtype), v, acc * prior[:, None])
-            high = hi
-        head = kv_head * 8 + m
-        base = (row * SPLITS + split) * 16 + head
-        tl.store(PART + base[:, None] * 256 + d[None, :], acc / den[:, None], m[:, None] < 8)
-        tl.store(LSE + base, high + tl.log2(den), m < 8)
+        next_high = tl.where(valid, tl.maximum(highest, tl.max(scores, 1)), 0.0)
+        old = tl.exp2(highest - next_high)
+        probability = tl.exp2(scores - next_high[:, None])
+        denom = denom * old + tl.sum(probability, 1)
+        acc = tl.dot(probability.to(value.dtype), value, acc * old[:, None])
+        highest = next_high
+    index = (row * SPLITS + split) * 16 + head
+    tl.store(PART + index[:, None] * 256 + channel[None, :], acc / denom[:, None], valid[:, None])
+    tl.store(LSE + index, highest + tl.log2(denom), valid)
 
 
 @triton.jit
@@ -142,7 +152,9 @@ def paged_decode(
         query_rows,
         num_warps=4,
     )
-    _decode_attention[(rows, _KV_HEADS, splits)](
+    # A singleton uses the narrower query tiles to maximize parallelism.
+    group_rows = query_rows if rows > query_rows else 1
+    _decode_attention[(rows // group_rows, _KV_HEADS, splits)](
         qkv,
         pool,
         positions,
@@ -153,10 +165,11 @@ def paged_decode(
         page_size,
         stride,
         splits,
-        32,
         split_length,
         width,
         query_rows,
+        group_rows,
+        max(16, triton.next_power_of_2(group_rows * 8)),
         num_warps=4,
     )
     out = qkv.new_empty((rows, _Q_HEADS * _HEAD_DIM))

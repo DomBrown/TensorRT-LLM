@@ -21,7 +21,14 @@ from tensorrt_llm._torch.speculative.utils import get_spec_worker
 from .... import disable_v2_by_default
 from .cache_manager import Qwen36HybridCacheManager
 from .kernels.prefill_gemm import PrefillGemm
-from .ops.attention import attention_step, gqa, paged_decode_attention, qkv_projection
+from .ops.attention import (
+    attention_step,
+    context_attention_step,
+    gqa,
+    paged_decode_attention,
+    qkv_projection,
+    uses_native_decode,
+)
 from .ops.epilogue import gated_output_quantize, gdn_gates, residual_norm_quantize
 from .ops.projection import decode_gates, fp8_projection, routed_experts, uses_cutlass
 from .ops.recurrent import (
@@ -129,14 +136,13 @@ class _Decoder(DecoderModel):
     @staticmethod
     def _prefill_gdn(
         projection: torch.Tensor,
-        ab: torch.Tensor,
-        conv_weight: torch.Tensor,
-        a_log: torch.Tensor,
-        dt_bias: torch.Tensor,
+        hidden: torch.Tensor,
+        weights: tuple[torch.Tensor, ...],
         conv: torch.Tensor,
         state: torch.Tensor,
         step: _LinearStep,
     ) -> torch.Tensor:
+        ab_weight, conv_weight, a_log, dt_bias, _ = weights
         rows = step.context_rows
         ctx_slots = step.slots[: len(step.lengths)]
         max_length = max(step.lengths)
@@ -151,7 +157,12 @@ class _Decoder(DecoderModel):
             step.initial,
             split=chunked,
         )
-        alpha, beta = gdn_gates(ab, a_log, dt_bias)
+        if chunked:
+            alpha, beta = gdn_gates(F.linear(hidden[:rows], ab_weight), a_log, dt_bias)
+        else:
+            alpha, beta = decode_gates(
+                hidden[:rows], ab_weight, a_log, dt_bias, fixed_reduction=True
+            )
         return gated_delta_rule(
             mixed,
             alpha,
@@ -230,7 +241,7 @@ class _Decoder(DecoderModel):
             assert recurrent is not None
             conv = cache.get_conv_states(index)
             state = cache.get_ssm_states(index)
-            ab_weight, conv_weight, a_log, dt_bias, norm = layer.attention_params
+            norm = layer.attention_params[-1]
             ctx_rows = recurrent.context_rows
             ctx_count = len(recurrent.lengths)
             if decode:
@@ -249,10 +260,8 @@ class _Decoder(DecoderModel):
             else:
                 core = self._prefill_gdn(
                     projection,
-                    F.linear(x[:ctx_rows], ab_weight),
-                    conv_weight,
-                    a_log,
-                    dt_bias,
+                    x,
+                    layer.attention_params,
                     conv,
                     state,
                     recurrent,
@@ -276,14 +285,20 @@ class _Decoder(DecoderModel):
             qkv = qkv_projection(
                 projection, *layer.attention_params, self.cosine, self.sine, position
             )
-            if decode and md.num_seqs == 1:
-                pool, pool_id = self._attention_pool(cache, index)
-                pages = md.kv_cache_block_offsets[pool_id, : md.num_seqs, 0]
-                core = paged_decode_attention(
-                    qkv, pool, position, pages, md.max_seq_len, query_rows
-                )
-            else:
+            if uses_native_decode(md):
                 core = gqa(qkv, cache.layer_offsets[index], attention, query_rows)
+            else:
+                ctx_count = md.num_contexts
+                ctx_rows = md.num_ctx_tokens if ctx_count else 0
+                if ctx_rows:
+                    core = gqa(qkv[:ctx_rows], cache.layer_offsets[index], attention)
+                if ctx_rows < qkv.shape[0]:
+                    pool, pool_id = self._attention_pool(cache, index)
+                    pages = md.kv_cache_block_offsets[pool_id, ctx_count : md.num_seqs, 0]
+                    gen_core = paged_decode_attention(
+                        qkv[ctx_rows:], pool, position[ctx_rows:], pages, md.max_seq_len, query_rows
+                    )
+                    core = torch.cat((core, gen_core)) if ctx_rows else gen_core
             gated = gated_output_quantize(core, projection, None, mn_major=mn_major)
         return fp8_projection(gated, layer.output_projection, decode, self.gemm)
 
@@ -296,7 +311,11 @@ class _Decoder(DecoderModel):
         rows = input_ids.numel()
         position = position_ids.view(-1, rows)[0]
         recurrent = _linear_step(attn_metadata)
-        attention = attention_step(attn_metadata)
+        attention = (
+            attention_step(attn_metadata)
+            if uses_native_decode(attn_metadata)
+            else context_attention_step(attn_metadata)
+        )
         decode = attn_metadata.num_contexts == 0
         generation_count = attn_metadata.num_seqs - attn_metadata.num_contexts
         query_rows = (rows - recurrent.context_rows) // generation_count if generation_count else 1
@@ -410,7 +429,11 @@ class _MtpLayer(nn.Module):
             hidden,
             attention_input,
             attn_metadata,
-            attention_step(attn_metadata),
+            (
+                attention_step(attn_metadata)
+                if uses_native_decode(attn_metadata)
+                else context_attention_step(attn_metadata)
+            ),
             None,
             position,
             decode,

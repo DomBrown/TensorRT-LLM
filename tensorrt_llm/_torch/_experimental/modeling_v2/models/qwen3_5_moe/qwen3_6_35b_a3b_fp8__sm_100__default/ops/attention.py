@@ -121,6 +121,29 @@ def attention_step(md: TrtllmAttentionMetadata) -> dict:
     )
 
 
+def uses_native_decode(md: TrtllmAttentionMetadata) -> bool:
+    return md.num_seqs - md.num_contexts > 32
+
+
+def context_attention_step(md: TrtllmAttentionMetadata) -> dict:
+    """Bind just the context prefix when generation uses paged decode tiles."""
+    count = md.num_contexts
+    if count == 0:
+        return {}
+    kwargs = attention_step(md)
+    for field in (
+        "sequence_length",
+        "host_past_key_value_lengths",
+        "context_lengths",
+        "host_context_lengths",
+        "host_request_types",
+    ):
+        kwargs[field] = kwargs[field][:count]
+    kwargs["kv_cache_block_offsets"] = kwargs["kv_cache_block_offsets"][:, :count].contiguous()
+    kwargs["use_spec_decoding"] = False
+    return kwargs
+
+
 def gqa(
     packed_qkv: torch.Tensor, layer_offset: int, metadata: dict, query_rows: int = 1
 ) -> torch.Tensor:

@@ -61,9 +61,14 @@ def test_decode_gates(cell, certifying):  # noqa: F811
     w = torch.randn(64, 2048, device=_DEVICE, dtype=_BF16) * 0.03
     a = torch.randn(32, device=_DEVICE, dtype=_BF16)
     dt = torch.randn(32, device=_DEVICE, dtype=_BF16)
+    fixed = cell.spec.get("fixed_reduction", False)
     with true_fp32_matmul():
-        decay, beta = decode_gates(x, w, a, dt)
-        want_decay, want_beta = decode_gates.reference(x, w, a, dt)
+        decay, beta = decode_gates(x, w, a, dt, fixed_reduction=fixed)
+        want_decay, want_beta = decode_gates.reference(x, w, a, dt, fixed_reduction=fixed)
+    if fixed:
+        one_decay, one_beta = decode_gates(x[14:23], w, a, dt, fixed_reduction=True)
+        assert torch.equal(decay[14:23], one_decay)
+        assert torch.equal(beta[14:23], one_beta)
     torch.testing.assert_close(decay, want_decay, atol=0.0015, rtol=0.01)
     torch.testing.assert_close(beta, want_beta, atol=0.001, rtol=0.006)
 

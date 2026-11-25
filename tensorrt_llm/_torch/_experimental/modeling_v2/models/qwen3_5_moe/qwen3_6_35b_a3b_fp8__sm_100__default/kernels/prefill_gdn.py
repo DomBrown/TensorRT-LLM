@@ -45,8 +45,8 @@ def _time_tiled(MIXED, QK, ALPHA, BETA, Y, STATE, CU, SLOTS, INITIAL, SLOT_STRID
     sequence = gl.program_id(0)
     head = gl.program_id(1)
     value_tile = gl.program_id(2)
-    # One key per lane before the reduction matches the short prefill kernel.
-    state_layout: gl.constexpr = gl.BlockedLayout([1, 1], [1, 32], [1, 1], [1, 0])
+    # Keep four consecutive keys per lane for the prefill reduction order.
+    state_layout: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [1, 1], [1, 0])
     preload_layout: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [1, 1], [1, 0])
     key_layout: gl.constexpr = gl.SliceLayout(0, state_layout)
     value_layout: gl.constexpr = gl.SliceLayout(1, state_layout)

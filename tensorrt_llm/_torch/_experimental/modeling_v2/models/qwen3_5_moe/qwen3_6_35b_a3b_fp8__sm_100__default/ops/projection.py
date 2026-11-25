@@ -87,6 +87,7 @@ class DecodeGates(OpWrapper):
         Cell("split-K gate projection for batch 1", {"rows": 1}),
         Cell("batched BF16 gate projection", {"rows": 32}),
         Cell("wide partitioned gate projection", {"rows": 128}),
+        Cell("same reduction for packed short contexts", {"rows": 39, "fixed_reduction": True}),
     )
 
     def __call__(
@@ -96,8 +97,10 @@ class DecodeGates(OpWrapper):
         a_log: torch.Tensor,
         dt_bias: torch.Tensor,
         query_rows: int = 1,
+        fixed_reduction: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return bf16_decode.gates(x, weight, a_log, dt_bias, True, x.shape[0] // query_rows)
+        batch = 1 if fixed_reduction else x.shape[0] // query_rows
+        return bf16_decode.gates(x, weight, a_log, dt_bias, True, batch)
 
     def reference(
         self,
@@ -106,6 +109,7 @@ class DecodeGates(OpWrapper):
         a_log: torch.Tensor,
         dt_bias: torch.Tensor,
         query_rows: int = 1,
+        fixed_reduction: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         ab = F.linear(x.float(), weight.float()).to(BF16).float()
         a, b = ab.chunk(2, dim=-1)

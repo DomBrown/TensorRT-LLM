@@ -92,6 +92,40 @@ def test_gated_delta_rule(cell, certifying):  # noqa: F811
     assert torch.equal(storage[:, ::2], reference_storage[:, ::2])
 
 
+def test_short_recurrence_is_independent_of_context_packing():
+    torch.manual_seed(23)
+    lengths = (9, 14, 30)
+    rows = sum(lengths)
+    mixed = torch.randn(rows, 8192, device="cuda", dtype=torch.bfloat16)
+    alpha = torch.rand(rows, 32, device="cuda") * 0.3 + 0.7
+    beta = torch.rand(rows, 32, device="cuda")
+    slots = torch.tensor([4, 1, 3], device="cuda", dtype=torch.int32)
+    offsets = torch.tensor([0, 9, 23, 53], device="cuda", dtype=torch.int32)
+    initial = torch.tensor([True, False, True], device="cuda")
+    state = torch.randn(5, 32, 128, 128, device="cuda") * 0.04
+    packed_state = state.clone()
+    packed = gated_delta_rule(
+        mixed, alpha, beta, packed_state, slots, offsets, initial, None, lengths
+    )
+    start = 0
+    for i, length in enumerate(lengths):
+        end = start + length
+        single = gated_delta_rule(
+            mixed[start:end],
+            alpha[start:end],
+            beta[start:end],
+            state,
+            slots[i : i + 1],
+            offsets[i : i + 2] - start,
+            initial[i : i + 1],
+            None,
+            (length,),
+        )
+        assert torch.equal(packed[start:end], single)
+        start = end
+    assert torch.equal(state, packed_state)
+
+
 @pytest.mark.parametrize("cell", verify_conv.CELLS, ids=lambda cell: cell.why)
 def test_verify_convolution(cell, certifying):  # noqa: F811
     certifying(verify_conv)
