@@ -61,8 +61,11 @@ class Fp8Projection(OpWrapper):
         if uses_cutlass(rows, decode):
             return gemm.dense(a, scale, *weight)
         if decode:
-            if rows <= 8 and a.shape[1] == HIDDEN_SIZE:
-                return fp8_panel.dense(a, scale, *weight)
+            if rows <= 8:
+                if a.shape[1] == HIDDEN_SIZE:
+                    return fp8_panel.dense(a, scale, *weight)
+                if a.shape[1] == 4096 and weight[0].shape[0] == HIDDEN_SIZE:
+                    return fp8_panel.split_output(a, scale, *weight)
             return fp8_decode.dense(a, scale, *weight, split=True, prefetch_groups=True)
         return kernels.fp8_linear(a, scale, *weight)
 

@@ -192,7 +192,7 @@ def test_verify_convolution(cell, certifying):  # noqa: F811
     weights = torch.randn(8192, 1, 4, device="cuda", dtype=torch.bfloat16)
     history = torch.randn(8, 3, 8192, 3, device="cuda", dtype=torch.bfloat16)[:, 1]
     saved = history.clone()
-    staged_shape = (4, 4, 8192) if cell.spec.get("raw_only", False) else (4, 4, 8192, 3)
+    staged_shape = (4, width, 8192) if cell.spec.get("raw_only", False) else (4, width, 8192, 3)
     staged = torch.zeros(staged_shape, device="cuda", dtype=torch.bfloat16)
     expected_staged = staged.clone()
     actual = verify_conv(raw, weights, slots, history, staged, width)
@@ -215,7 +215,7 @@ def test_verify_gated_delta_rule(cell, certifying):  # noqa: F811
     mixed = torch.randn(rows, 8192, device="cuda", dtype=torch.bfloat16)
     alpha = torch.rand(rows, 32, device="cuda") * 0.3 + 0.7
     beta = torch.rand(rows, 32, device="cuda")
-    staged = torch.zeros(4, 4, 32, 128, 128, device="cuda")
+    staged = torch.zeros(4, width, 32, 128, 128, device="cuda")
     expected_staged = staged.clone()
     actual = verify_gdn(mixed, alpha, beta, slots, state, staged, width)
     expected = verify_gdn.reference(mixed, alpha, beta, slots, state, expected_staged, width)

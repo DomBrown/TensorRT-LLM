@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Small-row E4M3 input projections with TMA activations and weight panels."""
+"""Small-row E4M3 projections with TMA activations and weight panels."""
 
 from functools import lru_cache
 
@@ -17,6 +17,8 @@ from triton.experimental.gluon.language.nvidia.blackwell import (
 )
 from triton.experimental.gluon.language.nvidia.hopper import mbarrier, tma
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
+
+from .fp8_decode import _prefetched_group_sum
 
 
 @gluon.jit
@@ -76,8 +78,8 @@ def _tma_input_projection(
 
 
 @lru_cache(maxsize=128)
-def _descriptor(weight, width=512):
-    shape = [64, width]
+def _descriptor(weight, width, columns=64):
+    shape = [columns, width]
     layout = gl.NVMMASharedLayout.get_default_for(shape, gl.float8e4nv)
     return TensorDescriptor.from_tensor(weight, shape, layout)
 
@@ -103,3 +105,65 @@ def dense(a, scale, weight, weight_scale):
         num_warps=4,
     )
     return out
+
+
+@gluon.jit
+def _partial_panel(
+    AD, WD, RAW, M: gl.constexpr, N: gl.constexpr, COLS: gl.constexpr, GROUPS: gl.constexpr
+):
+    column_tile = gl.program_id(0)
+    panel = gl.program_id(1)
+    channels: gl.constexpr = GROUPS * 128
+    a = gl.allocate_shared_memory(gl.float8e4nv, [8, channels], AD.layout)
+    w = gl.allocate_shared_memory(gl.float8e4nv, [COLS, channels], WD.layout)
+    ready = mbarrier.allocate_mbarrier()
+    done = mbarrier.allocate_mbarrier()
+    mbarrier.init(ready, count=1)
+    mbarrier.init(done, count=1)
+    mbarrier.expect(ready, AD.nbytes_per_cta + WD.nbytes_per_cta)
+    tma.async_load(AD, [0, panel * channels], ready, a)
+    tma.async_load(WD, [column_tile * COLS, panel * channels], ready, w)
+    partial = allocate_tensor_memory(
+        gl.float32, [GROUPS, COLS, 8], TensorMemoryLayout([COLS, 8], col_stride=1)
+    )
+    mbarrier.wait(ready, phase=0)
+    for group in gl.static_range(GROUPS):
+        activation = a.slice(group * 128, 128, dim=1)
+        weight = w.slice(group * 128, 128, dim=1)
+        tcgen05_mma(weight, activation.permute((1, 0)), partial.index(group), use_acc=False)
+    tcgen05_commit(done)
+    mbarrier.wait(done, phase=0)
+    layout: gl.constexpr = partial.index(0).get_reg_layout()
+    row = gl.arange(0, 8, layout=gl.SliceLayout(0, layout))
+    column = column_tile * COLS + gl.arange(0, COLS, layout=gl.SliceLayout(1, layout))
+    for group in gl.static_range(GROUPS):
+        offset = ((panel * GROUPS + group) * M + row[None, :]) * N + column[:, None]
+        gl.store(RAW + offset, partial.index(group).load(), row[None, :] < M)
+    mbarrier.invalidate(ready)
+    mbarrier.invalidate(done)
+
+
+def split_output(a, scale, weight, weight_scale):
+    """Load four K groups per FP8 tile and finish their scale FMAs in order."""
+    rows, k = a.shape
+    columns = weight.shape[0]
+    raw = torch.empty((k // 128, rows, columns), device=a.device, dtype=torch.float32)
+    result = torch.empty((rows, columns), device=a.device, dtype=torch.bfloat16)
+    groups, tile = 4, 128
+    shape = [8, groups * 128]
+    layout = gl.NVMMASharedLayout.get_default_for(shape, gl.float8e4nv)
+    activation = TensorDescriptor.from_tensor(a, shape, layout)
+    _partial_panel[(columns // tile, k // (groups * 128))](
+        activation,
+        _descriptor(weight, groups * 128, tile),
+        raw,
+        rows,
+        columns,
+        tile,
+        groups,
+        num_warps=4,
+    )
+    _prefetched_group_sum[(columns // 32, rows)](
+        raw, scale, weight_scale, result, rows, columns, num_warps=1
+    )
+    return result

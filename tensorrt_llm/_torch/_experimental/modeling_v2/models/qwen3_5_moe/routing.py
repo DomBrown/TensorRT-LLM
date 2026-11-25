@@ -69,7 +69,7 @@ def route(
     spec = model_config.spec_config
     if spec is not None and (
         not spec.spec_dec_mode.is_mtp_eagle_one_model()
-        or spec.max_draft_len not in (1, 2, 3)
+        or spec.max_draft_len not in (1, 2, 3, 4)
         or text.get("mtp_num_hidden_layers") != 1
         or spec.use_dynamic_tree
         or spec.use_rejection_sampling
@@ -80,7 +80,7 @@ def route(
         or spec.draft_moe_dtype != "auto"
     ):
         raise NoTarget(
-            "Qwen3.6-35B-A3B FP8 supports linear embedded MTP with up to three draft tokens"
+            "Qwen3.6-35B-A3B FP8 supports linear embedded MTP with up to four draft tokens"
         )
     if model_config.lora_config is not None or llm_args.max_beam_width != 1:
         raise NoTarget("Qwen3.6-35B-A3B FP8 requires beam width 1 and no LoRA")

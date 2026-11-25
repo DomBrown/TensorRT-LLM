@@ -52,7 +52,7 @@ def run(
             max_num_tokens=8192,
             cuda_graph_config={"batch_sizes": [1]},
             prefill_cuda_graph_backend="breakable" if prefill_graph else "disabled",
-            prefill_capture_num_tokens=[128, 256, 512, 1024, 2048] if prefill_graph else None,
+            prefill_capture_num_tokens=[128, 256, 512, 1024, 2048, 4096] if prefill_graph else None,
             kv_cache_config={
                 "enable_block_reuse": False,
                 "max_tokens": 16384,
@@ -186,7 +186,7 @@ def main() -> None:
         raise SystemExit("usage: engine.sh MODEL_DIRECTORY")
     with os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1) as protocol:
         os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
-        run(Path(sys.argv[1]), protocol, draft_len=3)
+        run(Path(sys.argv[1]), protocol, draft_len=4)
 
 
 if __name__ == "__main__":

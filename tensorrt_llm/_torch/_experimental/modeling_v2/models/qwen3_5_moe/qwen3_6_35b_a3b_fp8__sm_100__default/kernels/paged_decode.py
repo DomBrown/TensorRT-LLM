@@ -53,6 +53,7 @@ def _decode_attention(
     BLOCKS,
     PART,
     LSE,
+    PICKS,
     BLOCK_ROW_STRIDE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     PAGE_STRIDE: tl.constexpr,
@@ -63,8 +64,10 @@ def _decode_attention(
     GROUP_ROWS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     SHORT_LIMIT: tl.constexpr = 0,
+    SELECT_ROWS: tl.constexpr = False,
 ):
-    first_row = tl.program_id(0) * GROUP_ROWS
+    first_output = tl.program_id(0) * GROUP_ROWS
+    first_row = tl.load(PICKS + first_output) if SELECT_ROWS else first_output
     sequence = first_row // QUERY_ROWS
     kv_head = tl.program_id(1)
     split = tl.program_id(2)
@@ -111,7 +114,7 @@ def _decode_attention(
         denom = denom * old + tl.sum(probability, 1)
         acc = tl.dot(probability.to(value.dtype), value, acc * old[:, None])
         highest = next_high
-    index = (row * SPLITS + split) * 16 + head
+    index = ((first_output + rank) * SPLITS + split) * 16 + head
     tl.store(PART + index[:, None] * 256 + channel[None, :], acc / denom[:, None], valid[:, None])
     tl.store(LSE + index, highest + tl.log2(denom), valid)
 
@@ -168,6 +171,7 @@ def _merge_quantize(
     POS,
     PROJECTION,
     NATIVE,
+    PICKS,
     OUTPUT,
     SCALES,
     SPLITS: gl.constexpr,
@@ -176,11 +180,13 @@ def _merge_quantize(
     MN_MAJOR: gl.constexpr,
     SHORT_LIMIT: gl.constexpr,
     QUERY_ROWS: gl.constexpr,
+    SELECT_ROWS: gl.constexpr,
 ):
     row = gl.program_id(0)
+    source = gl.load(PICKS + row) if SELECT_ROWS else row
     head = gl.program_id(1)
     group = gl.program_id(2)
-    end = gl.load(POS + row) + 1
+    end = gl.load(POS + source) + 1
     vector: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0])
     output_channel = group * 128 + gl.arange(0, 128, layout=vector)
     if SHORT_LIMIT:
@@ -191,7 +197,7 @@ def _merge_quantize(
             core = _merged_core(PART, LSE, row, head, group, end, SPLITS, NS, SPLIT_LEN, vector)
     else:
         core = _merged_core(PART, LSE, row, head, group, end, SPLITS, NS, SPLIT_LEN, vector)
-    z = gl.load(PROJECTION + row * 9216 + head * 512 + 256 + output_channel).to(gl.float32)
+    z = gl.load(PROJECTION + source * 9216 + head * 512 + 256 + output_channel).to(gl.float32)
     gate = 1.0 / (1.0 + gl.exp(-z))
     x = (core * gate).to(gl.bfloat16).to(gl.float32)
     maximum = gl.maximum(gl.max(gl.abs(x), 0), 1e-10)
@@ -214,6 +220,7 @@ def paged_decode(
     projection: torch.Tensor | None = None,
     mn_major: bool = False,
     native_output: torch.Tensor | None = None,
+    pick_rows: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Attend over HND pages, reusing the native kernel's writes if supplied."""
     rows, width = qkv.shape
@@ -223,10 +230,11 @@ def paged_decode(
     split_length = 128 if rows == query_rows or short_limit else 256
     max_keys = min(max_seq_len, short_limit) if short_limit else max_seq_len
     splits = triton.cdiv(max_keys, split_length)
+    output_rows = rows if pick_rows is None else pick_rows.numel()
     partial = torch.empty(
-        (rows, splits, _Q_HEADS, _HEAD_DIM), device=qkv.device, dtype=torch.float32
+        (output_rows, splits, _Q_HEADS, _HEAD_DIM), device=qkv.device, dtype=torch.float32
     )
-    lse = torch.empty((rows, splits, _Q_HEADS), device=qkv.device, dtype=torch.float32)
+    lse = torch.empty((output_rows, splits, _Q_HEADS), device=qkv.device, dtype=torch.float32)
     if native_output is None:
         _append_decode[(rows, _KV_HEADS)](
             qkv,
@@ -241,14 +249,15 @@ def paged_decode(
             num_warps=4,
         )
     # A singleton uses the narrower query tiles to maximize parallelism.
-    group_rows = query_rows if rows > query_rows else 1
-    _decode_attention[(rows // group_rows, _KV_HEADS, splits)](
+    group_rows = query_rows if rows > query_rows and pick_rows is None else 1
+    _decode_attention[(output_rows // group_rows, _KV_HEADS, splits)](
         qkv,
         pool,
         positions,
         key_pages,
         partial,
         lse,
+        pick_rows,
         key_pages.stride(0),
         page_size,
         stride,
@@ -259,18 +268,20 @@ def paged_decode(
         group_rows,
         max(16, triton.next_power_of_2(group_rows * 8)),
         short_limit,
+        pick_rows is not None,
         num_warps=4,
     )
     output_width = _Q_HEADS * _HEAD_DIM
     if projection is not None:
-        out = qkv.new_empty((rows, output_width), dtype=FP8)
-        scales = _scales(rows, output_width // 128, qkv.device, mn_major)
-        _merge_quantize[(rows, _Q_HEADS, _HEAD_DIM // 128)](
+        out = qkv.new_empty((output_rows, output_width), dtype=FP8)
+        scales = _scales(output_rows, output_width // 128, qkv.device, mn_major)
+        _merge_quantize[(output_rows, _Q_HEADS, _HEAD_DIM // 128)](
             partial,
             lse,
             positions,
             projection,
             native_output,
+            pick_rows,
             out,
             scales,
             splits,
@@ -279,10 +290,11 @@ def paged_decode(
             mn_major,
             short_limit,
             query_rows,
+            pick_rows is not None,
             num_warps=4,
         )
         return out, scales
-    out = qkv.new_empty((rows, output_width))
+    out = qkv.new_empty((output_rows, output_width))
     _merge[(rows, _Q_HEADS, _HEAD_DIM // 64)](
         partial,
         lse,

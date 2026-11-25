@@ -66,6 +66,8 @@ def test_paged_decode_attention(cell, certifying):  # noqa: F811
     if cell.spec.get("quantize", False):
         projection = torch.randn(rows, 9216, device="cuda", dtype=torch.bfloat16)
     mn_major = cell.spec.get("mn_major", False)
+    raw_picks = cell.spec.get("pick_rows")
+    pick_rows = None if raw_picks is None else torch.tensor(raw_picks, device="cuda")
     native = None
     if cell.spec.get("native", False):
         # Emulate the cache write from the native kernel before replacing attended rows.
@@ -73,7 +75,11 @@ def test_paged_decode_attention(cell, certifying):  # noqa: F811
         expected_storage.copy_(storage)
         native = torch.randn(rows, 4096, device="cuda", dtype=torch.bfloat16)
     actual = paged_decode_attention(
-        *args, projection=projection, mn_major=mn_major, native_output=native
+        *args,
+        projection=projection,
+        mn_major=mn_major,
+        native_output=native,
+        pick_rows=pick_rows,
     )
     with true_fp32_matmul():
         expected = paged_decode_attention.reference(
@@ -86,6 +92,7 @@ def test_paged_decode_attention(cell, certifying):  # noqa: F811
             projection=projection,
             mn_major=mn_major,
             native_output=native,
+            pick_rows=pick_rows,
         )
     assert torch.equal(storage, expected_storage)
     if projection is None:
@@ -93,8 +100,8 @@ def test_paged_decode_attention(cell, certifying):  # noqa: F811
     else:
         quant, scales = actual
         ref_quant, ref_scales = expected
-        out = quant.float().view(rows, 32, 128) * scales[..., None]
-        ref = ref_quant.float().view(rows, 32, 128) * ref_scales[..., None]
+        out = quant.float().reshape(-1, 32, 128) * scales[..., None]
+        ref = ref_quant.float().reshape(-1, 32, 128) * ref_scales[..., None]
         assert_within_ulp(out, ref, element_ulp=2, rms_ulp=0.3, ulp=1 / 14 + 1e-7)
         if native is None:
             old_core = paged_decode_attention(*args)
@@ -111,6 +118,9 @@ def test_paged_decode_attention(cell, certifying):  # noqa: F811
                         width * page_size,
                         query_rows,
                     )
+        if pick_rows is not None:
+            old_core = old_core.index_select(0, pick_rows)
+            projection = projection.index_select(0, pick_rows)
         old_quant, old_scales = gated_output_quantize(old_core, projection, None, mn_major=mn_major)
         assert scales.stride() == old_scales.stride()
         assert torch.equal(quant.view(torch.uint8), old_quant.view(torch.uint8))

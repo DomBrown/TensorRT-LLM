@@ -196,6 +196,7 @@ gated_delta_rule = GatedDeltaRule()
 
 _VERIFY_CELLS = (
     Cell("two candidates at one nonzero slot", {"slots": (3,), "width": 2}),
+    Cell("five-token verification in a remapped slot", {"slots": (4,), "width": 5}),
     Cell("four candidates with noncontiguous state slots", {"slots": (5, 1, 4), "width": 4}),
 )
 

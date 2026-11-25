@@ -565,3 +565,52 @@ measured 740.2, 7700.1, and 14888.6 tokens/s at C1, C32, and C128,
 respectively. Batch-1 CLI decode was 748.7, 782.6, and 764.4 tokens/s
 at ISL 128, 1024, and 4096 with OSL 1024, about 1.3–1.5% below the
 row-specialized kernels in the preceding two-prompt runs.
+
+## Batch-1 draft depth and projections
+
+The CLI uses four draft tokens for long greedy generations. The server
+uses three. Its two-wave runs compare fixed depths and the runtime's
+positive draft-length schedule. Every tested depth passed the external
+serving oracle at C1, C8, C32, C64, and C128.
+
+### Draft-depth trials, ISL 1024, OSL 1024
+
+| Draft tokens | C32 tokens/s | C128 tokens/s |
+|---|---:|---:|
+| 2 | 6859.5 | 14692.8 |
+| 3 | 7547.3 | 14889.5 |
+| 4 | 6874.5 | 13880.6 |
+| 3 through C32, then 2 | 7575.5 | 14655.6 |
+
+For small MTP decode steps, paged attention writes K/V for every
+candidate and computes only the selected query outputs. The output
+projection loads four 128-channel FP8 groups with each TMA panel and
+applies the FP32 scale multiplications in the original order. Small
+BF16 gates and routers use fixed row counts, and mixed steps still
+reuse shape-stable kernels.
+
+The single-request draft head includes up to 1,024 additional token IDs
+from the current prompt. This adapts the prompt-aware shortlist in
+`/ref-engine/speculation.py`. The full BF16 target head verifies every
+proposal. The score and first-token executor also captures exact
+4,096-token contexts.
+
+### Four-draft CLI, ISL 128/1024/4096, OSL 1024
+
+| ISL | OSL | Median TTFT (ms) | Decode tokens/s |
+|---:|---:|---:|---:|
+| 128 | 1024 | 11.55 | 782.9 |
+| 1024 | 1024 | 22.08 | 825.2 |
+| 4096 | 1024 | 54.58 | 800.2 |
+
+The actual CLI passed all 32 oracle items with KL 0.006457 and 99.587%
+non-tie top-1. The protocol checks passed, and every timed first token
+matched its longer continuation. The focused tests passed 81 cases.
+The shared routing suite passed 460 cases with 76 skips. Capturing
+sampling in the decode graph changed throughput by less than 1% and
+was left disabled.
+
+The HTTP oracle passed at every tested concurrency. The four-wave
+ISL 1024, OSL 1024 run measured 757.0 tokens/s at C1, 7598.3 at C32,
+and 15086.8 at C128. C1 and C128 rose by 2.3% and 1.3% from the previous
+four-wave run. C32 was 1.3% lower in this run.

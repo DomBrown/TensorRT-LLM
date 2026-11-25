@@ -365,6 +365,7 @@ class _Decoder(DecoderModel):
         decode: bool,
         mn_major: bool,
         query_rows: int,
+        pick_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
         pending_gates = None
         if layer.linear_attention and decode and x.shape[0] <= 8:
@@ -456,8 +457,9 @@ class _Decoder(DecoderModel):
                     md.max_seq_len,
                     query_rows,
                     projection=projection,
-                    mn_major=mn_major,
+                    mn_major=mn_major and pick_rows is None,
                     native_output=native_output,
+                    pick_rows=pick_rows,
                 )
                 return fp8_projection(gated, layer.output_projection, decode, self.gemm)
             if native:
@@ -603,6 +605,7 @@ class _MtpLayer(nn.Module):
         _, hidden, attention_input = residual_norm_quantize(
             residual, layer.input_norm, mn_major=mn_major
         )
+        pick_attention_rows = decode and not uses_native_decode(attn_metadata)
         delta = decoder._mix(
             layer,
             len(decoder.layers),
@@ -619,10 +622,12 @@ class _MtpLayer(nn.Module):
             decode,
             mn_major,
             query_rows,
+            pick_rows if pick_attention_rows else None,
         )
         if pick_rows is not None:
             residual = residual[pick_rows]
-            delta = delta[pick_rows]
+            if not pick_attention_rows:
+                delta = delta[pick_rows]
         expert_decode = decode or pick_rows is not None
         residual, hidden, expert_input = residual_norm_quantize(
             residual, layer.post_attention_norm, delta=delta
@@ -665,24 +670,44 @@ class _DraftHead:
 
     def __init__(self, target_weight: torch.Tensor) -> None:
         common = 65536
+        extra = 1024
         special = 248000
         vocab_size, hidden = target_weight.shape
         columns = common + vocab_size - special
-        aligned = (columns + 255) // 256 * 256
-        self.weight = target_weight.new_empty((aligned, hidden))
+        aligned = (columns + extra + 255) // 256 * 256
+        self.target_weight = target_weight
+        self.weight = target_weight.new_zeros((aligned, hidden))
         self.common = common
+        self.extra = extra
+        self.special = special
+        self.columns = columns
         self.weight[:common].copy_(target_weight[:common])
         self.weight[common:columns].copy_(target_weight[special:])
-        self.columns = columns
-        self.special_offset = special - common
+        self.ids = torch.zeros(aligned, device=target_weight.device, dtype=torch.int32)
+        self.ids[:common].copy_(
+            torch.arange(common, device=target_weight.device, dtype=torch.int32)
+        )
+        self.ids[common:columns].copy_(
+            torch.arange(special, vocab_size, device=target_weight.device, dtype=torch.int32)
+        )
+        self.arange = torch.arange(aligned, device=target_weight.device, dtype=torch.int32)
+        self.limit = torch.full((1,), columns, device=target_weight.device, dtype=torch.int32)
+
+    def prepare(self, prompt_ids: torch.Tensor) -> None:
+        tail = torch.unique(prompt_ids)
+        tail = tail[(tail >= self.common) & (tail < self.special)][: self.extra].long()
+        end = self.columns + tail.numel()
+        self.ids[self.columns : end].copy_(tail)
+        self.weight[self.columns : end].copy_(self.target_weight.index_select(0, tail))
+        self.limit.fill_(end)
 
     def supports(self, rows: int) -> bool:
         return rows <= 32
 
     def sample(self, hidden: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
-        logits = _small_bf16(hidden, self.weight)[:, : self.columns]
-        tokens = greedy_argmax(logits, small_rows=True)
-        tokens = torch.where(tokens < self.common, tokens, tokens + self.special_offset)
+        logits = _small_bf16(hidden, self.weight)
+        logits.masked_fill_(self.arange >= self.limit, -float("inf"))
+        tokens = self.ids[greedy_argmax(logits, small_rows=True).long()]
         if out is not None:
             out.copy_(tokens)
             return out
@@ -770,6 +795,8 @@ class ModelingV2Qwen3635BA3BFp8Sm100Default(DecoderModelForCausalLM):
             prefill_graph = self.model.prepare_prefill_graph(attn_metadata, input_ids, position_ids)
         hidden = self.model(attn_metadata, input_ids, position_ids, prefill_graph)
         if self.spec_worker is not None:
+            if attn_metadata.num_contexts and attn_metadata.max_num_requests == 1:
+                self.spec_worker.draft_head.prepare(input_ids)
             selected = hidden[spec_metadata.gather_ids]
             logits = _small_bf16(selected, self.lm_head.weight)
             if (

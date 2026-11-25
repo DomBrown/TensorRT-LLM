@@ -88,15 +88,16 @@ def test_declines_unsupported_deployment(deployment, part, key, value, capabilit
 
 
 @pytest.mark.cpu_only
-def test_routes_linear_embedded_mtp(deployment, monkeypatch) -> None:
+@pytest.mark.parametrize("draft_length", [3, 4])
+def test_routes_linear_embedded_mtp(deployment, monkeypatch, draft_length) -> None:
     config, args = deployment
-    config.spec_config = MTPDecodingConfig(max_draft_len=3)
+    config.spec_config = MTPDecodingConfig(max_draft_len=draft_length)
     monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
     assert route(config, args, (10, 0)).__name__ == "ModelingV2Qwen3635BA3BFp8Sm100Default"
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("options", [{"max_draft_len": 4}, {"use_mtp_vanilla": True}])
+@pytest.mark.parametrize("options", [{"max_draft_len": 5}, {"use_mtp_vanilla": True}])
 def test_declines_unsupported_speculation(deployment, monkeypatch, options) -> None:
     config, args = deployment
     config.spec_config = MTPDecodingConfig(**({"max_draft_len": 3} | options))

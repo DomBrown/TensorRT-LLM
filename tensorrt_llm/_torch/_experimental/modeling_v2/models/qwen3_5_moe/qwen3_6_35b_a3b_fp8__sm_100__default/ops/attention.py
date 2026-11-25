@@ -248,6 +248,15 @@ class PagedDecodeAttention(OpWrapper):
             {"positions": (143, 31, 161), "layers": 3, "quantize": True, "mn_major": True},
         ),
         Cell(
+            "write all draft KV and attend only selected chain rows",
+            {
+                "positions": (30, 31, 32, 33, 110, 111, 112, 113),
+                "query_rows": 4,
+                "quantize": True,
+                "pick_rows": (2, 5),
+            },
+        ),
+        Cell(
             "use the native output for long chains and shared pages for short chains",
             {
                 "positions": (125, 126, 127, 128, 253, 254, 255, 256),
@@ -270,9 +279,12 @@ class PagedDecodeAttention(OpWrapper):
         projection: torch.Tensor | None = None,
         mn_major: bool = False,
         native_output: torch.Tensor | None = None,
+        pick_rows: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if native_output is not None and projection is None:
-            raise ValueError("reusing native output requires the gated FP8 epilogue")
+        if projection is None and (native_output is not None or pick_rows is not None):
+            raise ValueError("native output and row selection require the gated FP8 epilogue")
+        if native_output is not None and pick_rows is not None:
+            raise ValueError("the native path quantizes all output rows")
         return paged_decode(
             qkv,
             pool,
@@ -283,6 +295,7 @@ class PagedDecodeAttention(OpWrapper):
             projection=projection,
             mn_major=mn_major,
             native_output=native_output,
+            pick_rows=pick_rows,
         )
 
     def reference(
@@ -297,6 +310,7 @@ class PagedDecodeAttention(OpWrapper):
         projection: torch.Tensor | None = None,
         mn_major: bool = False,
         native_output: torch.Tensor | None = None,
+        pick_rows: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         page_size = pool.shape[-2]
         row_stride = pool.stride(0) // pool.stride(1)
@@ -321,6 +335,9 @@ class PagedDecodeAttention(OpWrapper):
             probs = ((query @ key.transpose(-1, -2)) / 16.0).softmax(dim=-1)
             output[i].copy_((probs @ value).flatten())
         if projection is not None:
+            if pick_rows is not None:
+                output = output.index_select(0, pick_rows)
+                projection = projection.index_select(0, pick_rows)
             return gated_output_quantize.reference(output, projection, None, mn_major=mn_major)
         return output
 

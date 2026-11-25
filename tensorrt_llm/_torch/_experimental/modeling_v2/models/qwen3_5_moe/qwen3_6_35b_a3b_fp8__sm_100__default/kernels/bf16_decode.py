@@ -28,7 +28,10 @@ def _bf16_part(
     KT: tl.constexpr,
     ST: tl.constexpr,
     K_PART: tl.constexpr = 0,
+    STATIC_ROWS: tl.constexpr = 0,
 ):
+    if STATIC_ROWS:
+        M = STATIC_ROWS
     mi = tl.program_id(0) * MT + tl.arange(0, MT)
     ni = tl.program_id(1) * NT + tl.arange(0, NT)
     slice = tl.program_id(2)
@@ -53,7 +56,19 @@ def _bf16_part(
 
 
 @triton.jit(do_not_specialize=["M"])
-def _gate_finish(P, PARAM, DT, ALPHA, BETA, M, ST: tl.constexpr, ROUND_BETA: tl.constexpr):
+def _gate_finish(
+    P,
+    PARAM,
+    DT,
+    ALPHA,
+    BETA,
+    M,
+    ST: tl.constexpr,
+    ROUND_BETA: tl.constexpr,
+    STATIC_ROWS: tl.constexpr = 0,
+):
+    if STATIC_ROWS:
+        M = STATIC_ROWS
     row = tl.program_id(0)
     h = tl.arange(0, 32)
     a = tl.full((32,), 0.0, tl.float32)
@@ -87,9 +102,12 @@ def gates(x, w, a_log, dt, round_beta):
         nt,
         kt,
         st,
+        STATIC_ROWS=m if m <= 8 else 0,
         num_warps=4,
     )
-    _gate_finish[(m,)](partials, a_log, dt, alpha, beta, m, st, round_beta, num_warps=1)
+    _gate_finish[(m,)](
+        partials, a_log, dt, alpha, beta, m, st, round_beta, m if m <= 8 else 0, num_warps=1
+    )
     return alpha, beta
 
 
@@ -107,7 +125,10 @@ def _router_topk(
     WIDTH: tl.constexpr,
     RETIRE: tl.constexpr,
     COLLECT: tl.constexpr,
+    STATIC_ROWS: tl.constexpr = 0,
 ):
+    if STATIC_ROWS:
+        M = STATIC_ROWS
     row = tl.program_id(0)
     j = tl.arange(0, 8)
     if RETIRE:
@@ -182,7 +203,7 @@ def route_decode(x, weight, counts=None, tile_rows=8, active=None, width=1, emit
         )
     else:
         _bf16_part[(triton.cdiv(m, 16), 9, partitions)](
-            x, weight, p, m, n, k, 16, 32, 64, partitions, 192, num_warps=4
+            x, weight, p, m, n, k, 16, 32, 64, partitions, 192, m if m <= 8 else 0, num_warps=4
         )
     logits = x.new_empty((m, n))
     ids = torch.empty((m, 9), dtype=torch.int64, device=x.device)
@@ -202,6 +223,7 @@ def route_decode(x, weight, counts=None, tile_rows=8, active=None, width=1, emit
         width,
         active is not None,
         collect,
+        m if m <= 8 else 0,
         num_warps=4,
     )
     schedule = None
