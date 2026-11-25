@@ -130,6 +130,12 @@ class RoutedExperts(OpWrapper):
         Cell("small decode with expert tile lists", {"rows": 4, "decode": True}),
         Cell("batch 32 fused route scheduling", {"rows": 32, "decode": True}),
         Cell("batch 128 grouped decode", {"rows": 128, "decode": True}),
+        Cell(
+            "persistent expert tiles for batch 32", {"rows": 128, "decode": True, "query_rows": 4}
+        ),
+        Cell(
+            "persistent expert tiles for batch 128", {"rows": 512, "decode": True, "query_rows": 4}
+        ),
         Cell("short prefill", {"rows": 27, "decode": False}),
         Cell("short-prompt packed prefill with TMA expert tiles", {"rows": 83, "decode": False}),
         Cell(
@@ -159,9 +165,18 @@ class RoutedExperts(OpWrapper):
         fast = decode or small_prefill
         tile_rows = (16 if rows >= 256 else fp8_decode.ROUTE_BLOCK) if fast else 64
         schedule = slots = counts = None
+        multiprocessors = 0
         if decode and batch >= 32:
+            multiprocessors = gemm.multiprocessors if query_rows > 1 else 0
             logits, routes, probabilities, schedule = bf16_decode.router_topk(
-                x, router, batch, True, route_counts, tile_rows, width=query_rows
+                x,
+                router,
+                batch,
+                True,
+                route_counts,
+                tile_rows,
+                width=query_rows,
+                emit_count=multiprocessors > 0,
             )
         elif decode and batch == 1:
             logits, routes, probabilities = bf16_decode.single_router(x, router, True, True)
@@ -202,6 +217,7 @@ class RoutedExperts(OpWrapper):
                         up=True,
                         tile_rows=tile_rows,
                         tuned=True,
+                        multiprocessors=multiprocessors,
                     )
                 a, scale = kernels.quantize(up, "swiglu")
             out = fp8_decode.routed(
@@ -213,6 +229,7 @@ class RoutedExperts(OpWrapper):
                 up=False,
                 tile_rows=tile_rows,
                 tuned=True,
+                multiprocessors=multiprocessors,
             )
         else:
             up = kernels.fp8_linear(a, scale, *gate_up, route=routes, schedule=schedule, up=True)

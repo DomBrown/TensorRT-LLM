@@ -287,3 +287,40 @@ replay occupied 27.7%, and dense FP8 projections occupied 9.3%.
 The recurrent update took approximately 202 µs per layer. Reordering
 GDN CTAs to process adjacent tiles of one state first lost time in
 isolated tests with strided recurrent slots.
+
+## Fused draft input and persistent expert scheduling
+
+The draft layer gathers embeddings, normalizes them and the carried target
+state, and writes the two inputs to its BF16 projection in one Gluon launch.
+The greedy target sampler reads BF16 logits directly. The target opts into
+the runtime's packed decode input uploads, single-stream overlap loop,
+and MTP step-0 epilogue. For wide verification, the MoE projections use
+the persistent expert schedule from `/ref-engine/fp8_decode.py`. At 512
+input rows, the paired CUDA graph microbenchmark went from 219.0 to
+188.8 µs for routing and both projections. Both expert outputs were
+bitwise equal across the tested groups.
+
+`serve.sh` enables replay MTP with three draft tokens. The CLI passed
+all 32 dev prompts with KL 0.006457 and 99.587% non-tie top-1 agreement.
+The actual HTTP launcher passed the external greedy oracle at concurrency
+1, 8, 32, and 128. The four fragile positions encountered at concurrency
+128 all matched the CLI's teacher-forced top-1. Separate comparison against
+the CLI's own cached continuations remains in progress.
+
+### Batch 1 with fused draft input, ISL 128/1024/4096, OSL 1024
+
+| ISL | OSL | Median TTFT (ms) | Decode (tokens/s) |
+|---:|---:|---:|---:|
+| 128 | 1024 | 35.30 | 740.5 |
+| 1024 | 1024 | 34.53 | 776.2 |
+| 4096 | 1024 | 54.22 | 756.1 |
+
+Each 32-token request matched the first 32 tokens of the longer request.
+
+### Persistent-expert serving, ISL 1024, OSL 1024
+
+| ISL | OSL | Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+|---:|---:|---:|---:|---:|---:|
+| 1024 | 1024 | 1 | 772.6 | 48.0 | 1.25 |
+| 1024 | 1024 | 32 | 7465.0 | 319.2 | 3.76 |
+| 1024 | 1024 | 128 | 13956.7 | 1122.0 | 7.68 |

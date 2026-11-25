@@ -175,7 +175,46 @@ class GdnGates(OpWrapper):
         return decay, b.sigmoid().bfloat16().float()
 
 
+class MtpInput(OpWrapper):
+    """Gather token embeddings and normalize both inputs to the MTP projection."""
+
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = (
+        Cell("single-token drafting", {"rows": 1}),
+        Cell("batched verification rows and repeated token IDs", {"rows": 128}),
+    )
+
+    def __call__(
+        self,
+        input_ids: torch.Tensor,
+        embedding: torch.Tensor,
+        hidden: torch.Tensor,
+        embedding_norm: torch.Tensor,
+        hidden_norm: torch.Tensor,
+    ) -> torch.Tensor:
+        return norms.mtp_input(input_ids, embedding, hidden, embedding_norm, hidden_norm)
+
+    def reference(
+        self,
+        input_ids: torch.Tensor,
+        embedding: torch.Tensor,
+        hidden: torch.Tensor,
+        embedding_norm: torch.Tensor,
+        hidden_norm: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.cat(
+            (
+                residual_norm_quantize.reference(
+                    F.embedding(input_ids, embedding), embedding_norm, quantize=False
+                )[1],
+                residual_norm_quantize.reference(hidden, hidden_norm, quantize=False)[1],
+            ),
+            dim=-1,
+        )
+
+
 block_quantize = BlockQuantize()
 residual_norm_quantize = ResidualNormQuantize()
 gated_output_quantize = GatedOutputQuantize()
 gdn_gates = GdnGates()
+mtp_input = MtpInput()

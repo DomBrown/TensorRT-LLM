@@ -11,6 +11,11 @@ from . import kernels as ops
 
 
 @gluon.jit
+def _rms(x, weight, K: gl.constexpr):
+    return (x * gl.rsqrt(gl.sum(x * x, 0) * (1.0 / K) + 1e-6) * (1.0 + weight)).to(gl.bfloat16)
+
+
+@gluon.jit
 def _norm_quant(
     X,
     D,
@@ -80,7 +85,7 @@ def _norm_quant(
             x = x.to(gl.bfloat16).to(gl.float32)
 
     w = gl.load(W + c).to(gl.float32)
-    y = (x * gl.rsqrt(gl.sum(x * x, 0) * (1.0 / K) + 1e-6) * (1.0 + w)).to(gl.bfloat16)
+    y = _rms(x, w, K)
     gl.store(Y + offset, y)
 
     if QUANTIZE:
@@ -149,3 +154,32 @@ def norm_quant(
         num_warps=4,
     )
     return residual, normalized, (q, s)
+
+
+@gluon.jit
+def _mtp_input(IDS, EMBED, HIDDEN, EMBED_NORM, HIDDEN_NORM, PAIR, K: gl.constexpr):
+    row = gl.program_id(0)
+    c = gl.arange(0, K, layout=gl.BlockedLayout([8], [32], [4], [0]))
+    token = gl.load(IDS + row).to(gl.int64)
+    embedding = gl.load(EMBED + token * K + c).to(gl.float32)
+    hidden = gl.load(HIDDEN + row * K + c).to(gl.float32)
+    ew = gl.load(EMBED_NORM + c).to(gl.float32)
+    hw = gl.load(HIDDEN_NORM + c).to(gl.float32)
+    gl.store(PAIR + row * (2 * K) + c, _rms(embedding, ew, K))
+    gl.store(PAIR + row * (2 * K) + K + c, _rms(hidden, hw, K))
+
+
+def mtp_input(input_ids, embedding, hidden, embedding_norm, hidden_norm):
+    rows, width = hidden.shape
+    pair = hidden.new_empty((rows, 2 * width))
+    _mtp_input[(rows,)](
+        input_ids.contiguous(),
+        embedding,
+        hidden.contiguous(),
+        embedding_norm,
+        hidden_norm,
+        pair,
+        width,
+        num_warps=4,
+    )
+    return pair

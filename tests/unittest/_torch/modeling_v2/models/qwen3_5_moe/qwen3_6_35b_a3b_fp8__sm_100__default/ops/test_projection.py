@@ -102,9 +102,12 @@ def test_routed_experts(cell, certifying):  # noqa: F811
         torch.zeros(257, device=_DEVICE, dtype=torch.int32),
         PrefillGemm(_DEVICE),
     )
+    query_rows = cell.spec.get("query_rows", 1)
     with true_fp32_matmul():
-        out, probability, logits, permutation = routed_experts(*args)
-        want, want_probability, want_logits, _ = routed_experts.reference(*args)
+        out, probability, logits, permutation = routed_experts(*args, query_rows=query_rows)
+        want, want_probability, want_logits, _ = routed_experts.reference(
+            *args, query_rows=query_rows
+        )
     if permutation is not None:
         out = out[permutation.long().flatten()]
     torch.testing.assert_close(logits, want_logits)

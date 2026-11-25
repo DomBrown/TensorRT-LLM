@@ -97,6 +97,7 @@ def _clear_expert_padding(
 class PrefillGemm:
     def __init__(self, device):
         self.kernels = _kernels()
+        self.multiprocessors = torch.cuda.get_device_properties(device).multi_processor_count
         self.workspace = torch.empty(64 << 20, dtype=torch.uint8, device=device)
         self.descriptors = torch.empty(8 << 20, dtype=torch.uint8, device=device)
 

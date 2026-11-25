@@ -15,6 +15,8 @@ from torch import nn
 from torch.nn import functional as F
 
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
+from tensorrt_llm._torch.speculative.greedy_argmax import greedy_argmax
 from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
 from tensorrt_llm._torch.speculative.utils import get_spec_worker
 
@@ -29,7 +31,7 @@ from .ops.attention import (
     qkv_projection,
     uses_native_decode,
 )
-from .ops.epilogue import gated_output_quantize, gdn_gates, residual_norm_quantize
+from .ops.epilogue import gated_output_quantize, gdn_gates, mtp_input, residual_norm_quantize
 from .ops.projection import decode_gates, fp8_projection, routed_experts, uses_cutlass
 from .ops.recurrent import (
     SHORT_CONTEXT,
@@ -47,6 +49,15 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.speculative.interface import SpecMetadata
+
+
+_SPEC_DECODE_HOOKS = RuntimeHooks(
+    loop_on_execution_stream=True,
+    pack_step_inputs=True,
+    pack_parallel_scatter=True,
+    skip_greedy_rng_upload=True,
+    spec_small_h2d=True,
+)
 
 
 class _LinearStep(NamedTuple):
@@ -412,12 +423,9 @@ class _MtpLayer(nn.Module):
         context_rows = attn_metadata.num_ctx_tokens if context_count else 0
         generation_count = attn_metadata.num_seqs - context_count
         query_rows = (rows - context_rows) // generation_count if generation_count else 1
-        embeddings = embed_tokens(input_ids)
-        _, embeddings, _ = residual_norm_quantize(embeddings, self.embedding_norm, quantize=False)
-        _, hidden_states, _ = residual_norm_quantize(
-            hidden_states, self.hidden_norm, quantize=False
+        pair = mtp_input(
+            input_ids, embed_tokens.weight, hidden_states, self.embedding_norm, self.hidden_norm
         )
-        pair = torch.cat((embeddings, hidden_states), dim=1)
         residual = _small_bf16(pair, self.fc) if decode else F.linear(pair, self.fc)
         mn_major = uses_cutlass(rows, decode) and (not decode or rows == 128)
         _, hidden, attention_input = residual_norm_quantize(
@@ -501,7 +509,7 @@ class _DraftHead:
 
     def sample(self, hidden: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         logits = _small_bf16(hidden, self.weight)[:, : self.columns]
-        tokens = logits.argmax(dim=-1)
+        tokens = greedy_argmax(logits, small_rows=True)
         tokens = torch.where(tokens < self.common, tokens, tokens + self.special_offset)
         if out is not None:
             out.copy_(tokens)
@@ -544,6 +552,8 @@ class ModelingV2Qwen3635BA3BFp8Sm100Default(DecoderModelForCausalLM):
         self.spec_worker = None
         self.draft_model = None
         spec_config = runtime_config.spec_config
+        self.spec_decode_fast_paths = spec_config is not None
+        self.runtime_hooks = _SPEC_DECODE_HOOKS if self.spec_decode_fast_paths else None
         if spec_config is not None:
             self.draft_model = _MtpDraft(self.model, self.lm_head)
             self.spec_worker = get_spec_worker(
@@ -551,6 +561,7 @@ class ModelingV2Qwen3635BA3BFp8Sm100Default(DecoderModelForCausalLM):
                 runtime_config,
                 runtime_config.mapping,
                 use_separate_draft_kv_cache=should_use_separate_draft_kv_cache(spec_config),
+                spec_decode_fast_paths=self.spec_decode_fast_paths,
             )
             self.spec_worker.set_draft_model(self.draft_model)
             self.spec_worker.set_target_model(self)
@@ -586,7 +597,10 @@ class ModelingV2Qwen3635BA3BFp8Sm100Default(DecoderModelForCausalLM):
         if self.spec_worker is not None:
             selected = hidden[spec_metadata.gather_ids]
             logits = _small_bf16(selected, self.lm_head.weight)
-            if not self.spec_worker.reads_lm_head_dtype_logits:
+            if (
+                not spec_metadata.is_all_greedy_sample
+                or self.spec_worker.guided_decoder is not None
+            ):
                 logits = logits.float()
             return self.spec_worker(
                 input_ids=input_ids,

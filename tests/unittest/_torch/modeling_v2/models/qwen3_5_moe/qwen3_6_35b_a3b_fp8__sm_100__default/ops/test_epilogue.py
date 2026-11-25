@@ -8,6 +8,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35
     block_quantize,
     gated_output_quantize,
     gdn_gates,
+    mtp_input,
     residual_norm_quantize,
 )
 
@@ -104,3 +105,22 @@ def test_gdn_gates(cell, certifying):  # noqa: F811
     want_decay, want_beta = gdn_gates.reference(*args)
     torch.testing.assert_close(decay, want_decay, rtol=2e-5, atol=3e-6)
     torch.testing.assert_close(beta, want_beta, rtol=0.004, atol=1e-7)
+
+
+@pytest.mark.parametrize("cell", mtp_input.CELLS, ids=lambda cell: cell.why)
+def test_mtp_input(cell, certifying):  # noqa: F811
+    certifying(mtp_input)
+    torch.manual_seed(21)
+    rows = cell.spec["rows"]
+    input_ids = torch.randint(0, 41, (rows,), device="cuda", dtype=torch.int32)
+    embedding = _bf16(41, 2048)
+    hidden = _bf16(rows, 2048)
+    embedding_norm, hidden_norm = _bf16(2048) * 0.05, _bf16(2048) * 0.05
+    args = input_ids, embedding, hidden, embedding_norm, hidden_norm
+    combined = mtp_input(*args)
+    expected = mtp_input.reference(*args)
+    assert_within_ulp(combined, expected, element_ulp=1, rms_ulp=0.03)
+    embeds = residual_norm_quantize(embedding[input_ids], embedding_norm, quantize=False)[1]
+    contexts = residual_norm_quantize(hidden, hidden_norm, quantize=False)[1]
+    assert torch.equal(combined[:, :2048], embeds)
+    assert torch.equal(combined[:, 2048:], contexts)
