@@ -9,6 +9,11 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35b_a3b_fp8__sm_100__default.modeling import (  # noqa: E501
+    _ContextGroup,
+    _Decoder,
+    _partition_context,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe.qwen3_6_35b_a3b_fp8__sm_100__default.ops.recurrent import (  # noqa: E501
     SHORT_CONTEXT,
     causal_convolution,
@@ -123,6 +128,56 @@ def test_short_recurrence_is_independent_of_context_packing():
         )
         assert torch.equal(packed[start:end], single)
         start = end
+    assert torch.equal(state, packed_state)
+
+
+def test_mixed_short_and_long_prefill_preserves_slot_state():
+    torch.manual_seed(83)
+    lengths, rows, slots, offsets, row_map, initial = _layout(
+        {"lengths": (9, 103, 13), "slots": (4, 1, 3), "initial": (True, True, False)}
+    )
+    read_slots = torch.where(initial, slots, -1)
+    context = _ContextGroup(None, slots, offsets, row_map, initial, read_slots, lengths)
+    options = {"device": "cuda", "dtype": torch.bfloat16}
+    projection = torch.randn(rows, 12288, **options)
+    hidden = torch.randn(rows, 2048, **options)
+    weights = (
+        torch.randn(64, 2048, **options) * 0.02,
+        torch.randn(8192, 1, 4, **options) * 0.25,
+        torch.randn(32, **options),
+        torch.randn(32, **options),
+        torch.ones(128, **options),
+    )
+    conv = torch.randn(5, 8192, 3, **options)
+    state = torch.randn(5, 32, 128, 128, device="cuda") * 0.04
+    packed_conv, packed_state = conv.clone(), state.clone()
+    packed_output = torch.empty(rows, 4096, **options)
+    for group in _partition_context(context):
+        indices = group.rows
+        assert indices is not None
+        outputs = _Decoder._prefill_gdn(
+            projection[indices], hidden[indices], weights, packed_conv, packed_state, group
+        )
+        packed_output.index_copy_(0, indices, outputs)
+    start = 0
+    for idx, length in enumerate(lengths):
+        end = start + length
+        item = slice(idx, idx + 1)
+        solo_group = _ContextGroup(
+            None,
+            slots[item],
+            offsets[idx : idx + 2] - start,
+            torch.zeros_like(row_map[start:end]),
+            initial[item],
+            read_slots[item],
+            (length,),
+        )
+        solo = _Decoder._prefill_gdn(
+            projection[start:end], hidden[start:end], weights, conv, state, solo_group
+        )
+        assert torch.equal(packed_output[start:end], solo)
+        start = end
+    assert torch.equal(conv, packed_conv)
     assert torch.equal(state, packed_state)
 
 

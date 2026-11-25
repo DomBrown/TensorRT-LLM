@@ -87,7 +87,7 @@ class DecodeGates(OpWrapper):
         Cell("split-K gate projection for batch 1", {"rows": 1}),
         Cell("batched BF16 gate projection", {"rows": 32}),
         Cell("wide partitioned gate projection", {"rows": 128}),
-        Cell("same reduction for packed short contexts", {"rows": 39, "fixed_reduction": True}),
+        Cell("same reduction for packed short contexts", {"rows": 39}),
     )
 
     def __call__(
@@ -96,11 +96,8 @@ class DecodeGates(OpWrapper):
         weight: torch.Tensor,
         a_log: torch.Tensor,
         dt_bias: torch.Tensor,
-        query_rows: int = 1,
-        fixed_reduction: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch = 1 if fixed_reduction else x.shape[0] // query_rows
-        return bf16_decode.gates(x, weight, a_log, dt_bias, True, batch)
+        return bf16_decode.gates(x, weight, a_log, dt_bias, True)
 
     def reference(
         self,
@@ -108,8 +105,6 @@ class DecodeGates(OpWrapper):
         weight: torch.Tensor,
         a_log: torch.Tensor,
         dt_bias: torch.Tensor,
-        query_rows: int = 1,
-        fixed_reduction: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         ab = F.linear(x.float(), weight.float()).to(BF16).float()
         a, b = ab.chunk(2, dim=-1)
@@ -136,11 +131,14 @@ class RoutedExperts(OpWrapper):
         Cell(
             "persistent expert tiles for batch 128", {"rows": 512, "decode": True, "query_rows": 4}
         ),
-        Cell("short prefill", {"rows": 27, "decode": False}),
-        Cell("short-prompt packed prefill with TMA expert tiles", {"rows": 83, "decode": False}),
+        Cell("short prefill", {"rows": 27, "decode": False, "short_context": True}),
+        Cell(
+            "short-prompt packed prefill with TMA expert tiles",
+            {"rows": 83, "decode": False, "short_context": True},
+        ),
         Cell(
             "wide packed prefill and compact expert scatter",
-            {"rows": 512, "decode": False, "fixed_router": True},
+            {"rows": 512, "decode": False},
         ),
     )
     note = "Composes the reference engine's stable top-k, expert schedule, W8A8 GEMMs and SwiGLU."
@@ -153,10 +151,11 @@ class RoutedExperts(OpWrapper):
         gate_up: Fp8Weight,
         down: Fp8Weight,
         decode: bool,
-        fixed_router: bool,
         route_counts: torch.Tensor,
         gemm: PrefillGemm,
         query_rows: int = 1,
+        short_context: bool = False,
+        short_rows: torch.Tensor | None = None,
     ) -> ExpertOutputs:
         rows = x.shape[0]
         batch = rows // query_rows
@@ -166,27 +165,22 @@ class RoutedExperts(OpWrapper):
         tile_rows = (16 if rows >= 256 else fp8_decode.ROUTE_BLOCK) if fast else 64
         schedule = slots = counts = None
         multiprocessors = 0
-        if decode and batch >= 32:
-            multiprocessors = gemm.multiprocessors if query_rows > 1 else 0
-            logits, routes, probabilities, schedule = bf16_decode.router_topk(
+        if decode:
+            counts = route_counts if batch >= 32 else None
+            multiprocessors = gemm.multiprocessors if counts is not None and query_rows > 1 else 0
+            logits, routes, probabilities, schedule = bf16_decode.route_decode(
                 x,
                 router,
-                batch,
-                True,
-                route_counts,
+                counts,
                 tile_rows,
                 width=query_rows,
                 emit_count=multiprocessors > 0,
             )
-        elif decode and batch == 1:
-            logits, routes, probabilities = bf16_decode.single_router(x, router, True, True)
         else:
-            if fixed_router:
-                logits = bf16_decode.prefill_router(x, router, True)
-            elif decode:
-                logits = bf16_decode.router(x, router, batch)
-            else:
-                logits = F.linear(x, router)
+            logits = F.linear(x, router) if short_context else bf16_decode.prefill_router(x, router)
+            if short_rows is not None:
+                short_logits = F.linear(x.index_select(0, short_rows), router)
+                logits.index_copy_(0, short_rows, short_logits)
             if wide_prefill:
                 counts = torch.zeros(256, device=x.device, dtype=torch.int32)
                 routes, probabilities, slots = kernels.route_logits(logits, True, counts)
@@ -245,10 +239,11 @@ class RoutedExperts(OpWrapper):
         gate_up: Fp8Weight,
         down: Fp8Weight,
         decode: bool,
-        fixed_router: bool,
         route_counts: torch.Tensor,
         gemm: PrefillGemm,
         query_rows: int = 1,
+        short_context: bool = False,
+        short_rows: torch.Tensor | None = None,
     ) -> ExpertOutputs:
         logits = F.linear(x.float(), router.float()).to(BF16)
         sorted_logits, sorted_experts = logits[:, :256].float().sort(descending=True, stable=True)

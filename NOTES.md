@@ -351,3 +351,33 @@ length. At OSL 1 it reduced median TTFT from 34.0 to 10.3 ms at ISL 128
 and from 35.0 to 20.8 ms at ISL 1024. The graph-backed CLI later hit a
 CUDA memory error with the two executors loaded together. The CLI uses
 eager prefill, with generation CUDA graphs enabled.
+
+## Recurrence and router stability in packed batches
+
+Packing a 16-token context alongside 31 longer contexts had sent the
+short request through FlashInfer's chunked recurrence. The target now
+groups context rows by recurrence while retaining the runtime's state
+slots and scheduler order. The mixed-prefill regression compares output
+rows, carried convolution history, and FP32 state against isolated
+execution, including initialized and fresh slots.
+
+The decode router and GDN gate projection preserve their split-K
+reduction order across CUDA graph sizes. Short prefills retain the BF16
+projection used in batch 1. A trial that moved every prefill to the same
+Triton router failed one fragile oracle case, so this version retains the
+short-context arithmetic.
+
+The CLI passed 32 of 32 oracle items with KL 0.006457 and 99.587%
+non-tie top-1 agreement. The exact HTTP launcher passed the external
+oracle at concurrency 1, 8, 32, and 128. Comparison to cached batch-1
+logits showed two remaining differences with a margin of exactly
+0.5 nats in the concurrent run.
+
+### Packed recurrence and fixed decode reductions, ISL 1024, OSL 1024
+
+| ISL | OSL | Path | Concurrency | Output tokens/s | Median TTFT (ms) |
+|---:|---:|---|---:|---:|---:|
+| 1024 | 1024 | CLI decode | 1 | 778.1 | 33.9 |
+| 1024 | 1024 | OpenAI serving | 1 | 772.2 | 46.4 |
+| 1024 | 1024 | OpenAI serving | 32 | 7536.1 | 381.7 |
+| 1024 | 1024 | OpenAI serving | 128 | 14722.3 | 1012.2 |

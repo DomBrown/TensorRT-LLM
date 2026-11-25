@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from copy import copy
 from dataclasses import replace
+from itertools import accumulate
 from typing import TYPE_CHECKING, NamedTuple
 from weakref import WeakKeyDictionary, ref
 
@@ -60,15 +61,55 @@ _SPEC_DECODE_HOOKS = RuntimeHooks(
 )
 
 
+class _ContextGroup(NamedTuple):
+    rows: torch.Tensor | None
+    slots: torch.Tensor
+    offsets: torch.Tensor
+    row_map: torch.Tensor
+    initial: torch.Tensor
+    read_slots: torch.Tensor | None
+    lengths: tuple[int, ...]
+
+
 class _LinearStep(NamedTuple):
     context_rows: int
     slots: torch.Tensor
     replay_slots: torch.Tensor | None
-    offsets: torch.Tensor | None
-    row_map: torch.Tensor | None
-    initial: torch.Tensor | None
-    read_slots: torch.Tensor | None
-    lengths: tuple[int, ...]
+    contexts: tuple[_ContextGroup, ...]
+
+
+def _partition_context(group: _ContextGroup) -> tuple[_ContextGroup, ...]:
+    # Use the same recurrence for a sequence whether or not a longer prompt is
+    # in its prefill batch. In a homogeneous batch the runtime views suffice.
+    short = [i for i, length in enumerate(group.lengths) if length <= SHORT_CONTEXT]
+    if not short or len(short) == len(group.lengths):
+        return (group,)
+
+    long = [i for i, length in enumerate(group.lengths) if length > SHORT_CONTEXT]
+    offsets = list(accumulate(group.lengths, initial=0))
+    device = group.slots.device
+    result = []
+    for sequences in (short, long):
+        selected = torch.tensor(sequences, dtype=torch.long, device=device)
+        lengths = tuple(group.lengths[index] for index in sequences)
+        rows = [row for index in sequences for row in range(offsets[index], offsets[index + 1])]
+        row_map = [index for index, length in enumerate(lengths) for _ in range(length)]
+        result.append(
+            _ContextGroup(
+                torch.tensor(rows, dtype=torch.long, device=device),
+                group.slots.index_select(0, selected),
+                torch.tensor(
+                    list(accumulate(lengths, initial=0)), dtype=group.offsets.dtype, device=device
+                ),
+                torch.tensor(row_map, dtype=group.row_map.dtype, device=device),
+                group.initial.index_select(0, selected),
+                group.read_slots.index_select(0, selected)
+                if group.read_slots is not None
+                else None,
+                lengths,
+            )
+        )
+    return tuple(result)
 
 
 def _linear_step(md: TrtllmAttentionMetadata) -> _LinearStep:
@@ -79,21 +120,22 @@ def _linear_step(md: TrtllmAttentionMetadata) -> _LinearStep:
     if md.kv_cache_manager.get_replay_state_update_metadata() is not None:
         replay_slots = metadata.replay_state_indices[num_ctx : md.num_seqs]
     if num_ctx == 0:
-        return _LinearStep(0, slots, replay_slots, None, None, None, None, ())
+        return _LinearStep(0, slots, replay_slots, ())
     lengths = tuple(md.seq_lens[:num_ctx].tolist())
     initial = metadata.has_initial_states[:num_ctx]
+    context_slots = slots[:num_ctx]
     # FlashInfer reads -1 as a zero state. Destination slots always belong to the request.
-    read_slots = torch.where(initial, slots[:num_ctx], -1) if metadata.use_initial_states else None
-    return _LinearStep(
-        md.num_ctx_tokens,
-        slots,
-        replay_slots,
+    read_slots = torch.where(initial, context_slots, -1) if metadata.use_initial_states else None
+    context = _ContextGroup(
+        None,
+        context_slots,
         metadata.query_start_loc[: num_ctx + 1],
         metadata.seq_idx.reshape(-1),
         initial,
         read_slots,
         lengths,
     )
+    return _LinearStep(md.num_ctx_tokens, slots, replay_slots, _partition_context(context))
 
 
 def _small_bf16(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -151,39 +193,34 @@ class _Decoder(DecoderModel):
         weights: tuple[torch.Tensor, ...],
         conv: torch.Tensor,
         state: torch.Tensor,
-        step: _LinearStep,
+        group: _ContextGroup,
     ) -> torch.Tensor:
         ab_weight, conv_weight, a_log, dt_bias, _ = weights
-        rows = step.context_rows
-        ctx_slots = step.slots[: len(step.lengths)]
-        max_length = max(step.lengths)
-        chunked = max_length > SHORT_CONTEXT
+        chunked = max(group.lengths) > SHORT_CONTEXT
         mixed = causal_convolution(
-            projection[:rows],
+            projection,
             conv_weight,
             conv,
-            ctx_slots,
-            step.offsets,
-            step.row_map,
-            step.initial,
+            group.slots,
+            group.offsets,
+            group.row_map,
+            group.initial,
             split=chunked,
         )
         if chunked:
-            alpha, beta = gdn_gates(F.linear(hidden[:rows], ab_weight), a_log, dt_bias)
+            alpha, beta = gdn_gates(F.linear(hidden, ab_weight), a_log, dt_bias)
         else:
-            alpha, beta = decode_gates(
-                hidden[:rows], ab_weight, a_log, dt_bias, fixed_reduction=True
-            )
+            alpha, beta = decode_gates(hidden, ab_weight, a_log, dt_bias)
         return gated_delta_rule(
             mixed,
             alpha,
             beta,
             state,
-            ctx_slots,
-            step.offsets,
-            step.initial,
-            step.read_slots,
-            step.lengths,
+            group.slots,
+            group.offsets,
+            group.initial,
+            group.read_slots,
+            group.lengths,
         )
 
     @staticmethod
@@ -200,7 +237,7 @@ class _Decoder(DecoderModel):
         replay_slots: torch.Tensor | None,
     ) -> torch.Tensor:
         ab_weight, conv_weight, a_log, dt_bias, _ = weights
-        alpha, beta = decode_gates(x, ab_weight, a_log, dt_bias, query_rows)
+        alpha, beta = decode_gates(x, ab_weight, a_log, dt_bias)
         buffers = (
             cache.mamba_layer_cache(index) if query_rows > 1 or replay_slots is not None else None
         )
@@ -254,7 +291,6 @@ class _Decoder(DecoderModel):
             state = cache.get_ssm_states(index)
             norm = layer.attention_params[-1]
             ctx_rows = recurrent.context_rows
-            ctx_count = len(recurrent.lengths)
             if decode:
                 core = self._decode_gdn(
                     x,
@@ -269,14 +305,32 @@ class _Decoder(DecoderModel):
                     recurrent.replay_slots,
                 )
             else:
-                core = self._prefill_gdn(
-                    projection,
-                    x,
-                    layer.attention_params,
-                    conv,
-                    state,
-                    recurrent,
-                )
+                if len(recurrent.contexts) == 1:
+                    core = self._prefill_gdn(
+                        projection[:ctx_rows],
+                        x[:ctx_rows],
+                        layer.attention_params,
+                        conv,
+                        state,
+                        recurrent.contexts[0],
+                    )
+                else:
+                    core = projection.new_empty((ctx_rows, 4096))
+                    for group in recurrent.contexts:
+                        indices = group.rows
+                        assert indices is not None
+                        core.index_copy_(
+                            0,
+                            indices,
+                            self._prefill_gdn(
+                                projection.index_select(0, indices),
+                                x.index_select(0, indices),
+                                layer.attention_params,
+                                conv,
+                                state,
+                                group,
+                            ),
+                        )
                 if ctx_rows < x.shape[0]:
                     decode_core = self._decode_gdn(
                         x[ctx_rows:],
@@ -284,7 +338,7 @@ class _Decoder(DecoderModel):
                         layer.attention_params,
                         conv,
                         state,
-                        recurrent.slots[ctx_count:],
+                        recurrent.slots[md.num_contexts :],
                         query_rows,
                         cache,
                         index,
@@ -331,7 +385,11 @@ class _Decoder(DecoderModel):
         generation_count = attn_metadata.num_seqs - attn_metadata.num_contexts
         query_rows = (rows - recurrent.context_rows) // generation_count if generation_count else 1
         mn_major = uses_cutlass(rows, decode) and (not decode or rows == 128)
-        fixed_router = max(recurrent.lengths, default=0) > SHORT_CONTEXT
+        short_group = (
+            recurrent.contexts[0]
+            if recurrent.contexts and max(recurrent.contexts[0].lengths) <= SHORT_CONTEXT
+            else None
+        )
         residual = self.embed_tokens(input_ids)
         _, hidden, attention_input = residual_norm_quantize(
             residual, self.layers[0].input_norm, mn_major=mn_major
@@ -360,10 +418,11 @@ class _Decoder(DecoderModel):
                 layer.expert_gate_up,
                 layer.expert_down,
                 decode,
-                fixed_router,
                 self.route_counts,
                 self.gemm,
                 query_rows=query_rows if decode else 1,
+                short_context=short_group is not None and short_group.rows is None,
+                short_rows=short_group.rows if short_group is not None else None,
             )
             last = i + 1 == len(self.layers)
             weight = self.final_norm if last else self.layers[i + 1].input_norm
@@ -462,10 +521,10 @@ class _MtpLayer(nn.Module):
             layer.expert_gate_up,
             layer.expert_down,
             expert_decode,
-            not expert_decode and context_rows > SHORT_CONTEXT,
             decoder.route_counts,
             decoder.gemm,
             query_rows=query_rows if decode and pick_rows is None else 1,
+            short_context=context_rows <= SHORT_CONTEXT,
         )
         _, hidden, _ = residual_norm_quantize(
             residual,

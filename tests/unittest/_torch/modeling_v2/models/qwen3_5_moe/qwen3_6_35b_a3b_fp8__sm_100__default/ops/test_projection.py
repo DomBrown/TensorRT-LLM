@@ -61,14 +61,13 @@ def test_decode_gates(cell, certifying):  # noqa: F811
     w = torch.randn(64, 2048, device=_DEVICE, dtype=_BF16) * 0.03
     a = torch.randn(32, device=_DEVICE, dtype=_BF16)
     dt = torch.randn(32, device=_DEVICE, dtype=_BF16)
-    fixed = cell.spec.get("fixed_reduction", False)
     with true_fp32_matmul():
-        decay, beta = decode_gates(x, w, a, dt, fixed_reduction=fixed)
-        want_decay, want_beta = decode_gates.reference(x, w, a, dt, fixed_reduction=fixed)
-    if fixed:
-        one_decay, one_beta = decode_gates(x[14:23], w, a, dt, fixed_reduction=True)
-        assert torch.equal(decay[14:23], one_decay)
-        assert torch.equal(beta[14:23], one_beta)
+        decay, beta = decode_gates(x, w, a, dt)
+        want_decay, want_beta = decode_gates.reference(x, w, a, dt)
+    middle = slice(x.shape[0] // 3, x.shape[0] // 3 + 1)
+    one_decay, one_beta = decode_gates(x[middle], w, a, dt)
+    assert torch.equal(decay[middle], one_decay)
+    assert torch.equal(beta[middle], one_beta)
     torch.testing.assert_close(decay, want_decay, atol=0.0015, rtol=0.01)
     torch.testing.assert_close(beta, want_beta, atol=0.001, rtol=0.006)
 
@@ -98,18 +97,26 @@ def test_routed_experts(cell, certifying):  # noqa: F811
         gate_up,
         down,
         cell.spec["decode"],
-        cell.spec.get("fixed_router", False),
         torch.zeros(257, device=_DEVICE, dtype=torch.int32),
         PrefillGemm(_DEVICE),
     )
     query_rows = cell.spec.get("query_rows", 1)
+    short_context = cell.spec.get("short_context", False)
     with true_fp32_matmul():
-        out, probability, logits, permutation = routed_experts(*args, query_rows=query_rows)
+        out, probability, logits, permutation = routed_experts(
+            *args, query_rows=query_rows, short_context=short_context
+        )
         want, want_probability, want_logits, _ = routed_experts.reference(
-            *args, query_rows=query_rows
+            *args, query_rows=query_rows, short_context=short_context
         )
     if permutation is not None:
         out = out[permutation.long().flatten()]
+    if cell.spec["decode"]:
+        middle = slice(rows // 3, rows // 3 + 1)
+        quantized = tuple(t[middle] for t in q)
+        _, one_prob, one_logits, _ = routed_experts(x[middle], quantized, *args[2:])
+        assert torch.equal(logits[middle], one_logits)
+        assert torch.equal(probability[middle], one_prob)
     torch.testing.assert_close(logits, want_logits)
     # Compare probability against the actual BF16 logits as well as the
     # FP32-dot reference. One BF16 logit step can move softmax by several ulps.
