@@ -339,7 +339,7 @@ def _gate_quant_group(
     c = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
     x = gl.load(OUTPUT + row * 4096 + h[:, None] * 128 + c[None, :]).to(gl.float32)
     if GDN:
-        add = 8192 + h * 128
+        add = STRIDE - 4096 + h * 128
     else:
         add = (h // 2) * 512 + 256 + (h % 2) * 128
     z = gl.load(Z + row * STRIDE + add[:, None] + c[None, :]).to(gl.float32)
@@ -374,7 +374,7 @@ def _gated_norm_quant(
     h = tl.program_id(1)
     c = tl.arange(0, 128)
     x = tl.load(OUTPUT + r * 4096 + h * 128 + c).to(tl.float32)
-    z = tl.load(Z + r * SZ + 8192 + h * 128 + c).to(tl.float32)
+    z = tl.load(Z + r * SZ + SZ - 4096 + h * 128 + c).to(tl.float32)
     w = tl.load(W + c).to(tl.float32)
     y = x * tl.rsqrt(tl.sum(x * x, 0) / 128.0 + 1e-6) * w
     y = (y * (z * tl.sigmoid(z))).to(tl.bfloat16).to(tl.float32)

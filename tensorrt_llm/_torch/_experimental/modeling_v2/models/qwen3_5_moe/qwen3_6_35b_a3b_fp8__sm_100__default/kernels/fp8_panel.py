@@ -23,7 +23,27 @@ from .fp8_decode import _prefetched_group_sum
 
 @gluon.jit
 def _tma_input_projection(
-    AD, S, WD, WS, OUTPUT, M: gl.constexpr, N: gl.constexpr, K: gl.constexpr, GROUPS: gl.constexpr
+    AD,
+    S,
+    WD,
+    WS,
+    OUTPUT,
+    M: gl.constexpr,
+    N: gl.constexpr,
+    K: gl.constexpr,
+    GROUPS: gl.constexpr,
+    CONV_WEIGHT=None,
+    HISTORY=None,
+    SLOTS=None,
+    STAGED=None,
+    MIXED=None,
+    CONV_SLOT: gl.constexpr = 0,
+    CONV_CHANNEL: gl.constexpr = 0,
+    CONV_TIME: gl.constexpr = 0,
+    STAGE_TOKEN: gl.constexpr = 0,
+    STAGE_CHANNEL: gl.constexpr = 0,
+    STAGE_TIME: gl.constexpr = 0,
+    FUSE_CONV: gl.constexpr = False,
 ):
     row_tile = gl.program_id(0)
     weight_tile = gl.program_id(1)
@@ -74,7 +94,39 @@ def _tma_input_projection(
     for stage in gl.static_range(2):
         mbarrier.invalidate(ready.index(stage))
     mbarrier.invalidate(done)
-    gl.store(OUTPUT + row[None, :] * N + col[:, None], acc, live[None, :])
+    if FUSE_CONV and weight_tile * 64 < 8192:
+        # A thread retains the complete sequence of one convolution channel.
+        conv_layout: gl.constexpr = gl.BlockedLayout([1, 8], [32, 1], [4, 1], [0, 1])
+        ct = weight_tile * 64 + gl.arange(0, 64, layout=gl.SliceLayout(1, conv_layout))
+        projected = gl.convert_layout(acc.to(gl.bfloat16).to(gl.float32), conv_layout)
+        slot = gl.load(SLOTS).to(gl.int64)
+        history = HISTORY + slot * CONV_SLOT + ct * CONV_CHANNEL
+        x0 = gl.load(history).to(gl.float32)
+        x1 = gl.load(history + CONV_TIME).to(gl.float32)
+        x2 = gl.load(history + 2 * CONV_TIME).to(gl.float32)
+        w0 = gl.load(CONV_WEIGHT + ct * 4).to(gl.float32)
+        w1 = gl.load(CONV_WEIGHT + ct * 4 + 1).to(gl.float32)
+        w2 = gl.load(CONV_WEIGHT + ct * 4 + 2).to(gl.float32)
+        w3 = gl.load(CONV_WEIGHT + ct * 4 + 3).to(gl.float32)
+        for rank in gl.static_range(M):
+            index = gl.full((64, 1), rank, gl.int32, conv_layout)
+            x3 = gl.sum(gl.gather(projected, index, axis=1), 1)
+            value = gl.fma(x1, w1, x0 * w0)
+            value = gl.fma(x2, w2, value)
+            value = gl.fma(x3, w3, value)
+            gl.store(MIXED + rank * 8192 + ct, value * (1.0 / (1.0 + gl.exp(-value))))
+            window = STAGED + rank * STAGE_TOKEN + ct * STAGE_CHANNEL
+            if STAGE_TIME:
+                gl.store(window, x1)
+                gl.store(window + STAGE_TIME, x2)
+                gl.store(window + 2 * STAGE_TIME, x3)
+            else:
+                gl.store(window, x3)
+            x0, x1, x2 = x1, x2, x3
+    else:
+        stride: gl.constexpr = N - 8192 if FUSE_CONV else N
+        offset: gl.constexpr = 8192 if FUSE_CONV else 0
+        gl.store(OUTPUT + row[None, :] * stride + col[:, None] - offset, acc, live[None, :])
 
 
 @lru_cache(maxsize=128)
@@ -167,3 +219,35 @@ def split_output(a, scale, weight, weight_scale):
         raw, scale, weight_scale, result, rows, columns, num_warps=1
     )
     return result
+
+
+def projection_and_verify(a, scale, weight, weight_scale, conv_weight, history, slots, staged):
+    rows, k = a.shape
+    n = weight.shape[0]
+    output = a.new_empty((rows, n - 8192), dtype=torch.bfloat16)
+    mixed = a.new_empty((rows, 8192), dtype=torch.bfloat16)
+    shape = [8, k]
+    layout = gl.NVMMASharedLayout.get_default_for(shape, gl.float8e4nv)
+    activation = TensorDescriptor.from_tensor(a, shape, layout)
+    stage_strides = staged.stride()[1:] if staged.ndim == 4 else (*staged.stride()[1:], 0)
+    _tma_input_projection[(1, n // 64)](
+        activation,
+        scale,
+        _descriptor(weight, 512),
+        weight_scale,
+        output,
+        rows,
+        n,
+        k,
+        4,
+        conv_weight,
+        history,
+        slots,
+        staged,
+        mixed,
+        *history.stride(),
+        *stage_strides,
+        True,
+        num_warps=4,
+    )
+    return output, mixed

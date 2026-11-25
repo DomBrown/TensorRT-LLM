@@ -18,7 +18,6 @@ from torch.nn import functional as F
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
-from tensorrt_llm._torch.speculative.greedy_argmax import greedy_argmax
 from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
 from tensorrt_llm._torch.speculative.utils import get_spec_worker
 
@@ -33,7 +32,9 @@ from .ops.attention import (
     qkv_projection,
     uses_native_decode,
 )
+from .ops.draft_logits import draft_argmax
 from .ops.epilogue import gated_output_quantize, gdn_gates, mtp_input, residual_norm_quantize
+from .ops.fused_verify_input import fused_verify_input
 from .ops.projection import decode_gates, fp8_projection, routed_experts, uses_cutlass
 from .ops.recurrent import (
     SHORT_CONTEXT,
@@ -310,6 +311,7 @@ class _Decoder(DecoderModel):
         index: int,
         replay_slots: torch.Tensor | None,
         pending_gates: tuple[torch.cuda.Stream, tuple[torch.Tensor, torch.Tensor]] | None = None,
+        mixed: torch.Tensor | None = None,
     ) -> torch.Tensor:
         ab_weight, conv_weight, a_log, dt_bias, _ = weights
         if pending_gates is None:
@@ -317,12 +319,18 @@ class _Decoder(DecoderModel):
         buffers = (
             cache.mamba_layer_cache(index) if query_rows > 1 or replay_slots is not None else None
         )
-        if query_rows > 1:
-            mixed = verify_conv(
-                projection, conv_weight, slots, conv, buffers.intermediate_conv_window, query_rows
-            )
-        else:
-            mixed = causal_convolution(projection, conv_weight, conv, slots, None, None, None)
+        if mixed is None:
+            if query_rows > 1:
+                mixed = verify_conv(
+                    projection,
+                    conv_weight,
+                    slots,
+                    conv,
+                    buffers.intermediate_conv_window,
+                    query_rows,
+                )
+            else:
+                mixed = causal_convolution(projection, conv_weight, conv, slots, None, None, None)
         if pending_gates is not None:
             stream, gates = pending_gates
             current = torch.cuda.current_stream()
@@ -374,12 +382,24 @@ class _Decoder(DecoderModel):
             self.gate_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.gate_stream):
                 pending_gates = (self.gate_stream, decode_gates(x, ab_weight, a_log, dt_bias))
-        projection = fp8_projection(quantized, layer.input_projection, decode, self.gemm)
         cache = md.kv_cache_manager
         if layer.linear_attention:
             assert recurrent is not None
             conv = cache.get_conv_states(index)
             state = cache.get_ssm_states(index)
+            mixed = None
+            if decode and 1 < query_rows == x.shape[0] <= 8:
+                buffers = cache.mamba_layer_cache(index)
+                projection, mixed = fused_verify_input(
+                    quantized,
+                    layer.input_projection,
+                    layer.attention_params[1],
+                    conv,
+                    recurrent.slots,
+                    buffers.intermediate_conv_window,
+                )
+            else:
+                projection = fp8_projection(quantized, layer.input_projection, decode, self.gemm)
             norm = layer.attention_params[-1]
             ctx_rows = recurrent.context_rows
             if decode:
@@ -395,6 +415,7 @@ class _Decoder(DecoderModel):
                     index,
                     recurrent.replay_slots,
                     pending_gates,
+                    mixed,
                 )
             else:
                 if len(recurrent.contexts) == 1:
@@ -439,6 +460,7 @@ class _Decoder(DecoderModel):
                     core = torch.cat((core, decode_core))
             gated = gated_output_quantize(core, projection, norm, mn_major=mn_major)
         else:
+            projection = fp8_projection(quantized, layer.input_projection, decode, self.gemm)
             qkv = qkv_projection(
                 projection, *layer.attention_params, self.cosine, self.sine, position
             )
@@ -690,7 +712,6 @@ class _DraftHead:
         self.ids[common:columns].copy_(
             torch.arange(special, vocab_size, device=target_weight.device, dtype=torch.int32)
         )
-        self.arange = torch.arange(aligned, device=target_weight.device, dtype=torch.int32)
         self.limit = torch.full((1,), columns, device=target_weight.device, dtype=torch.int32)
 
     def prepare(self, prompt_ids: torch.Tensor) -> None:
@@ -705,13 +726,7 @@ class _DraftHead:
         return rows <= 32
 
     def sample(self, hidden: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
-        logits = _small_bf16(hidden, self.weight)
-        logits.masked_fill_(self.arange >= self.limit, -float("inf"))
-        tokens = self.ids[greedy_argmax(logits, small_rows=True).long()]
-        if out is not None:
-            out.copy_(tokens)
-            return out
-        return tokens
+        return draft_argmax(_small_bf16(hidden, self.weight), self.ids, self.limit, out)
 
 
 class _MtpDraft(nn.Module):

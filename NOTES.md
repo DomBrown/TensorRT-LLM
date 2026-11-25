@@ -614,3 +614,48 @@ The HTTP oracle passed at every tested concurrency. The four-wave
 ISL 1024, OSL 1024 run measured 757.0 tokens/s at C1, 7598.3 at C32,
 and 15086.8 at C128. C1 and C128 rose by 2.3% and 1.3% from the previous
 four-wave run. C32 was 1.3% lower in this run.
+
+## Fused recurrent input and draft token selection
+
+The single-request verifier fuses the reference engine's FP8 input
+panel projection with the causal convolution over the draft chain.
+It rounds the projection to BF16 before convolution, writes the
+separate output gate, and stages either the full convolution windows
+or the raw inputs for replay. The isolated four- and five-token cases
+preserved the gate, convolved rows, and staged values bitwise. The
+five-token staged path fell from 12.70 to 9.28 µs.
+
+The draft head uses a tiled vocabulary reduction adapted from
+`/ref-engine/vocab.py`. It masks logits beyond the device-resident
+shortlist length while reducing. It resolves ties by shortlist order
+and reads the token map only for each winner. The full target head
+still verifies proposals. A mapped reduction probe reduced singleton
+selection from 14.93 to 3.48 µs.
+
+The existing expert tiles led the isolated sweep. The fastest exact
+FP32 state layout alternative saved 2.2% on the deployed wide decode
+shapes.
+Splitting the shared expert, fusing SwiGLU quantization into the
+persistent expert up projection, and factoring the recurrent replay
+decays into a common multiplier all increased isolated kernel time.
+FP16 recurrent storage changed a development generation at a 0.625-nat
+reference margin and did not improve wide throughput. The serving
+configuration retains FP32 state.
+
+### Fused batch-1 CLI, ISL 128/1024/4096, OSL 1024
+
+| ISL | OSL | Median TTFT (ms) | Decode tokens/s |
+|---:|---:|---:|---:|
+| 128 | 1024 | 11.49 | 816.8 |
+| 1024 | 1024 | 22.00 | 860.7 |
+| 4096 | 1024 | 54.55 | 837.0 |
+
+The actual CLI passed all 32 development items and the protocol
+checks. All 86 focused operation and routing tests passed. The
+timed decode rates exceeded the independent standalone run at all
+three tested input lengths.
+
+The actual server passed the external oracle at C1, C8, C32, C64, and
+C128. Its ISL 1024, OSL 1024 four-wave throughput was 780.8 tokens/s at
+C1, 7768.3 at C32, and 15119.1 at C128. Relative to the preceding run,
+throughput rose 3.2% at C1 and 2.2% at C32. C128 moved by 0.2%.

@@ -121,6 +121,10 @@ class GatedOutputQuantize(OpWrapper):
     ARCHS = frozenset({Arch.SM_100})
     CELLS = (
         Cell("GDN decode", {"rows": 1, "recurrent": True}),
+        Cell(
+            "GDN verification with a separate output gate",
+            {"rows": 5, "recurrent": True, "gate_only": True},
+        ),
         Cell("GDN grouped prefill", {"rows": 128, "recurrent": True, "mn_major": True}),
         Cell("GQA decode", {"rows": 32, "recurrent": False}),
         Cell("GQA grouped prefill", {"rows": 132, "recurrent": False, "mn_major": True}),
@@ -148,7 +152,7 @@ class GatedOutputQuantize(OpWrapper):
         if weight is not None:
             x = core.float().reshape(rows, 32, 128)
             x = x * (x.square().mean(-1, keepdim=True) + 1e-6).rsqrt() * weight.float()
-            z = projection[:, 8192:].float().reshape(rows, 32, 128)
+            z = projection[:, -4096:].float().reshape(rows, 32, 128)
             output = x * F.silu(z)
         else:
             z = projection[:, :8192].float().reshape(rows, 16, 512)[..., 256:]

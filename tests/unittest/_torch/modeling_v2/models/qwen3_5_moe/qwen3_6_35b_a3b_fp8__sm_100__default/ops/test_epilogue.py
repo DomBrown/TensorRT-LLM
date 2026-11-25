@@ -87,9 +87,12 @@ def test_gated_output_quantize(cell, certifying):  # noqa: F811
     certifying(gated_output_quantize)
     torch.manual_seed(31)
     n, recurrent = cell.spec["rows"], cell.spec["recurrent"]
+    projection_width = 12288 if recurrent else 9216
+    if cell.spec.get("gate_only"):
+        projection_width = 4096
     args = (
         _bf16(n, 4096),
-        _bf16(n, 12288 if recurrent else 9216),
+        _bf16(n, projection_width),
         _bf16(128) if recurrent else None,
         cell.spec.get("mn_major", False),
     )
