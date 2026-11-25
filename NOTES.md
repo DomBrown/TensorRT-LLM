@@ -58,16 +58,30 @@ V2 cache manager. The current serving configuration enables chunked prefill
 and CUDA graph decode. Weights remain E4M3 with BF16 128×128 scales, and
 activations use per-token, per-128-channel dynamic FP8 scales.
 
-The reference engine at `6780d5e` supplied the layer ordering, projection
-packing, dynamic quantization, fused residual normalization, expert routing
-and expert kernels. The target's `weights.py` adapts `read_weights` from
-`engine.py` to the TensorRT-LLM weight loader. The Triton/Gluon code under
-`kernels/` preserves the reference's arithmetic while indexing cache slots
-by scheduler request. The runtime-compiled `fp8_cutlass.cu` and
-`prefill_gemm.py` come from the same reference files. A full source build
-would place this CUDA source under the target's `csrc/`. The catalog's
-paged attention is bound using the Qwen4 target's metadata pattern. No
-shared scheduler or cache implementation changes are needed.
+The port started at `/ref-engine` commit `6780d5e`. The target's `weights.py`
+adapts `read_weights` from `engine.py` to the TensorRT-LLM weight loader.
+The main kernel ports are grouped below by the reference source files.
+
+- `kernels.py` and `norms.py` supplied dynamic quantization, fused residual
+  normalization, rotary embeddings, convolution, and expert routing.
+- `bf16_decode.py`, `fp8_panel.py`, `fp8_expert_panel.py`, and `fp8_decode.py`
+  supplied the small BF16 and FP8 projection kernels and the expert schedule.
+  `prefill_gemm.py` and `fp8_cutlass.cu` supplied the large-row dense and
+  grouped FP8 projections. A full source build would move the runtime-compiled
+  `fp8_cutlass.cu` into the target's `csrc/`.
+- `gdn_decode.py`, `prefill_gdn.py`, and `speculation.py` supplied the FP32
+  recurrence, short prefill tiling, and speculative convolution and recurrent
+  state updates. The target addresses state through the runtime's request slots.
+- `verify_attention.py` supplied split-KV grouped attention tiles. The paged
+  variant uses runtime page indices and KV writes. The native catalog binding
+  follows the existing Qwen4 target's metadata pattern.
+- `speculation.py` and `vocab.py` supplied the draft vocabulary shortlist
+  and tiled argmax. The target uses the runtime's split MTP worker and maps
+  proposals back to the full vocabulary before verification.
+
+The shared executor has an optional hook for the target cache class and an
+optional hook for its exact-length prefill graph admission. The target owns
+its cache policy, graph capture, and kernel dispatch.
 ## Initial V2 validation and performance
 
 The first catalog-only attention version passed the KL and top-1 checks, with
@@ -122,7 +136,8 @@ installed CuTe DSL. The copied launcher ran with FlashAttention 4.0.0b41 and
 QuACK 0.6.5 in a subprocess-specific import path, with the engine sources
 unchanged. The dev oracle passed all 32 items with mean top-20 KL 0.006443
 and 99.679% non-tie top-1 agreement. Both static batch sizes also passed
-the oracle's greedy checks.
+the oracle's greedy checks. The branch's published evaluation reported
+non-tie greedy divergences on its held-out oracle at all three batch sizes.
 
 ### Standalone batches, ISL 128/1024/4096, OSL 1024
 
@@ -659,3 +674,121 @@ The actual server passed the external oracle at C1, C8, C32, C64, and
 C128. Its ISL 1024, OSL 1024 four-wave throughput was 780.8 tokens/s at
 C1, 7768.3 at C32, and 15119.1 at C128. Relative to the preceding run,
 throughput rose 3.2% at C1 and 2.2% at C32. C128 moved by 0.2%.
+
+## Wide serving dispatch and streaming trials
+
+Changing the attention split, prefill packing, and cache traffic gave
+the following four-wave results. C32 used 128 requests and C128 used 512.
+Whole-prompt admission reduced the work split across prefill steps but
+made replacements more expensive at C128. Skipping retired graph slots
+and making context row packing device-side gave similar or lower rates
+than the checked-in paths. The FP16 state trial had a development
+oracle failure and was excluded from dispatch selection.
+
+### Four-wave serving dispatch, ISL 1024, OSL 1024
+
+| Trial | C32 tokens/s | C128 tokens/s |
+|---|---:|---:|
+| Checked-in FP32 replay and hybrid attention | 7768.3 | 15119.1 |
+| Target-owned paged attention at every width | 7687.7 | 14443.1 |
+| Target-owned paged attention for MTP only | 7713.1 | 14686.9 |
+| Target-owned paged decode in mixed steps | 7730.4 | 14922.1 |
+| Fixed BF16 GDN gates on long context | 7676.2 | 15035.8 |
+| Skip retired graph slots | 7708.6 | 15001.4 |
+| Whole-prompt prefill | 7720.8 | 13671.1 |
+| Device-side mixed context packing | 7641.9 | 14775.3 |
+| Stream every four tokens, early first response | 7189.3 | 14994.3 |
+
+The four-token stream cadence lowered median C1 TTFT from 47.59 to
+43.99 ms, with C1 throughput changing from 780.8 to 782.5 tokens/s.
+The checked-in cadence led at C32. Producing projection scales directly
+in MN-major layout for all CUTLASS decode shapes passed the HTTP oracle
+and measured 7649.4 and 14923.0 tokens/s in the two-wave C32 and C128
+runs. It had little effect on wide throughput.
+
+## Matched end-to-end runs
+
+The repeated CLI run sends the contract's OSL 1, 32, and 1024 requests
+to the checked-in launcher. The two-prompt medians below use the same
+natural-language chat inputs as the independent standalone test. Across
+three prompts per length, V2 medians were 823.2, 793.4, and 841.7 tokens/s
+at ISL 128, 1024, and 4096. All nine timed first tokens and 32-token
+prefixes matched the corresponding 1,024-token continuations.
+
+### Paired batch-1 CLI repeat, ISL 128/1024/4096, OSL 1024
+
+| ISL | OSL | Standalone TTFT (ms) | V2 TTFT (ms) | Standalone tokens/s | V2 tokens/s |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 1024 | 8.29 | 11.66 | 765.9 | 818.8 |
+| 1024 | 1024 | 18.10 | 22.59 | 858.0 | 861.3 |
+| 4096 | 1024 | 46.65 | 56.04 | 792.1 | 836.6 |
+
+The serving sweep uses `bench_serving.py` with its default request
+counts and warmup, and an explicit passage because its default source
+files were absent on this machine. The following commands regenerate
+the corpus from the repository root and run the client.
+
+```bash
+cat README.md docs/source/developer-guide/*.md >/tmp/qwen-passage.txt
+python3 /task/bench_serving.py --url http://127.0.0.1:8000 \
+    --model qwen3.6-35b-a3b-fp8 --passage /tmp/qwen-passage.txt --isl 1024 4096
+```
+
+The baseline uses `aegis_engine.serve` with the same server settings
+and `modeling_v2: "off"`. Both runs use one frontend, three MTP drafts,
+chunked prefill, BF16 KV, FP32 GDN state, and the same admission policy.
+The client recorded matching request counts and input SHA-256 hashes
+at every point. Each row uses at least 16 requests, with four requests
+per concurrent client at C8 and above.
+
+### Matched closed-loop serving, ISL 1024/4096, OSL 1024
+
+| ISL | OSL | Concurrency | V1 tokens/s | V2 tokens/s | Speedup | V1 median TTFT (ms) | V2 median TTFT (ms) |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 1024 | 1 | 556.6 | 778.2 | 1.40× | 93.02 | 51.45 |
+| 1024 | 1024 | 2 | 891.1 | 1190.1 | 1.34× | 195.13 | 117.41 |
+| 1024 | 1024 | 4 | 1559.2 | 1817.6 | 1.17× | 201.04 | 140.85 |
+| 1024 | 1024 | 8 | 2495.9 | 2592.2 | 1.04× | 209.47 | 131.79 |
+| 1024 | 1024 | 16 | 4065.4 | 4413.8 | 1.09× | 228.96 | 182.67 |
+| 1024 | 1024 | 32 | 5922.8 | 7753.4 | 1.31× | 206.97 | 128.45 |
+| 1024 | 1024 | 64 | 8700.6 | 10939.7 | 1.26× | 216.38 | 157.16 |
+| 1024 | 1024 | 128 | 11490.7 | 14734.6 | 1.28× | 275.32 | 186.00 |
+| 4096 | 1024 | 1 | 537.5 | 743.8 | 1.38× | 88.42 | 68.90 |
+| 4096 | 1024 | 8 | 2401.8 | 2739.9 | 1.14× | 118.21 | 105.15 |
+| 4096 | 1024 | 32 | 4732.5 | 5908.7 | 1.25× | 209.73 | 133.71 |
+
+The V2 server matched the CLI's greedy sequences on all development
+requests at C1, C8, C32, C64, and C128. The matched V1 server had one
+distinct first difference at a fragile position of the development
+oracle, repeated at each concurrency. Its fragile exception remains
+unclassified because this run recorded tokens only. The earlier V1
+CLI baseline without MTP passed the complete oracle.
+
+The repeated batch-1 CLI decode exceeded the independent standalone
+rate on the paired inputs at every tested length. The standalone run
+had lower TTFT at every length. At ISL 1024 and OSL 1024 the V2
+closed-loop server remained below the standalone's measured static
+batch rates of 8652.4 and 17427.5 tokens/s at batches 32 and 128.
+
+### Direct CLI-to-server stress test, ISL 128/1024/4096, OSL 1024
+
+A separate stress test starts with eight natural-language chat prompts
+at each input length. It captures greedy token IDs from `engine.sh`
+and from `/v1/completions` through `serve.sh`, with EOS ignored. Each
+concurrency runs at least 24 requests, repeating the same prompts when
+needed to fill the batch. At the first different token, the CLI's
+teacher-forced score evaluates the shared prefix. A strict near-tie has
+a margin below 0.5 nats.
+
+| Concurrency | Requests | Exact sequences | First difference below 0.5 nats | First difference at or above 0.5 nats |
+|---:|---:|---:|---:|---:|
+| 1 | 24 | 24 | 0 | 0 |
+| 8 | 24 | 0 | 22 | 2 |
+| 32 | 32 | 0 | 30 | 2 |
+| 64 | 64 | 0 | 57 | 7 |
+| 128 | 128 | 0 | 114 | 14 |
+
+The largest teacher-forced margin at a first difference was 0.75 nats.
+The same serving run passed the external development oracle at all five
+concurrencies. The longer test exposes remaining differences between the
+wide server and the batch-1 CLI.
