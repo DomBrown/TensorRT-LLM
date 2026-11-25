@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Literal, TextIO
 
+_MAX_SEQUENCE_LENGTH = 8192
+
 
 def _token_ids(value: object, vocab_size: int, *, allow_empty: bool = False) -> list[int]:
     if not isinstance(value, list) or (not allow_empty and not value):
@@ -44,7 +46,7 @@ def run(
             modeling_v2=modeling_v2,
             skip_tokenizer_init=True,
             disable_mm_encoder=True,
-            max_seq_len=8192,
+            max_seq_len=_MAX_SEQUENCE_LENGTH,
             max_batch_size=1,
             max_num_tokens=8192,
             cuda_graph_config={"batch_sizes": [1]},
@@ -68,6 +70,8 @@ def run(
     def generate(prompt: list[int], length: int, ignore_eos: bool) -> list[int]:
         if length == 0:
             return []
+        if len(prompt) + length > _MAX_SEQUENCE_LENGTH:
+            raise ValueError(f"prompt and generation exceed {_MAX_SEQUENCE_LENGTH} tokens")
         params = SamplingParams(
             max_tokens=length,
             end_id=-1 if ignore_eos else eos_ids[0],
@@ -79,10 +83,15 @@ def run(
         )
         runner = scorer if length == 1 else generator
         output = runner.generate_async(prompt, params, streaming=False).result()
-        return output.outputs[0].token_ids
+        tokens = output.outputs[0].token_ids
+        if len(tokens) < length and (ignore_eos or not tokens or tokens[-1] not in eos_ids):
+            raise RuntimeError("generation ended before the requested length or an EOS token")
+        return tokens
 
     def score(request: dict, ids: list[int]) -> dict:
         position_count = len(ids) - 1
+        if len(ids) > _MAX_SEQUENCE_LENGTH:
+            raise ValueError(f"scoring sequence exceeds {_MAX_SEQUENCE_LENGTH} tokens")
         top_k = request.get("top_k", 0)
         if type(top_k) is not int or not 0 <= top_k <= vocab_size:
             raise ValueError("top_k must be an integer from 0 to the vocabulary size")

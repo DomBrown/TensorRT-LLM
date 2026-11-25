@@ -324,3 +324,30 @@ Each 32-token request matched the first 32 tokens of the longer request.
 | 1024 | 1024 | 1 | 772.6 | 48.0 | 1.25 |
 | 1024 | 1024 | 32 | 7465.0 | 319.2 | 3.76 |
 | 1024 | 1024 | 128 | 13956.7 | 1122.0 | 7.68 |
+
+## Scheduler token budget and streaming
+
+Raising the scheduler budget from 8,192 to 32,768 tokens let each
+prefill step process more prompts at large concurrency. With the same
+draft length and graph shapes, the increase improved C128 throughput
+at ISL 1024 by 5.9% and lowered its median TTFT. At the original token
+budget, a stream interval of four had negligible throughput effect
+(7,459 tokens/s at C32 and 13,937 at C128, ISL 1024 and OSL 1024).
+The serving configuration keeps the default stream interval.
+
+### Larger token budget, ISL 1024/4096, OSL 1024
+
+| ISL | OSL | Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+|---:|---:|---:|---:|---:|---:|
+| 1024 | 1024 | 1 | 775.7 | 43.0 | 1.25 |
+| 1024 | 1024 | 32 | 7479.1 | 372.5 | 3.63 |
+| 1024 | 1024 | 128 | 14785.3 | 975.7 | 7.25 |
+| 4096 | 1024 | 1 | 699.9 | 67.0 | 1.36 |
+| 4096 | 1024 | 8 | 2655.0 | 349.3 | 2.55 |
+| 4096 | 1024 | 32 | 5907.1 | 911.6 | 4.31 |
+
+An isolated breakable prefill graph captured each full single-request
+length. At OSL 1 it reduced median TTFT from 34.0 to 10.3 ms at ISL 128
+and from 35.0 to 20.8 ms at ISL 1024. The graph-backed CLI later hit a
+CUDA memory error with the two executors loaded together. The CLI uses
+eager prefill, with generation CUDA graphs enabled.
