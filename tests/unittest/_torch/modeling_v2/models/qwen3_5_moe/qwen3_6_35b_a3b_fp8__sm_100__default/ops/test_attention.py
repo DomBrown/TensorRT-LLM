@@ -66,7 +66,15 @@ def test_paged_decode_attention(cell, certifying):  # noqa: F811
     if cell.spec.get("quantize", False):
         projection = torch.randn(rows, 9216, device="cuda", dtype=torch.bfloat16)
     mn_major = cell.spec.get("mn_major", False)
-    actual = paged_decode_attention(*args, projection=projection, mn_major=mn_major)
+    native = None
+    if cell.spec.get("native", False):
+        # Emulate the cache write from the native kernel before replacing attended rows.
+        paged_decode_attention(*args)
+        expected_storage.copy_(storage)
+        native = torch.randn(rows, 4096, device="cuda", dtype=torch.bfloat16)
+    actual = paged_decode_attention(
+        *args, projection=projection, mn_major=mn_major, native_output=native
+    )
     with true_fp32_matmul():
         expected = paged_decode_attention.reference(
             qkv,
@@ -77,6 +85,7 @@ def test_paged_decode_attention(cell, certifying):  # noqa: F811
             query_rows,
             projection=projection,
             mn_major=mn_major,
+            native_output=native,
         )
     assert torch.equal(storage, expected_storage)
     if projection is None:
@@ -87,7 +96,21 @@ def test_paged_decode_attention(cell, certifying):  # noqa: F811
         out = quant.float().view(rows, 32, 128) * scales[..., None]
         ref = ref_quant.float().view(rows, 32, 128) * ref_scales[..., None]
         assert_within_ulp(out, ref, element_ulp=2, rms_ulp=0.3, ulp=1 / 14 + 1e-7)
-        old_core = paged_decode_attention(*args)
+        if native is None:
+            old_core = paged_decode_attention(*args)
+        else:
+            old_core = native.clone()
+            for request, end in enumerate(positions[query_rows - 1 :: query_rows].tolist()):
+                if end < 256:
+                    chain = slice(request * query_rows, (request + 1) * query_rows)
+                    old_core[chain] = paged_decode_attention(
+                        qkv[chain],
+                        storage[:, -1],
+                        positions[chain],
+                        key_pages[request : request + 1],
+                        width * page_size,
+                        query_rows,
+                    )
         old_quant, old_scales = gated_output_quantize(old_core, projection, None, mn_major=mn_major)
         assert scales.stride() == old_scales.stride()
         assert torch.equal(quant.view(torch.uint8), old_quant.view(torch.uint8))

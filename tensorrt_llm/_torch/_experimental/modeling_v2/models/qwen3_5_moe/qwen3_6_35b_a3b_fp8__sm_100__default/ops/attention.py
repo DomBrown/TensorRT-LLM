@@ -15,7 +15,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
 )
 
 from ..kernels.kernels import prepare_qkv
-from ..kernels.paged_decode import paged_decode
+from ..kernels.paged_decode import _SHORT_HISTORY, paged_decode
 from .epilogue import gated_output_quantize
 
 if TYPE_CHECKING:
@@ -225,7 +225,7 @@ qkv_projection = PrepareQkv()
 
 
 class PagedDecodeAttention(OpWrapper):
-    """Append BF16 KV and compute causal GQA for a linear chain per request."""
+    """Compute causal GQA over each chain, optionally sharing native KV writes."""
 
     ARCHS = frozenset({Arch.SM_100})
     CELLS = (
@@ -247,6 +247,15 @@ class PagedDecodeAttention(OpWrapper):
             "merge and quantize into column-major scales",
             {"positions": (143, 31, 161), "layers": 3, "quantize": True, "mn_major": True},
         ),
+        Cell(
+            "use the native output for long chains and shared pages for short chains",
+            {
+                "positions": (125, 126, 127, 128, 253, 254, 255, 256),
+                "query_rows": 4,
+                "quantize": True,
+                "native": True,
+            },
+        ),
     )
 
     def __call__(
@@ -260,7 +269,10 @@ class PagedDecodeAttention(OpWrapper):
         *,
         projection: torch.Tensor | None = None,
         mn_major: bool = False,
+        native_output: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if native_output is not None and projection is None:
+            raise ValueError("reusing native output requires the gated FP8 epilogue")
         return paged_decode(
             qkv,
             pool,
@@ -270,6 +282,7 @@ class PagedDecodeAttention(OpWrapper):
             query_rows,
             projection=projection,
             mn_major=mn_major,
+            native_output=native_output,
         )
 
     def reference(
@@ -283,17 +296,24 @@ class PagedDecodeAttention(OpWrapper):
         *,
         projection: torch.Tensor | None = None,
         mn_major: bool = False,
+        native_output: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         page_size = pool.shape[-2]
         row_stride = pool.stride(0) // pool.stride(1)
         q, k, v = qkv.split((4096, 512, 512), dim=-1)
         output = torch.empty_like(q)
-        for i, position in enumerate(positions.tolist()):
+        host_positions = positions.tolist()
+        for i, position in enumerate(host_positions):
+            chain_end = (i // query_rows + 1) * query_rows - 1
+            if native_output is not None and host_positions[chain_end] >= _SHORT_HISTORY:
+                output[i].copy_(native_output[i])
+                continue
             logical_page, offset = divmod(position, page_size)
             ids = key_pages[i // query_rows, : logical_page + 1].long() // row_stride
             page = int(ids[-1])
-            pool[page, 0, :, offset].copy_(k[i].view(2, 256))
-            pool[page, 1, :, offset].copy_(v[i].view(2, 256))
+            if native_output is None:
+                pool[page, 0, :, offset].copy_(k[i].view(2, 256))
+                pool[page, 1, :, offset].copy_(v[i].view(2, 256))
             key, value = pool[ids].permute(1, 2, 0, 3, 4).flatten(2, 3)
             key = key[:, : position + 1].float()
             value = value[:, : position + 1].float()

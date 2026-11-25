@@ -467,3 +467,42 @@ at exactly 0.5 nats at C128.
 | 1024 | 1024 | 1 | 794.2 | 49.86 | 1.21 |
 | 1024 | 1024 | 32 | 7645.7 | 381.71 | 3.60 |
 | 1024 | 1024 | 128 | 15023.1 | 1008.64 | 7.11 |
+
+## Short-history parity at wide batch sizes
+
+The native attention kernel appends K/V for wide decode batches and
+attends long histories. For chains that fit in two 128-token splits,
+the target reads those same pages and uses the narrow decode reduction.
+The fused epilogue selects the result by device position, applies the
+attention gate, and emits block-FP8 activations and scales. The graph
+can replay with both short and long chains in the same batch. The
+operation test checks each branch and checks that the second pass keeps
+the cache writes intact.
+
+The development oracle passed at C1, C8, C32, C64, and C128 in the fused
+probe. Against cached CLI logits, C128 had 96 exact continuations and 32
+accepted first near-ties. The earlier discrepant C128 continuation had
+a 0.625-nat margin in the CLI's teacher-forced score. The first differing
+token now matches. The shared routing and runtime CPU suite passed 564
+tests with 76 skipped.
+
+The first comprehensive serving sweep completed through C64. The load
+client disconnected during the C128 warm-up between benchmark levels,
+and the server shut down normally as the harness exited. The launcher
+now gives pooled HTTP connections a 30-second idle timeout.
+
+The actual CLI passed the full development oracle at KL 0.006457 and
+99.587% non-tie top-1. The actual server passed the external oracle and
+the direct cached CLI comparison at every tested concurrency for the
+development set. In a separate mixed-length run with 128-, 1,024- and
+4,096-token chat prompts and OSL 256, C1, C8 and C32 met the direct tie
+rule. Two of 128 responses at C128 first differed at exactly 0.5 nats.
+The focused operation suite passed 76 tests.
+
+### Fused short-history serving, ISL 1024, OSL 1024
+
+| ISL | OSL | Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+|---:|---:|---:|---:|---:|---:|
+| 1024 | 1024 | 1 | 795.3 | 48.59 | 1.21 |
+| 1024 | 1024 | 32 | 7640.4 | 383.05 | 3.60 |
+| 1024 | 1024 | 128 | 14822.6 | 1037.74 | 7.16 |

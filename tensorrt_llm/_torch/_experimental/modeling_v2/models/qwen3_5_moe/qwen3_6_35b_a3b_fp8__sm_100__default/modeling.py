@@ -369,28 +369,34 @@ class _Decoder(DecoderModel):
             qkv = qkv_projection(
                 projection, *layer.attention_params, self.cosine, self.sine, position
             )
-            if uses_native_decode(md):
+            native = uses_native_decode(md)
+            if decode:
+                native_output = (
+                    gqa(qkv, cache.layer_offsets[index], attention, query_rows) if native else None
+                )
+                pool, pool_id = self._attention_pool(cache, index)
+                pages = md.kv_cache_block_offsets[pool_id, : md.num_seqs, 0]
+                gated = paged_decode_attention(
+                    qkv,
+                    pool,
+                    position,
+                    pages,
+                    md.max_seq_len,
+                    query_rows,
+                    projection=projection,
+                    mn_major=mn_major,
+                    native_output=native_output,
+                )
+                return fp8_projection(gated, layer.output_projection, decode, self.gemm)
+            if native:
                 core = gqa(qkv, cache.layer_offsets[index], attention, query_rows)
             else:
                 ctx_count = md.num_contexts
-                ctx_rows = md.num_ctx_tokens if ctx_count else 0
-                if ctx_rows:
-                    core = gqa(qkv[:ctx_rows], cache.layer_offsets[index], attention)
+                ctx_rows = md.num_ctx_tokens
+                core = gqa(qkv[:ctx_rows], cache.layer_offsets[index], attention)
                 if ctx_rows < qkv.shape[0]:
                     pool, pool_id = self._attention_pool(cache, index)
                     pages = md.kv_cache_block_offsets[pool_id, ctx_count : md.num_seqs, 0]
-                    if not ctx_rows:
-                        gated = paged_decode_attention(
-                            qkv,
-                            pool,
-                            position,
-                            pages,
-                            md.max_seq_len,
-                            query_rows,
-                            projection=projection,
-                            mn_major=mn_major,
-                        )
-                        return fp8_projection(gated, layer.output_projection, decode, self.gemm)
                     gen_core = paged_decode_attention(
                         qkv[ctx_rows:], pool, position[ctx_rows:], pages, md.max_seq_len, query_rows
                     )
