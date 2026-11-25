@@ -68,17 +68,10 @@ def test_paged_decode_attention(cell, certifying):  # noqa: F811
     mn_major = cell.spec.get("mn_major", False)
     raw_picks = cell.spec.get("pick_rows")
     pick_rows = None if raw_picks is None else torch.tensor(raw_picks, device="cuda")
-    native = None
-    if cell.spec.get("native", False):
-        # Emulate the cache write from the native kernel before replacing attended rows.
-        paged_decode_attention(*args)
-        expected_storage.copy_(storage)
-        native = torch.randn(rows, 4096, device="cuda", dtype=torch.bfloat16)
     actual = paged_decode_attention(
         *args,
         projection=projection,
         mn_major=mn_major,
-        native_output=native,
         pick_rows=pick_rows,
     )
     with true_fp32_matmul():
@@ -91,7 +84,6 @@ def test_paged_decode_attention(cell, certifying):  # noqa: F811
             query_rows,
             projection=projection,
             mn_major=mn_major,
-            native_output=native,
             pick_rows=pick_rows,
         )
     assert torch.equal(storage, expected_storage)
@@ -103,14 +95,13 @@ def test_paged_decode_attention(cell, certifying):  # noqa: F811
         out = quant.float().reshape(-1, 32, 128) * scales[..., None]
         ref = ref_quant.float().reshape(-1, 32, 128) * ref_scales[..., None]
         assert_within_ulp(out, ref, element_ulp=2, rms_ulp=0.3, ulp=1 / 14 + 1e-7)
-        if native is None:
-            old_core = paged_decode_attention(*args)
-        else:
-            old_core = native.clone()
-            for request, end in enumerate(positions[query_rows - 1 :: query_rows].tolist()):
-                if end < 256:
-                    chain = slice(request * query_rows, (request + 1) * query_rows)
-                    old_core[chain] = paged_decode_attention(
+        old_core = paged_decode_attention(*args)
+        if cell.spec.get("check_independent_chains", False):
+            separate = []
+            for request in range(batch):
+                chain = slice(request * query_rows, (request + 1) * query_rows)
+                separate.append(
+                    paged_decode_attention(
                         qkv[chain],
                         storage[:, -1],
                         positions[chain],
@@ -118,6 +109,8 @@ def test_paged_decode_attention(cell, certifying):  # noqa: F811
                         width * page_size,
                         query_rows,
                     )
+                )
+            assert torch.equal(old_core, torch.cat(separate))
         if pick_rows is not None:
             old_core = old_core.index_select(0, pick_rows)
             projection = projection.index_select(0, pick_rows)

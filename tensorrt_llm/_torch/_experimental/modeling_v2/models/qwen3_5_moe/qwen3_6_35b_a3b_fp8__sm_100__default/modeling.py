@@ -24,14 +24,7 @@ from tensorrt_llm._torch.speculative.utils import get_spec_worker
 from .... import disable_v2_by_default
 from .cache_manager import Qwen36HybridCacheManager
 from .kernels.prefill_gemm import PrefillGemm
-from .ops.attention import (
-    attention_step,
-    context_attention_step,
-    gqa,
-    paged_decode_attention,
-    qkv_projection,
-    uses_native_decode,
-)
+from .ops.attention import context_attention_step, gqa, paged_decode_attention, qkv_projection
 from .ops.draft_logits import draft_argmax
 from .ops.epilogue import gated_output_quantize, gdn_gates, mtp_input, residual_norm_quantize
 from .ops.fused_verify_input import fused_verify_input
@@ -464,11 +457,7 @@ class _Decoder(DecoderModel):
             qkv = qkv_projection(
                 projection, *layer.attention_params, self.cosine, self.sine, position
             )
-            native = uses_native_decode(md)
             if decode:
-                native_output = (
-                    gqa(qkv, cache.layer_offsets[index], attention, query_rows) if native else None
-                )
                 pool, pool_id = self._attention_pool(cache, index)
                 pages = md.kv_cache_block_offsets[pool_id, : md.num_seqs, 0]
                 gated = paged_decode_attention(
@@ -480,23 +469,19 @@ class _Decoder(DecoderModel):
                     query_rows,
                     projection=projection,
                     mn_major=mn_major and pick_rows is None,
-                    native_output=native_output,
                     pick_rows=pick_rows,
                 )
                 return fp8_projection(gated, layer.output_projection, decode, self.gemm)
-            if native:
-                core = gqa(qkv, cache.layer_offsets[index], attention, query_rows)
-            else:
-                ctx_count = md.num_contexts
-                ctx_rows = md.num_ctx_tokens
-                core = gqa(qkv[:ctx_rows], cache.layer_offsets[index], attention)
-                if ctx_rows < qkv.shape[0]:
-                    pool, pool_id = self._attention_pool(cache, index)
-                    pages = md.kv_cache_block_offsets[pool_id, ctx_count : md.num_seqs, 0]
-                    gen_core = paged_decode_attention(
-                        qkv[ctx_rows:], pool, position[ctx_rows:], pages, md.max_seq_len, query_rows
-                    )
-                    core = torch.cat((core, gen_core))
+            ctx_count = md.num_contexts
+            ctx_rows = md.num_ctx_tokens
+            core = gqa(qkv[:ctx_rows], cache.layer_offsets[index], attention)
+            if ctx_rows < qkv.shape[0]:
+                pool, pool_id = self._attention_pool(cache, index)
+                pages = md.kv_cache_block_offsets[pool_id, ctx_count : md.num_seqs, 0]
+                gen_core = paged_decode_attention(
+                    qkv[ctx_rows:], pool, position[ctx_rows:], pages, md.max_seq_len, query_rows
+                )
+                core = torch.cat((core, gen_core))
             gated = gated_output_quantize(core, projection, None, mn_major=mn_major)
         return fp8_projection(gated, layer.output_projection, decode, self.gemm)
 
@@ -510,11 +495,7 @@ class _Decoder(DecoderModel):
         rows = input_ids.numel()
         if prefill_graph is None:
             recurrent = _linear_step(attn_metadata)
-            attention = (
-                attention_step(attn_metadata)
-                if uses_native_decode(attn_metadata)
-                else context_attention_step(attn_metadata)
-            )
+            attention = context_attention_step(attn_metadata)
         else:
             input_ids, position_ids, recurrent, attention = prefill_graph
         position = position_ids.view(-1, rows)[0]
@@ -627,28 +608,23 @@ class _MtpLayer(nn.Module):
         _, hidden, attention_input = residual_norm_quantize(
             residual, layer.input_norm, mn_major=mn_major
         )
-        pick_attention_rows = decode and not uses_native_decode(attn_metadata)
         delta = decoder._mix(
             layer,
             len(decoder.layers),
             hidden,
             attention_input,
             attn_metadata,
-            (
-                attention_step(attn_metadata)
-                if uses_native_decode(attn_metadata)
-                else context_attention_step(attn_metadata)
-            ),
+            context_attention_step(attn_metadata),
             None,
             position,
             decode,
             mn_major,
             query_rows,
-            pick_rows if pick_attention_rows else None,
+            pick_rows if decode else None,
         )
         if pick_rows is not None:
             residual = residual[pick_rows]
-            if not pick_attention_rows:
+            if not decode:
                 delta = delta[pick_rows]
         expert_decode = decode or pick_rows is not None
         residual, hidden, expert_input = residual_norm_quantize(

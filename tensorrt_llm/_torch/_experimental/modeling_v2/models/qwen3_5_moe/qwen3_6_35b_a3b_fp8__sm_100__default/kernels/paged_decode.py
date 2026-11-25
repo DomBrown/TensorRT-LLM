@@ -14,8 +14,8 @@ from .kernels import FP8, _scales
 _HEAD_DIM = 256
 _Q_HEADS = 16
 _KV_HEADS = 2
-# Two narrow decode splits preserve their reduction order at wide batch sizes.
-_SHORT_HISTORY = 256
+# Use the same split-axis reduction when a request shares the decode batch.
+_KEYS_PER_SPLIT = 128
 
 
 @triton.jit
@@ -63,7 +63,6 @@ def _decode_attention(
     QUERY_ROWS: tl.constexpr,
     GROUP_ROWS: tl.constexpr,
     BLOCK_M: tl.constexpr,
-    SHORT_LIMIT: tl.constexpr = 0,
     SELECT_ROWS: tl.constexpr = False,
 ):
     first_output = tl.program_id(0) * GROUP_ROWS
@@ -75,9 +74,6 @@ def _decode_attention(
     last_end = tl.load(POS + first_row + GROUP_ROWS - 1) + 1
     if start >= last_end:
         return
-    if SHORT_LIMIT:
-        if last_end > SHORT_LIMIT:
-            return
     channel = tl.arange(0, 256)
     lane = tl.arange(0, BLOCK_M)
     rank = lane // 8
@@ -170,7 +166,6 @@ def _merge_quantize(
     LSE,
     POS,
     PROJECTION,
-    NATIVE,
     PICKS,
     OUTPUT,
     SCALES,
@@ -178,8 +173,6 @@ def _merge_quantize(
     NS: gl.constexpr,
     SPLIT_LEN: gl.constexpr,
     MN_MAJOR: gl.constexpr,
-    SHORT_LIMIT: gl.constexpr,
-    QUERY_ROWS: gl.constexpr,
     SELECT_ROWS: gl.constexpr,
 ):
     row = gl.program_id(0)
@@ -189,14 +182,7 @@ def _merge_quantize(
     end = gl.load(POS + source) + 1
     vector: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0])
     output_channel = group * 128 + gl.arange(0, 128, layout=vector)
-    if SHORT_LIMIT:
-        last_end = gl.load(POS + (row // QUERY_ROWS + 1) * QUERY_ROWS - 1) + 1
-        if last_end > SHORT_LIMIT:
-            core = gl.load(NATIVE + (row * 16 + head) * 256 + output_channel).to(gl.float32)
-        else:
-            core = _merged_core(PART, LSE, row, head, group, end, SPLITS, NS, SPLIT_LEN, vector)
-    else:
-        core = _merged_core(PART, LSE, row, head, group, end, SPLITS, NS, SPLIT_LEN, vector)
+    core = _merged_core(PART, LSE, row, head, group, end, SPLITS, NS, SPLIT_LEN, vector)
     z = gl.load(PROJECTION + source * 9216 + head * 512 + 256 + output_channel).to(gl.float32)
     gate = 1.0 / (1.0 + gl.exp(-z))
     x = (core * gate).to(gl.bfloat16).to(gl.float32)
@@ -219,35 +205,31 @@ def paged_decode(
     *,
     projection: torch.Tensor | None = None,
     mn_major: bool = False,
-    native_output: torch.Tensor | None = None,
     pick_rows: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Attend over HND pages, reusing the native kernel's writes if supplied."""
+    """Append candidate K/V and attend over BF16 HND pages."""
     rows, width = qkv.shape
     page_size = pool.shape[-2]
     stride = pool.stride(1)
-    short_limit = _SHORT_HISTORY if native_output is not None else 0
-    split_length = 128 if rows == query_rows or short_limit else 256
-    max_keys = min(max_seq_len, short_limit) if short_limit else max_seq_len
-    splits = triton.cdiv(max_keys, split_length)
+    split_length = _KEYS_PER_SPLIT
+    splits = triton.cdiv(max_seq_len, split_length)
     output_rows = rows if pick_rows is None else pick_rows.numel()
     partial = torch.empty(
         (output_rows, splits, _Q_HEADS, _HEAD_DIM), device=qkv.device, dtype=torch.float32
     )
     lse = torch.empty((output_rows, splits, _Q_HEADS), device=qkv.device, dtype=torch.float32)
-    if native_output is None:
-        _append_decode[(rows, _KV_HEADS)](
-            qkv,
-            pool,
-            positions,
-            key_pages,
-            key_pages.stride(0),
-            page_size,
-            stride,
-            width,
-            query_rows,
-            num_warps=4,
-        )
+    _append_decode[(rows, _KV_HEADS)](
+        qkv,
+        pool,
+        positions,
+        key_pages,
+        key_pages.stride(0),
+        page_size,
+        stride,
+        width,
+        query_rows,
+        num_warps=4,
+    )
     # A singleton uses the narrower query tiles to maximize parallelism.
     group_rows = query_rows if rows > query_rows and pick_rows is None else 1
     _decode_attention[(output_rows // group_rows, _KV_HEADS, splits)](
@@ -267,7 +249,6 @@ def paged_decode(
         query_rows,
         group_rows,
         max(16, triton.next_power_of_2(group_rows * 8)),
-        short_limit,
         pick_rows is not None,
         num_warps=4,
     )
@@ -280,7 +261,6 @@ def paged_decode(
             lse,
             positions,
             projection,
-            native_output,
             pick_rows,
             out,
             scales,
@@ -288,8 +268,6 @@ def paged_decode(
             triton.next_power_of_2(splits),
             split_length,
             mn_major,
-            short_limit,
-            query_rows,
             pick_rows is not None,
             num_warps=4,
         )

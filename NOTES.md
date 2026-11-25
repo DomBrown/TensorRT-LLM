@@ -741,7 +741,7 @@ The client recorded matching request counts and input SHA-256 hashes
 at every point. Each row uses at least 16 requests, with four requests
 per concurrent client at C8 and above.
 
-### Matched closed-loop serving, ISL 1024/4096, OSL 1024
+### Matched hybrid-attention serving, ISL 1024/4096, OSL 1024
 
 | ISL | OSL | Concurrency | V1 tokens/s | V2 tokens/s | Speedup | V1 median TTFT (ms) | V2 median TTFT (ms) |
 |---:|---:|---:|---:|---:|---:|---:|---:|
@@ -792,3 +792,72 @@ The largest teacher-forced margin at a first difference was 0.75 nats.
 The same serving run passed the external development oracle at all five
 concurrencies. The longer test exposes remaining differences between the
 wide server and the batch-1 CLI.
+
+An instrumented run reproduced all 24 CLI continuations and recorded
+the two leading BF16 logits of each incremental decode step. Under
+those logits, all first differences at C8 and C32 were near-ties.
+Three of 64 requests at C64 and two of 128 at C128 had first differences
+at or above 0.5 nats. Recomputing the two logits in FP32 on the same
+hidden states left three at C64 and one at C128. The largest margin
+remaining in that recomputation was 0.730 nats. The teacher-forced
+score uses the full-prefix prefill path, which gives a separate measure
+of the margin at those positions.
+
+Dispatching all batch widths to the target's paged attention removed
+the previous C64 differences. In the longer test it introduced three
+score-cutoff differences at C8 and one at C128 under the recorded decode
+logits. Two C8 cases differed on the first generated token. Its external
+development oracle still passed at every tested concurrency. The
+hybrid configuration remained the baseline for that trial.
+
+### Two-wave serving follow-ups, ISL 1024, OSL 1024
+
+| Trial | C32 tokens/s | C128 tokens/s |
+|---|---:|---:|
+| MN-major scales on all CUTLASS decode shapes | 7649.4 | 14923.0 |
+| Side-stream BF16 gates on wide decode | 7631.0 | 15098.1 |
+| Full-vocabulary FP8 proposal head on wide MTP | 7593.9 | 15002.6 |
+| Suffix-automaton proposals at threshold four | 7099.1 | 14099.7 |
+
+All four variants passed the external HTTP development oracle. The
+first three produced similar rates to the existing dispatch in the
+two-wave runs. Suffix-automaton proposals reduced aggregate throughput
+at both measured concurrencies.
+
+## Common split size for paged decode
+
+The singleton decoder used 128 keys per attention split. The grouped
+decoder used 256 and changed the merge reduction for the same request.
+The wide native branch used another reduction. The target now appends
+candidate K/V to the runtime's page table and uses 128-key splits for
+every decode shape. Grouped tiles still share K/V reads across candidate
+rows. The catalog still handles context rows. All draft K/V is appended
+when MTP needs an attended output only for selected rows.
+
+The 128-key trial passed every concurrency of the development oracle.
+With the recorded batch-1 decode logits and the strict 0.5-nat cutoff,
+every result in the 24-prompt stress set was exact or a near-tie. Its
+two-wave ISL 1024, OSL 1024 throughput was 7548.5 tokens/s at C32 and
+13971.7 at C128. The change trades some wide throughput for more
+consistent continuations across concurrency levels.
+
+An operation cell checks two verification chains with different live
+split counts. The grouped BF16 attention output agrees bitwise with
+running the chains separately. The full focused suite passed 86 cases.
+The checked-in CLI passed all 32 development items with KL 0.006457
+and 99.587% non-tie top-1 agreement. Every timed first token and every
+32-token prefix matched its 1,024-token continuation.
+The checked-in server started and matched the CLI on the development
+requests at C1, C8, C32, C64, and C128.
+
+### Fixed-split batch-1 CLI, ISL 128/1024/4096, OSL 1024
+
+| ISL | OSL | Median TTFT (ms) | Decode (tokens/s) |
+|---:|---:|---:|---:|
+| 128 | 1024 | 11.47 | 819.5 |
+| 1024 | 1024 | 22.01 | 863.6 |
+| 4096 | 1024 | 54.07 | 837.9 |
+
+The medians above use the two prompts shared with the standalone run.
+Across all three prompts per length, the medians were 822.4, 794.1, and
+842.3 tokens/s in the same order.

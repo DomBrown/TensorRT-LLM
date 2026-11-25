@@ -15,7 +15,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
 )
 
 from ..kernels.kernels import prepare_qkv
-from ..kernels.paged_decode import _SHORT_HISTORY, paged_decode
+from ..kernels.paged_decode import paged_decode
 from .epilogue import gated_output_quantize
 
 if TYPE_CHECKING:
@@ -122,10 +122,6 @@ def attention_step(md: TrtllmAttentionMetadata) -> dict:
     )
 
 
-def uses_native_decode(md: TrtllmAttentionMetadata) -> bool:
-    return md.num_seqs - md.num_contexts > 32
-
-
 def context_attention_step(md: TrtllmAttentionMetadata) -> dict:
     """Bind just the context prefix when generation uses paged decode tiles."""
     count = md.num_contexts
@@ -145,9 +141,7 @@ def context_attention_step(md: TrtllmAttentionMetadata) -> dict:
     return kwargs
 
 
-def gqa(
-    packed_qkv: torch.Tensor, layer_offset: int, metadata: dict, query_rows: int = 1
-) -> torch.Tensor:
+def gqa(packed_qkv: torch.Tensor, layer_offset: int, metadata: dict) -> torch.Tensor:
     """Append packed [rows, (16 + 2 + 2) * 256] BF16 QKV and return attended rows."""
     return thop_attention(
         q=packed_qkv,
@@ -155,7 +149,7 @@ def gqa(
         v=None,
         output=packed_qkv.new_empty((packed_qkv.shape[0], 4096)),
         is_fused_qkv=True,
-        predicted_tokens_per_seq=query_rows,
+        predicted_tokens_per_seq=1,
         local_layer_idx=layer_offset,
         num_heads=16,
         num_kv_heads=2,
@@ -225,7 +219,7 @@ qkv_projection = PrepareQkv()
 
 
 class PagedDecodeAttention(OpWrapper):
-    """Compute causal GQA over each chain, optionally sharing native KV writes."""
+    """Compute causal GQA over each chain in fixed-size KV splits."""
 
     ARCHS = frozenset({Arch.SM_100})
     CELLS = (
@@ -257,12 +251,12 @@ class PagedDecodeAttention(OpWrapper):
             },
         ),
         Cell(
-            "use the native output for long chains and shared pages for short chains",
+            "grouped verification with different numbers of live KV splits",
             {
-                "positions": (125, 126, 127, 128, 253, 254, 255, 256),
+                "positions": (125, 126, 127, 128, 381, 382, 383, 384),
                 "query_rows": 4,
                 "quantize": True,
-                "native": True,
+                "check_independent_chains": True,
             },
         ),
     )
@@ -278,13 +272,10 @@ class PagedDecodeAttention(OpWrapper):
         *,
         projection: torch.Tensor | None = None,
         mn_major: bool = False,
-        native_output: torch.Tensor | None = None,
         pick_rows: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if projection is None and (native_output is not None or pick_rows is not None):
-            raise ValueError("native output and row selection require the gated FP8 epilogue")
-        if native_output is not None and pick_rows is not None:
-            raise ValueError("the native path quantizes all output rows")
+        if projection is None and pick_rows is not None:
+            raise ValueError("row selection requires the gated FP8 epilogue")
         return paged_decode(
             qkv,
             pool,
@@ -294,7 +285,6 @@ class PagedDecodeAttention(OpWrapper):
             query_rows,
             projection=projection,
             mn_major=mn_major,
-            native_output=native_output,
             pick_rows=pick_rows,
         )
 
@@ -309,7 +299,6 @@ class PagedDecodeAttention(OpWrapper):
         *,
         projection: torch.Tensor | None = None,
         mn_major: bool = False,
-        native_output: torch.Tensor | None = None,
         pick_rows: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         page_size = pool.shape[-2]
@@ -318,16 +307,11 @@ class PagedDecodeAttention(OpWrapper):
         output = torch.empty_like(q)
         host_positions = positions.tolist()
         for i, position in enumerate(host_positions):
-            chain_end = (i // query_rows + 1) * query_rows - 1
-            if native_output is not None and host_positions[chain_end] >= _SHORT_HISTORY:
-                output[i].copy_(native_output[i])
-                continue
             logical_page, offset = divmod(position, page_size)
             ids = key_pages[i // query_rows, : logical_page + 1].long() // row_stride
             page = int(ids[-1])
-            if native_output is None:
-                pool[page, 0, :, offset].copy_(k[i].view(2, 256))
-                pool[page, 1, :, offset].copy_(v[i].view(2, 256))
+            pool[page, 0, :, offset].copy_(k[i].view(2, 256))
+            pool[page, 1, :, offset].copy_(v[i].view(2, 256))
             key, value = pool[ids].permute(1, 2, 0, 3, 4).flatten(2, 3)
             key = key[:, : position + 1].float()
             value = value[:, : position + 1].float()
