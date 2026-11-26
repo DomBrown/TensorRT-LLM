@@ -16,6 +16,10 @@ from ..weights import BF16, FP8, HIDDEN_SIZE, SCALE_BLOCK, Fp8Weight
 
 ExpertOutputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
 
+# Unaligned prefill row counts from which copying into a padded CUTLASS GEMM beats the Triton
+# projection on every dense shape of this model (the copies cost ~20-30 us).
+PADDED_CUTLASS_MIN_ROWS = 4096
+
 
 def uses_cutlass(rows: int, decode: bool) -> bool:
     """Dense CUTLASS case uses at least 128 rows and aligned prefill scales."""
@@ -24,6 +28,22 @@ def uses_cutlass(rows: int, decode: bool) -> bool:
 
 def _dequantize_activation(a: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return (a.float().view(a.shape[0], -1, SCALE_BLOCK) * scale[..., None]).reshape_as(a)
+
+
+def _padded_dense(
+    gemm: PrefillGemm, a: torch.Tensor, scale: torch.Tensor, weight: torch.Tensor, weight_scale
+) -> torch.Tensor:
+    """CUTLASS prefill for row counts that are not a multiple of 4: zero rows and scales pad the
+    activation scales to the 16-byte alignment the kernel needs."""
+    rows = a.shape[0]
+    padded = rows + (-rows) % 4
+    a_padded = a.new_empty((padded, a.shape[1]))
+    a_padded[:rows].copy_(a)
+    a_padded[rows:].zero_()
+    scale_padded = scale.new_empty((padded, scale.shape[1]))
+    scale_padded[:rows].copy_(scale)
+    scale_padded[rows:].zero_()
+    return gemm.dense(a_padded, scale_padded, weight, weight_scale)[:rows]
 
 
 def _dequantize_weight(w: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -60,6 +80,8 @@ class Fp8Projection(OpWrapper):
         rows = a.shape[0]
         if uses_cutlass(rows, decode):
             return gemm.dense(a, scale, *weight)
+        if not decode and rows >= PADDED_CUTLASS_MIN_ROWS:
+            return _padded_dense(gemm, a, scale, *weight)
         if decode:
             if rows <= 8:
                 if a.shape[1] == HIDDEN_SIZE:
